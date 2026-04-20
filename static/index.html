@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MiniClosedAI</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◆</span>
+      <span>MiniClosedAI</span>
+    </div>
+
+    <div class="top-controls">
+      <label class="field">
+        <span>Model</span>
+        <select id="model-select" title="Switch the local Ollama model">
+          <option value="">(loading...)</option>
+        </select>
+      </label>
+
+      <select id="conversation-select" title="Switch conversation">
+        <option value="">(no conversations)</option>
+      </select>
+
+      <button id="new-chat-btn" class="btn">+ New Chat</button>
+      <button id="clear-chat-btn" class="btn" title="Wipe messages in the current conversation">🧹 Clear</button>
+      <button id="delete-chat-btn" class="btn" title="Delete the current conversation">🗑 Delete</button>
+      <button id="api-code-btn" class="btn btn-secondary">Get API Code</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="panel sys-prompt-panel">
+        <h3>System Prompt</h3>
+        <textarea id="system-prompt" placeholder="You are a helpful AI assistant."></textarea>
+      </div>
+
+      <div id="h-splitter" class="h-splitter" title="Drag to resize the System Prompt. Double-click to reset."></div>
+
+      <div class="panel">
+        <h3>Parameters</h3>
+
+        <div class="param">
+          <label>
+            <span>🌡️ Temperature</span>
+            <span class="value" id="temp-val">0.7</span>
+          </label>
+          <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7" />
+          <div class="range-labels"><span>Precise</span><span>Balanced</span><span>Creative</span></div>
+        </div>
+
+        <div class="param">
+          <label>
+            <span>🎯 Max Tokens</span>
+            <span class="value" id="max-tokens-val">2048</span>
+          </label>
+          <input type="number" id="max-tokens" min="64" max="32000" step="64" value="2048" />
+        </div>
+
+        <div class="param">
+          <label>
+            <span>🎲 Top P</span>
+            <span class="value" id="top-p-val">0.9</span>
+          </label>
+          <input type="range" id="top-p" min="0" max="1" step="0.05" value="0.9" />
+        </div>
+
+        <div class="param">
+          <label>
+            <span>🔄 Top K</span>
+            <span class="value" id="top-k-val">40</span>
+          </label>
+          <input type="number" id="top-k" min="1" max="500" step="1" value="40" />
+        </div>
+
+        <div class="param">
+          <label>
+            <span>🧠 Thinking</span>
+            <span class="value" id="think-val">Default</span>
+          </label>
+          <select id="think" title="Control reasoning for models that support it (gpt-oss, deepseek-r1, qwen3 family, etc.)">
+            <option value="">Default (model decides)</option>
+            <option value="false">Off — disable thinking</option>
+            <option value="true">On — enable thinking</option>
+            <option value="low">Low effort</option>
+            <option value="medium">Medium effort</option>
+            <option value="high">High effort</option>
+          </select>
+          <div class="range-labels"><span>Ignored by models without reasoning support</span></div>
+        </div>
+
+        <div class="param">
+          <label>
+            <span>⛔ Max thinking tokens</span>
+            <span class="value" id="max-thinking-val">—</span>
+          </label>
+          <input type="number" id="max-thinking" min="1" max="100000" step="50" placeholder="blank = no limit" />
+          <div class="range-labels"><span>Auto-stop when thinking exceeds this count</span></div>
+        </div>
+
+        <button id="reset-params" class="btn btn-small btn-secondary">Reset defaults</button>
+      </div>
+
+      <div class="panel status-panel">
+        <h3>Status</h3>
+        <div id="status-line">Checking Ollama…</div>
+      </div>
+    </aside>
+
+    <div id="splitter" class="splitter" title="Drag to resize. Double-click to reset."></div>
+
+    <section class="chat">
+      <div id="messages" class="messages">
+        <div class="empty-state">
+          <h2>Local LLM playground</h2>
+          <p>Pick a model above, tweak parameters on the left, and start chatting. All inference runs locally via Ollama.</p>
+        </div>
+      </div>
+
+      <form id="chat-form" class="composer">
+        <textarea id="input" rows="2" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
+        <button type="submit" id="send-btn" class="btn btn-primary">Send</button>
+        <button type="button" id="stop-btn" class="btn" style="display:none">⏹ Stop</button>
+      </form>
+    </section>
+  </main>
+
+  <!-- API Code Modal -->
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>API Integration Code</h3>
+        <button id="modal-close" class="btn btn-small">✕</button>
+      </div>
+      <div class="tabs">
+        <button class="tab active" data-tab="curl">cURL</button>
+        <button class="tab" data-tab="python">Python</button>
+        <button class="tab" data-tab="js">JavaScript</button>
+      </div>
+      <pre><code id="code-snippet"></code></pre>
+      <div class="modal-actions">
+        <button id="copy-code" class="btn btn-primary">Copy</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
