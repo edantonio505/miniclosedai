@@ -27,3 +27,4 @@ Thumbs.db
 
 # Claude workspace (local only)
 .claude/
+CLAUDE.md

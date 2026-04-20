@@ -27,6 +27,10 @@ const els = {
   layout: document.querySelector(".layout"),
   sidebar: document.querySelector(".sidebar"),
   sysPromptPanel: document.querySelector(".sys-prompt-panel"),
+  themeToggle: document.getElementById("theme-toggle"),
+  themeIconLight: document.getElementById("theme-icon-light"),
+  themeIconDark: document.getElementById("theme-icon-dark"),
+  themeIconSystem: document.getElementById("theme-icon-system"),
   statusLine: document.getElementById("status-line"),
   messages: document.getElementById("messages"),
   form: document.getElementById("chat-form"),
@@ -307,13 +311,35 @@ async function newConversation() {
 }
 
 // ---------- Rendering ----------
+const EMPTY_STATE_HTML = `
+  <div class="empty-state">
+    <h2>Your local LLM playground</h2>
+    <p>Pick a model, tune parameters, and chat. Each saved conversation becomes its own callable API endpoint.</p>
+    <div class="suggestion-chips">
+      <button class="chip" data-prompt="Summarize this in one sentence: [paste text here]">
+        <strong>Summarize concisely</strong>
+        <span>Condense any text to one sentence</span>
+      </button>
+      <button class="chip" data-prompt="Extract the key entities (people, orgs, dates) from: [paste text]">
+        <strong>Extract entities</strong>
+        <span>Names, orgs, dates, amounts</span>
+      </button>
+      <button class="chip" data-prompt="Write a Python function that deduplicates a list while preserving order.">
+        <strong>Write code</strong>
+        <span>Short, focused snippets</span>
+      </button>
+      <button class="chip" data-prompt="Explain the difference between async and threads in Python at a senior level.">
+        <strong>Explain concepts</strong>
+        <span>Technical explanations</span>
+      </button>
+    </div>
+  </div>
+`;
+
 function renderMessages() {
   els.messages.innerHTML = "";
   if (!state.messages.length) {
-    const e = document.createElement("div");
-    e.className = "empty-state";
-    e.innerHTML = "<h2>Local LLM playground</h2><p>Type a message below to start. Parameters on the left apply to the next turn.</p>";
-    els.messages.appendChild(e);
+    els.messages.insertAdjacentHTML("beforeend", EMPTY_STATE_HTML);
     return;
   }
   for (const m of state.messages) renderMessage(m);
@@ -325,19 +351,26 @@ function renderMessage(m) {
   div.className = `msg ${m.role}`;
   if (m.role === "user") {
     div.textContent = m.content;
+    if (m.params) appendParamsBadge(div, m.params);
   } else {
-    div.innerHTML = render(m.content);
-  }
-  if (m.params) {
-    const badge = document.createElement("div");
-    badge.className = "params-badge";
-    badge.textContent = `${m.params.model || ""} · T=${m.params.temperature} · max=${m.params.max_tokens} · top_p=${m.params.top_p} · top_k=${m.params.top_k}`;
-    div.appendChild(badge);
+    // Wrap assistant content in a single child so the flex avatar lays out correctly.
+    const body = document.createElement("div");
+    body.className = "msg-body";
+    body.innerHTML = render(m.content);
+    div.appendChild(body);
+    if (m.params) appendParamsBadge(body, m.params);
   }
   const emptyState = els.messages.querySelector(".empty-state");
   if (emptyState) emptyState.remove();
   els.messages.appendChild(div);
   return div;
+}
+
+function appendParamsBadge(parent, params) {
+  const badge = document.createElement("div");
+  badge.className = "params-badge";
+  badge.textContent = `${params.model || ""} · T=${params.temperature} · max=${params.max_tokens} · top_p=${params.top_p} · top_k=${params.top_k}`;
+  parent.appendChild(badge);
 }
 
 // ---------- Streaming chat ----------
@@ -359,6 +392,7 @@ async function sendMessage(text) {
 
   // Assistant placeholder with streaming cursor
   const assistantEl = renderMessage({ role: "assistant", content: "" });
+  const body = assistantEl.querySelector(".msg-body");
   assistantEl.classList.add("cursor");
   let assistantText = "";
   let thinkingText = "";
@@ -408,30 +442,29 @@ async function sendMessage(text) {
         try { data = JSON.parse(line.slice(5).trim()); } catch { continue; }
         if (data.error) {
           assistantText += `\n\n**Error:** ${data.error}`;
-          if (!contentEl) { assistantEl.innerHTML = ""; contentEl = document.createElement("div"); assistantEl.appendChild(contentEl); }
+          if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
           contentEl.innerHTML = render(assistantText);
           break;
         }
         if (data.thinking) {
           thinkingText += data.thinking;
           if (!thinkingEl) {
-            assistantEl.innerHTML = "";
+            body.innerHTML = "";
             thinkingEl = document.createElement("details");
             thinkingEl.className = "thinking";
             thinkingEl.open = true;
             thinkingEl.innerHTML = '<summary>💭 Thinking…</summary><div class="thinking-body"></div>';
-            assistantEl.appendChild(thinkingEl);
+            body.appendChild(thinkingEl);
             contentEl = document.createElement("div");
-            assistantEl.appendChild(contentEl);
+            body.appendChild(contentEl);
           }
           thinkingEl.querySelector(".thinking-body").textContent = thinkingText;
           scrollToBottom();
         }
         if (data.chunk) {
           assistantText += data.chunk;
-          if (!contentEl) { assistantEl.innerHTML = ""; contentEl = document.createElement("div"); assistantEl.appendChild(contentEl); }
+          if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
           contentEl.innerHTML = render(assistantText);
-          // Collapse "thinking" once real content starts streaming
           if (thinkingEl && thinkingEl.open) {
             thinkingEl.open = false;
             thinkingEl.querySelector("summary").textContent = "💭 Thoughts (click to expand)";
@@ -443,7 +476,7 @@ async function sendMessage(text) {
             truncatedNotice = document.createElement("div");
             truncatedNotice.className = "truncated-notice";
             truncatedNotice.textContent = `⛔ Stopped: thinking exceeded ${data.limit} tokens.`;
-            assistantEl.appendChild(truncatedNotice);
+            body.appendChild(truncatedNotice);
           }
           scrollToBottom();
         }
@@ -455,10 +488,10 @@ async function sendMessage(text) {
       const stoppedNotice = document.createElement("div");
       stoppedNotice.className = "truncated-notice";
       stoppedNotice.textContent = "⏹ Stopped by user.";
-      assistantEl.appendChild(stoppedNotice);
+      body.appendChild(stoppedNotice);
     } else {
       assistantText += `\n\n**Request failed:** ${e.message}`;
-      if (!contentEl) { contentEl = document.createElement("div"); assistantEl.appendChild(contentEl); }
+      if (!contentEl) { contentEl = document.createElement("div"); body.appendChild(contentEl); }
       contentEl.innerHTML = render(assistantText);
     }
   } finally {
@@ -466,17 +499,17 @@ async function sendMessage(text) {
     els.stopBtn.style.display = "none";
     els.sendBtn.style.display = "";
     assistantEl.classList.remove("cursor");
-    // Add params badge to the final assistant message
+    // Params badge inside the body so the flex layout stays clean.
     const badge = document.createElement("div");
     badge.className = "params-badge";
     badge.textContent = `${model} · T=${params.temperature} · max=${params.max_tokens} · top_p=${params.top_p} · top_k=${params.top_k}`;
-    assistantEl.appendChild(badge);
+    body.appendChild(badge);
 
     state.messages.push({ role: "assistant", content: assistantText, params: { model, ...params } });
     els.sendBtn.disabled = false;
     els.input.disabled = false;
     els.input.focus();
-    loadConversations(); // refresh timestamps
+    loadConversations();
   }
 }
 
@@ -557,8 +590,22 @@ while (true) {
   return "";
 }
 
+const LANG_FOR_TAB = { curl: "bash", python: "python", js: "javascript" };
+
+function paintSnippet() {
+  const tab = state.activeTab;
+  const code = buildCodeSnippet(tab);
+  els.codeSnippet.textContent = code;
+  // Reset highlight.js "already highlighted" flag and language class.
+  els.codeSnippet.removeAttribute("data-highlighted");
+  els.codeSnippet.className = "hljs language-" + (LANG_FOR_TAB[tab] || "plaintext");
+  if (window.hljs && typeof hljs.highlightElement === "function") {
+    try { hljs.highlightElement(els.codeSnippet); } catch (_) {}
+  }
+}
+
 function openModal() {
-  els.codeSnippet.textContent = buildCodeSnippet(state.activeTab);
+  paintSnippet();
   els.modalBackdrop.classList.remove("hidden");
 }
 function closeModal() { els.modalBackdrop.classList.add("hidden"); }
@@ -572,7 +619,7 @@ function bindModal() {
       els.tabs.forEach(t => t.classList.remove("active"));
       tab.classList.add("active");
       state.activeTab = tab.dataset.tab;
-      els.codeSnippet.textContent = buildCodeSnippet(state.activeTab);
+      paintSnippet();
     });
   });
   els.copyCode.addEventListener("click", async () => {
@@ -780,13 +827,72 @@ function initHSplitter() {
   });
 }
 
+// ---------- Theme (Light / Dark / System) ----------
+const THEME_KEY = "miniclosedai:theme";
+const THEME_ORDER = ["system", "light", "dark"];
+
+function resolvedTheme(choice) {
+  if (choice === "dark") return "dark";
+  if (choice === "light") return "light";
+  return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function applyTheme(choice) {
+  const effective = resolvedTheme(choice);
+  document.documentElement.classList.toggle("dark", effective === "dark");
+  // Swap icon to reflect the user's *choice* (not the resolved value).
+  els.themeIconLight.style.display = choice === "light" ? "" : "none";
+  els.themeIconDark.style.display = choice === "dark" ? "" : "none";
+  els.themeIconSystem.style.display = choice === "system" ? "" : "none";
+  els.themeToggle.title = `Theme: ${choice} (click to cycle)`;
+}
+
+function initTheme() {
+  let choice = localStorage.getItem(THEME_KEY);
+  if (!THEME_ORDER.includes(choice)) choice = "system";
+  applyTheme(choice);
+
+  els.themeToggle.addEventListener("click", () => {
+    const current = localStorage.getItem(THEME_KEY) || "system";
+    const next = THEME_ORDER[(THEME_ORDER.indexOf(current) + 1) % THEME_ORDER.length];
+    localStorage.setItem(THEME_KEY, next);
+    applyTheme(next);
+  });
+
+  // React to OS theme changes while in "system" mode.
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    const current = localStorage.getItem(THEME_KEY) || "system";
+    if (current === "system") applyTheme("system");
+  });
+}
+
+// ---------- Suggestion chips (empty state) — delegated so re-renders work ----------
+function initSuggestionChips() {
+  els.messages.addEventListener("click", e => {
+    const chip = e.target.closest(".chip[data-prompt]");
+    if (!chip) return;
+    els.input.value = chip.dataset.prompt;
+    els.input.focus();
+    autoGrowInput();
+  });
+}
+
+// Auto-grow the composer textarea up to its max-height.
+function autoGrowInput() {
+  els.input.style.height = "auto";
+  els.input.style.height = Math.min(200, els.input.scrollHeight) + "px";
+}
+
 async function init() {
+  initTheme();
   loadSettings();
   bindParamDisplay();
   bindChat();
   bindModal();
   initSplitter();
   initHSplitter();
+  initSuggestionChips();
+  els.input.addEventListener("input", autoGrowInput);
   await loadModels();
   await loadConversations();
 
