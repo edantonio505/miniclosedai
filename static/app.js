@@ -27,6 +27,11 @@ const els = {
   layout: document.querySelector(".layout"),
   sidebar: document.querySelector(".sidebar"),
   sysPromptPanel: document.querySelector(".sys-prompt-panel"),
+  themeToggle: document.getElementById("theme-toggle"),
+  themeIconLight: document.getElementById("theme-icon-light"),
+  themeIconDark: document.getElementById("theme-icon-dark"),
+  themeIconSystem: document.getElementById("theme-icon-system"),
+  sidebarToggle: document.getElementById("sidebar-toggle"),
   statusLine: document.getElementById("status-line"),
   messages: document.getElementById("messages"),
   form: document.getElementById("chat-form"),
@@ -36,10 +41,13 @@ const els = {
   modalClose: document.getElementById("modal-close"),
   codeSnippet: document.getElementById("code-snippet"),
   copyCode: document.getElementById("copy-code"),
-  tabs: document.querySelectorAll(".tab"),
+  langTabs: document.querySelectorAll('.tabs[data-group="lang"] .tab'),
+  modeTabs: document.querySelectorAll('.tabs[data-group="mode"] .tab'),
+  styleTabs: document.querySelectorAll('.tabs[data-group="style"] .tab'),
 };
 
 const DEFAULTS = { temperature: 0.7, max_tokens: 2048, top_p: 0.9, top_k: 40 };
+const DEFAULT_SYSTEM_PROMPT = "You are a helpful AI assistant.";
 const SMALL_MODEL_PREFIXES = [
   "qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b", "qwen2.5:7b",
   "llama3.2:1b", "llama3.2:3b", "llama3.1:8b",
@@ -53,7 +61,9 @@ const SMALL_MODEL_PREFIXES = [
 let state = {
   conversationId: null,
   messages: [], // [{role, content, params?}]
-  activeTab: "curl",
+  activeTab: "curl",       // "curl" | "python" | "js"
+  activeMode: "stream",    // "stream" | "sync"
+  activeStyle: "native",   // "native" | "openai"
   abortController: null,
 };
 
@@ -67,7 +77,13 @@ function fmtBytes(n) {
 }
 function esc(s) { return s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
 function render(md) { return marked.parse(md || ""); }
-function scrollToBottom() { els.messages.scrollTop = els.messages.scrollHeight; }
+function scrollToBottom() {
+  // Force an instant jump to the true bottom. Using rAF so we measure
+  // scrollHeight AFTER any just-appended DOM has laid out.
+  requestAnimationFrame(() => {
+    els.messages.scrollTop = els.messages.scrollHeight;
+  });
+}
 
 function getParams() {
   const p = {
@@ -146,21 +162,39 @@ function syncParamDisplay() {
 
 // Debounced autosave of the current conversation's config.
 let saveTimer = null;
+
+function _buildConfigPatch() {
+  return {
+    ...getParams(),
+    model: els.modelSelect.value || undefined,
+    system_prompt: els.systemPrompt.value || undefined,
+  };
+}
+
 function scheduleSaveToConversation() {
   if (!state.conversationId) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const patch = {
-      ...getParams(),
-      model: els.modelSelect.value || undefined,
-      system_prompt: els.systemPrompt.value || undefined,
-    };
     fetch(`/api/conversations/${state.conversationId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
+      body: JSON.stringify(_buildConfigPatch()),
     }).catch(() => {});
   }, 350);
+}
+
+// Cancel any pending debounce and PATCH immediately. Returned promise
+// resolves once the server has acknowledged the current sidebar state.
+async function flushPendingSave() {
+  if (!state.conversationId) return;
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  try {
+    await fetch(`/api/conversations/${state.conversationId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(_buildConfigPatch()),
+    });
+  } catch (_) { /* offline / transient — snippet still works with prior saved state */ }
 }
 
 function bindParamDisplay() {
@@ -288,14 +322,21 @@ async function newConversation() {
     alert("Pick a model first.");
     return;
   }
+  const input = prompt("Name this chat:", "");
+  if (input === null) return;                 // user cancelled
+  const title = input.trim() || "New Chat";
+
+  // Every new bot starts from a clean slate — default system prompt and params.
+  // Model is carried over from the current selection since there's no universal
+  // "default" model (it depends on what the user has pulled in Ollama).
   const r = await fetch("/api/conversations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model,
-      system_prompt: els.systemPrompt.value || "You are a helpful AI assistant.",
-      title: "New Chat",
-      ...getParams(),
+      system_prompt: DEFAULT_SYSTEM_PROMPT,
+      title,
+      ...DEFAULTS,
     }),
   });
   const c = await r.json();
@@ -304,16 +345,59 @@ async function newConversation() {
   await loadConversations();
   els.convSelect.value = String(c.id);
   renderMessages();
+
+  // Reset the sidebar so the user sees the clean config they're about to edit.
+  // Must happen AFTER state.conversationId is set so the debounced auto-save
+  // (triggered when the user starts typing) targets the new conversation.
+  resetSidebarToDefaults();
+
+  // Focus the system prompt so they can start authoring the bot immediately.
+  els.systemPrompt.focus();
+}
+
+function resetSidebarToDefaults() {
+  els.systemPrompt.value = "";
+  els.temperature.value = DEFAULTS.temperature;
+  els.maxTokens.value   = DEFAULTS.max_tokens;
+  els.topP.value        = DEFAULTS.top_p;
+  els.topK.value        = DEFAULTS.top_k;
+  els.think.value       = "";
+  els.maxThinking.value = "";
+  syncParamDisplay();
+  saveSettings();   // update localStorage; do NOT trigger scheduleSaveToConversation
+                    // (the server already has these defaults from the just-created conv)
 }
 
 // ---------- Rendering ----------
+const EMPTY_STATE_HTML = `
+  <div class="empty-state">
+    <h2>Your local LLM playground</h2>
+    <p>Pick a model, tune parameters, and chat. Each saved conversation becomes its own callable API endpoint.</p>
+    <div class="suggestion-chips">
+      <button class="chip" data-prompt="Summarize this in one sentence: [paste text here]">
+        <strong>Summarize concisely</strong>
+        <span>Condense any text to one sentence</span>
+      </button>
+      <button class="chip" data-prompt="Extract the key entities (people, orgs, dates) from: [paste text]">
+        <strong>Extract entities</strong>
+        <span>Names, orgs, dates, amounts</span>
+      </button>
+      <button class="chip" data-prompt="Write a Python function that deduplicates a list while preserving order.">
+        <strong>Write code</strong>
+        <span>Short, focused snippets</span>
+      </button>
+      <button class="chip" data-prompt="Explain the difference between async and threads in Python at a senior level.">
+        <strong>Explain concepts</strong>
+        <span>Technical explanations</span>
+      </button>
+    </div>
+  </div>
+`;
+
 function renderMessages() {
   els.messages.innerHTML = "";
   if (!state.messages.length) {
-    const e = document.createElement("div");
-    e.className = "empty-state";
-    e.innerHTML = "<h2>Local LLM playground</h2><p>Type a message below to start. Parameters on the left apply to the next turn.</p>";
-    els.messages.appendChild(e);
+    els.messages.insertAdjacentHTML("beforeend", EMPTY_STATE_HTML);
     return;
   }
   for (const m of state.messages) renderMessage(m);
@@ -325,19 +409,26 @@ function renderMessage(m) {
   div.className = `msg ${m.role}`;
   if (m.role === "user") {
     div.textContent = m.content;
+    // params are stored on user messages for reproducibility but not displayed
   } else {
-    div.innerHTML = render(m.content);
-  }
-  if (m.params) {
-    const badge = document.createElement("div");
-    badge.className = "params-badge";
-    badge.textContent = `${m.params.model || ""} · T=${m.params.temperature} · max=${m.params.max_tokens} · top_p=${m.params.top_p} · top_k=${m.params.top_k}`;
-    div.appendChild(badge);
+    // Wrap assistant content in a single child so the flex avatar lays out correctly.
+    const body = document.createElement("div");
+    body.className = "msg-body";
+    body.innerHTML = render(m.content);
+    div.appendChild(body);
+    if (m.params) appendParamsBadge(body, m.params);
   }
   const emptyState = els.messages.querySelector(".empty-state");
   if (emptyState) emptyState.remove();
   els.messages.appendChild(div);
   return div;
+}
+
+function appendParamsBadge(parent, params) {
+  const badge = document.createElement("div");
+  badge.className = "params-badge";
+  badge.textContent = `${params.model || ""} · T=${params.temperature} · max=${params.max_tokens} · top_p=${params.top_p} · top_k=${params.top_k}`;
+  parent.appendChild(badge);
 }
 
 // ---------- Streaming chat ----------
@@ -359,7 +450,9 @@ async function sendMessage(text) {
 
   // Assistant placeholder with streaming cursor
   const assistantEl = renderMessage({ role: "assistant", content: "" });
+  const body = assistantEl.querySelector(".msg-body");
   assistantEl.classList.add("cursor");
+  scrollToBottom();
   let assistantText = "";
   let thinkingText = "";
   let thinkingEl = null;
@@ -373,17 +466,20 @@ async function sendMessage(text) {
   els.sendBtn.disabled = true;
   els.input.disabled = true;
 
+  // Ensure the server's saved config matches the sidebar BEFORE we fire
+  // the call. This way the GUI Send button is identical to the cURL
+  // snippet shown in "Get API Code" — both hit the conversation's pure-
+  // function endpoint with just `{message}` and rely on saved state.
+  await flushPendingSave();
+
   try {
-    const res = await fetch("/api/chat/stream", {
+    const res = await fetch(`/api/conversations/${state.conversationId}/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: ac.signal,
       body: JSON.stringify({
-        model,
-        messages: state.messages.filter(m => m.role !== "system").map(m => ({ role: m.role, content: m.content })),
-        system_prompt: els.systemPrompt.value || "You are a helpful AI assistant.",
-        conversation_id: state.conversationId,
-        ...params,
+        message: text,
+        persist: true,   // save turn for UI display; model still sees stateless input
       }),
     });
 
@@ -408,30 +504,29 @@ async function sendMessage(text) {
         try { data = JSON.parse(line.slice(5).trim()); } catch { continue; }
         if (data.error) {
           assistantText += `\n\n**Error:** ${data.error}`;
-          if (!contentEl) { assistantEl.innerHTML = ""; contentEl = document.createElement("div"); assistantEl.appendChild(contentEl); }
+          if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
           contentEl.innerHTML = render(assistantText);
           break;
         }
         if (data.thinking) {
           thinkingText += data.thinking;
           if (!thinkingEl) {
-            assistantEl.innerHTML = "";
+            body.innerHTML = "";
             thinkingEl = document.createElement("details");
             thinkingEl.className = "thinking";
             thinkingEl.open = true;
             thinkingEl.innerHTML = '<summary>💭 Thinking…</summary><div class="thinking-body"></div>';
-            assistantEl.appendChild(thinkingEl);
+            body.appendChild(thinkingEl);
             contentEl = document.createElement("div");
-            assistantEl.appendChild(contentEl);
+            body.appendChild(contentEl);
           }
           thinkingEl.querySelector(".thinking-body").textContent = thinkingText;
           scrollToBottom();
         }
         if (data.chunk) {
           assistantText += data.chunk;
-          if (!contentEl) { assistantEl.innerHTML = ""; contentEl = document.createElement("div"); assistantEl.appendChild(contentEl); }
+          if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
           contentEl.innerHTML = render(assistantText);
-          // Collapse "thinking" once real content starts streaming
           if (thinkingEl && thinkingEl.open) {
             thinkingEl.open = false;
             thinkingEl.querySelector("summary").textContent = "💭 Thoughts (click to expand)";
@@ -443,7 +538,7 @@ async function sendMessage(text) {
             truncatedNotice = document.createElement("div");
             truncatedNotice.className = "truncated-notice";
             truncatedNotice.textContent = `⛔ Stopped: thinking exceeded ${data.limit} tokens.`;
-            assistantEl.appendChild(truncatedNotice);
+            body.appendChild(truncatedNotice);
           }
           scrollToBottom();
         }
@@ -455,10 +550,10 @@ async function sendMessage(text) {
       const stoppedNotice = document.createElement("div");
       stoppedNotice.className = "truncated-notice";
       stoppedNotice.textContent = "⏹ Stopped by user.";
-      assistantEl.appendChild(stoppedNotice);
+      body.appendChild(stoppedNotice);
     } else {
       assistantText += `\n\n**Request failed:** ${e.message}`;
-      if (!contentEl) { contentEl = document.createElement("div"); assistantEl.appendChild(contentEl); }
+      if (!contentEl) { contentEl = document.createElement("div"); body.appendChild(contentEl); }
       contentEl.innerHTML = render(assistantText);
     }
   } finally {
@@ -466,50 +561,61 @@ async function sendMessage(text) {
     els.stopBtn.style.display = "none";
     els.sendBtn.style.display = "";
     assistantEl.classList.remove("cursor");
-    // Add params badge to the final assistant message
+    // Params badge inside the body so the flex layout stays clean.
     const badge = document.createElement("div");
     badge.className = "params-badge";
     badge.textContent = `${model} · T=${params.temperature} · max=${params.max_tokens} · top_p=${params.top_p} · top_k=${params.top_k}`;
-    assistantEl.appendChild(badge);
+    body.appendChild(badge);
 
     state.messages.push({ role: "assistant", content: assistantText, params: { model, ...params } });
     els.sendBtn.disabled = false;
     els.input.disabled = false;
     els.input.focus();
-    loadConversations(); // refresh timestamps
+    scrollToBottom();   // settle the viewport on the fully-rendered final message
+    loadConversations();
   }
 }
 
 // ---------- API code modal ----------
-// Each conversation is its own addressable "microservice function" on the server.
-// The saved model + system prompt + sampling params are stored with the conversation,
-// so the snippet just points at /api/conversations/{id}/chat/stream and sends a message.
-function buildCodeSnippet(tab) {
+// Each conversation is a saved microservice: its model, system prompt, and
+// sampling params are locked server-side. The snippet only needs to supply
+// the message (or the messages list, for multi-turn).
+function buildCodeSnippet(tab, mode, style) {
   const base = window.location.origin;
   const convId = state.conversationId;
   if (!convId) {
     return "# Send a message first to create a conversation.\n# Each chat becomes its own configured API endpoint.";
   }
-  const url = `${base}/api/conversations/${convId}/chat/stream`;
-  const urlSync = `${base}/api/conversations/${convId}/chat`;
+  if (style === "openai") return buildOpenAISnippet(tab, mode, base, convId);
+  return buildNativeSnippet(tab, mode, base, convId);
+}
+
+function buildNativeSnippet(tab, mode, base, convId) {
   const msg = "Hello!";
+  const streamUrl = `${base}/api/conversations/${convId}/chat/stream`;
+  const syncUrl = `${base}/api/conversations/${convId}/chat`;
+  const header = `# Chat #${convId}. Config (model, system prompt, temperature, max_tokens,\n# top_p, top_k, thinking) is set in the GUI — this call only supplies the message.`;
 
+  // ---- cURL ----
   if (tab === "curl") {
-    return `# Streaming (SSE) — uses the saved model, system prompt & params for chat #${convId}
-curl -N -X POST ${url} \\
+    if (mode === "stream") {
+      return `${header}
+curl -N -X POST ${streamUrl} \\
   -H "Content-Type: application/json" \\
-  -d '{"message": "${msg}"}'
-
-# Non-streaming equivalent:
-# curl -X POST ${urlSync} -H "Content-Type: application/json" -d '{"message":"${msg}"}'
-
-# Any field is overridable per-call, e.g. {"message":"...","temperature":0.2,"persist":true}`;
+  -d '{"message": "${msg}"}'`;
+    }
+    return `${header}
+curl -X POST ${syncUrl} \\
+  -H "Content-Type: application/json" \\
+  -d '{"message": "${msg}"}'`;
   }
-  if (tab === "python") {
-    return `import httpx, json
 
-# Each conversation is a saved function on the server — just send a message.
-URL = "${url}"
+  // ---- Python ----
+  if (tab === "python") {
+    if (mode === "stream") {
+      return `import httpx, json
+
+URL = "${streamUrl}"
 
 with httpx.stream("POST", URL, json={"message": "${msg}"}, timeout=None) as r:
     for line in r.iter_lines():
@@ -518,14 +624,20 @@ with httpx.stream("POST", URL, json={"message": "${msg}"}, timeout=None) as r:
             if "chunk" in data:
                 print(data["chunk"], end="", flush=True)
             if data.get("end"):
-                break
+                break`;
+    }
+    return `import httpx
 
-# Non-streaming: httpx.post("${urlSync}", json={"message": "${msg}"}).json()["response"]
-# Override anything: {"message": "...", "temperature": 0.2, "persist": True}`;
+URL = "${syncUrl}"
+
+response = httpx.post(URL, json={"message": "${msg}"}, timeout=120).json()
+print(response["response"])`;
   }
+
+  // ---- JavaScript ----
   if (tab === "js") {
-    return `// Streaming call to saved chat #${convId}
-const res = await fetch("${url}", {
+    if (mode === "stream") {
+      return `const res = await fetch("${streamUrl}", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ message: "${msg}" }),
@@ -546,19 +658,143 @@ while (true) {
     if (data.chunk) process.stdout.write(data.chunk);
     if (data.end) return;
   }
-}
+}`;
+    }
+    return `const { response } = await fetch("${syncUrl}", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ message: "${msg}" }),
+}).then(r => r.json());
 
-// Non-streaming:
-// const { response } = await fetch("${urlSync}", { method:"POST",
-//   headers:{"Content-Type":"application/json"},
-//   body: JSON.stringify({ message: "${msg}" })
-// }).then(r => r.json());`;
+console.log(response);`;
   }
   return "";
 }
 
-function openModal() {
-  els.codeSnippet.textContent = buildCodeSnippet(state.activeTab);
+// OpenAI-compatible snippets — caller uses the OpenAI SDK (or the raw HTTP
+// schema) pointed at MiniClosedAI's /v1 endpoint. The conversation ID goes
+// in the `model` field; any caller-supplied sampling params are ignored by
+// the server in favor of the bot's GUI-saved config.
+function buildOpenAISnippet(tab, mode, base, convId) {
+  const msg = "Hello!";
+  const url = `${base}/v1/chat/completions`;
+  const header = `# OpenAI-compatible. Use the conversation ID as 'model'. The bot's saved
+# config (model, system prompt, temperature, etc.) is the source of truth —
+# any caller-provided sampling params are ignored by the server.`;
+
+  // ---- cURL ----
+  if (tab === "curl") {
+    if (mode === "stream") {
+      return `${header}
+curl -N -X POST ${url} \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${convId}",
+    "messages": [{"role":"user","content":"${msg}"}],
+    "stream": true
+  }'`;
+    }
+    return `${header}
+curl -X POST ${url} \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${convId}",
+    "messages": [{"role":"user","content":"${msg}"}]
+  }'`;
+  }
+
+  // ---- Python (openai SDK) ----
+  if (tab === "python") {
+    if (mode === "stream") {
+      return `# pip install openai
+from openai import OpenAI
+
+# Drop-in for OpenAI: point base_url at MiniClosedAI, use chat id as 'model'.
+client = OpenAI(base_url="${base}/v1", api_key="not-required")
+
+stream = client.chat.completions.create(
+    model="${convId}",
+    messages=[{"role": "user", "content": "${msg}"}],
+    stream=True,
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta.content
+    if delta:
+        print(delta, end="", flush=True)`;
+    }
+    return `# pip install openai
+from openai import OpenAI
+
+client = OpenAI(base_url="${base}/v1", api_key="not-required")
+
+response = client.chat.completions.create(
+    model="${convId}",
+    messages=[{"role": "user", "content": "${msg}"}],
+)
+print(response.choices[0].message.content)`;
+  }
+
+  // ---- JavaScript (openai SDK) ----
+  if (tab === "js") {
+    if (mode === "stream") {
+      return `// npm install openai
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "${base}/v1",
+  apiKey: "not-required",
+});
+
+const stream = await client.chat.completions.create({
+  model: "${convId}",
+  messages: [{ role: "user", content: "${msg}" }],
+  stream: true,
+});
+
+for await (const chunk of stream) {
+  const delta = chunk.choices[0]?.delta?.content;
+  if (delta) process.stdout.write(delta);
+}`;
+    }
+    return `// npm install openai
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "${base}/v1",
+  apiKey: "not-required",
+});
+
+const response = await client.chat.completions.create({
+  model: "${convId}",
+  messages: [{ role: "user", content: "${msg}" }],
+});
+
+console.log(response.choices[0].message.content);`;
+  }
+  return "";
+}
+
+const LANG_FOR_TAB = { curl: "bash", python: "python", js: "javascript" };
+
+function paintSnippet() {
+  const tab = state.activeTab;
+  const mode = state.activeMode;
+  const style = state.activeStyle;
+  const code = buildCodeSnippet(tab, mode, style);
+  els.codeSnippet.textContent = code;
+  els.codeSnippet.removeAttribute("data-highlighted");
+  els.codeSnippet.className = "hljs language-" + (LANG_FOR_TAB[tab] || "plaintext");
+  if (window.hljs && typeof hljs.highlightElement === "function") {
+    try { hljs.highlightElement(els.codeSnippet); } catch (_) {}
+  }
+}
+
+async function openModal() {
+  // Make sure the server's saved config matches the sidebar before the user
+  // copies a snippet that hits the conversation endpoint. Without this, a
+  // pending 350ms debounce could leave the server on stale params.
+  await flushPendingSave();
+  paintSnippet();
   els.modalBackdrop.classList.remove("hidden");
 }
 function closeModal() { els.modalBackdrop.classList.add("hidden"); }
@@ -567,12 +803,28 @@ function bindModal() {
   els.apiCodeBtn.addEventListener("click", openModal);
   els.modalClose.addEventListener("click", closeModal);
   els.modalBackdrop.addEventListener("click", e => { if (e.target === els.modalBackdrop) closeModal(); });
-  els.tabs.forEach(tab => {
+  els.langTabs.forEach(tab => {
     tab.addEventListener("click", () => {
-      els.tabs.forEach(t => t.classList.remove("active"));
+      els.langTabs.forEach(t => t.classList.remove("active"));
       tab.classList.add("active");
       state.activeTab = tab.dataset.tab;
-      els.codeSnippet.textContent = buildCodeSnippet(state.activeTab);
+      paintSnippet();
+    });
+  });
+  els.modeTabs.forEach(tab => {
+    tab.addEventListener("click", () => {
+      els.modeTabs.forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      state.activeMode = tab.dataset.mode;
+      paintSnippet();
+    });
+  });
+  els.styleTabs.forEach(tab => {
+    tab.addEventListener("click", () => {
+      els.styleTabs.forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      state.activeStyle = tab.dataset.style;
+      paintSnippet();
     });
   });
   els.copyCode.addEventListener("click", async () => {
@@ -780,13 +1032,92 @@ function initHSplitter() {
   });
 }
 
+// ---------- Theme (Light / Dark / System) ----------
+const THEME_KEY = "miniclosedai:theme";
+const THEME_ORDER = ["system", "light", "dark"];
+
+function resolvedTheme(choice) {
+  if (choice === "dark") return "dark";
+  if (choice === "light") return "light";
+  return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function applyTheme(choice) {
+  const effective = resolvedTheme(choice);
+  document.documentElement.classList.toggle("dark", effective === "dark");
+  // Swap icon to reflect the user's *choice* (not the resolved value).
+  els.themeIconLight.style.display = choice === "light" ? "" : "none";
+  els.themeIconDark.style.display = choice === "dark" ? "" : "none";
+  els.themeIconSystem.style.display = choice === "system" ? "" : "none";
+  els.themeToggle.title = `Theme: ${choice} (click to cycle)`;
+}
+
+function initTheme() {
+  let choice = localStorage.getItem(THEME_KEY);
+  if (!THEME_ORDER.includes(choice)) choice = "system";
+  applyTheme(choice);
+
+  els.themeToggle.addEventListener("click", () => {
+    const current = localStorage.getItem(THEME_KEY) || "system";
+    const next = THEME_ORDER[(THEME_ORDER.indexOf(current) + 1) % THEME_ORDER.length];
+    localStorage.setItem(THEME_KEY, next);
+    applyTheme(next);
+  });
+
+  // React to OS theme changes while in "system" mode.
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    const current = localStorage.getItem(THEME_KEY) || "system";
+    if (current === "system") applyTheme("system");
+  });
+}
+
+// ---------- Sidebar collapse ----------
+const SIDEBAR_COLLAPSED_KEY = "miniclosedai:sidebarCollapsed";
+
+function applySidebarCollapsed(collapsed) {
+  document.body.classList.toggle("sidebar-collapsed", collapsed);
+  els.sidebarToggle.title = collapsed ? "Show sidebar" : "Hide sidebar";
+  els.sidebarToggle.setAttribute("aria-label", collapsed ? "Show sidebar" : "Hide sidebar");
+}
+
+function initSidebarToggle() {
+  const saved = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
+  applySidebarCollapsed(saved);
+  els.sidebarToggle.addEventListener("click", () => {
+    const now = !document.body.classList.contains("sidebar-collapsed");
+    applySidebarCollapsed(now);
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, now);
+  });
+}
+
+// ---------- Suggestion chips (empty state) — delegated so re-renders work ----------
+function initSuggestionChips() {
+  els.messages.addEventListener("click", e => {
+    const chip = e.target.closest(".chip[data-prompt]");
+    if (!chip) return;
+    els.input.value = chip.dataset.prompt;
+    els.input.focus();
+    autoGrowInput();
+  });
+}
+
+// Auto-grow the composer textarea up to its max-height.
+function autoGrowInput() {
+  els.input.style.height = "auto";
+  els.input.style.height = Math.min(200, els.input.scrollHeight) + "px";
+}
+
 async function init() {
+  initTheme();
+  initSidebarToggle();
   loadSettings();
   bindParamDisplay();
   bindChat();
   bindModal();
   initSplitter();
   initHSplitter();
+  initSuggestionChips();
+  els.input.addEventListener("input", autoGrowInput);
   await loadModels();
   await loadConversations();
 

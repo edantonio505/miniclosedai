@@ -5,31 +5,68 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>MiniClosedAI</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- Theme boot: applied before paint to avoid flash-of-wrong-theme. -->
+  <script>
+    (function() {
+      try {
+        const saved = localStorage.getItem("miniclosedai:theme") || "system";
+        const systemDark = matchMedia("(prefers-color-scheme: dark)").matches;
+        const useDark = saved === "dark" || (saved === "system" && systemDark);
+        if (useDark) document.documentElement.classList.add("dark");
+      } catch (e) {}
+    })();
+  </script>
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
+      <button id="sidebar-toggle" class="icon-btn" title="Hide sidebar" aria-label="Hide sidebar">
+        <!-- Feather: panel-left -->
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+      </button>
       <span class="logo">◆</span>
       <span>MiniClosedAI</span>
     </div>
 
     <div class="top-controls">
-      <label class="field">
-        <span>Model</span>
-        <select id="model-select" title="Switch the local Ollama model">
-          <option value="">(loading...)</option>
-        </select>
-      </label>
-
-      <select id="conversation-select" title="Switch conversation">
-        <option value="">(no conversations)</option>
+      <select id="model-select" title="Switch the local Ollama model">
+        <option value="">Loading models…</option>
       </select>
 
-      <button id="new-chat-btn" class="btn">+ New Chat</button>
-      <button id="clear-chat-btn" class="btn" title="Wipe messages in the current conversation">🧹 Clear</button>
-      <button id="delete-chat-btn" class="btn" title="Delete the current conversation">🗑 Delete</button>
-      <button id="api-code-btn" class="btn btn-secondary">Get API Code</button>
+      <select id="conversation-select" title="Switch conversation">
+        <option value="">No conversations</option>
+      </select>
+
+      <span class="divider-v"></span>
+
+      <button id="new-chat-btn" class="icon-btn" title="New chat" aria-label="New chat">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+
+      <button id="clear-chat-btn" class="icon-btn" title="Clear messages (keep model + system prompt)" aria-label="Clear messages">
+        <!-- Rotate-ccw: reset / start fresh -->
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+      </button>
+
+      <button id="delete-chat-btn" class="icon-btn" title="Delete conversation" aria-label="Delete conversation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+      </button>
+
+      <button id="api-code-btn" class="btn btn-small" title="Get API integration code">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+        API Code
+      </button>
+
+      <span class="divider-v"></span>
+
+      <button id="theme-toggle" class="icon-btn" title="Theme: system" aria-label="Toggle theme">
+        <svg id="theme-icon-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        <svg id="theme-icon-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        <svg id="theme-icon-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+      </button>
     </div>
   </header>
 
@@ -40,14 +77,14 @@
         <textarea id="system-prompt" placeholder="You are a helpful AI assistant."></textarea>
       </div>
 
-      <div id="h-splitter" class="h-splitter" title="Drag to resize the System Prompt. Double-click to reset."></div>
+      <div id="h-splitter" class="h-splitter" title="Drag to resize. Double-click to reset."></div>
 
       <div class="panel">
         <h3>Parameters</h3>
 
         <div class="param">
           <label>
-            <span>🌡️ Temperature</span>
+            <span>🌡 Temperature</span>
             <span class="value" id="temp-val">0.7</span>
           </label>
           <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7" />
@@ -103,7 +140,7 @@
           <div class="range-labels"><span>Auto-stop when thinking exceeds this count</span></div>
         </div>
 
-        <button id="reset-params" class="btn btn-small btn-secondary">Reset defaults</button>
+        <button id="reset-params" class="btn btn-small">Reset defaults</button>
       </div>
 
       <div class="panel status-panel">
@@ -117,16 +154,40 @@
     <section class="chat">
       <div id="messages" class="messages">
         <div class="empty-state">
-          <h2>Local LLM playground</h2>
-          <p>Pick a model above, tweak parameters on the left, and start chatting. All inference runs locally via Ollama.</p>
+          <h2>Your local LLM playground</h2>
+          <p>Pick a model, tune parameters, and chat. Each saved conversation becomes its own callable API endpoint.</p>
+          <div class="suggestion-chips" id="suggestion-chips">
+            <button class="chip" data-prompt="Summarize this in one sentence: [paste text here]">
+              <strong>Summarize concisely</strong>
+              <span>Condense any text to one sentence</span>
+            </button>
+            <button class="chip" data-prompt="Extract the key entities (people, orgs, dates) from: [paste text]">
+              <strong>Extract entities</strong>
+              <span>Names, orgs, dates, amounts</span>
+            </button>
+            <button class="chip" data-prompt="Write a Python function that deduplicates a list while preserving order.">
+              <strong>Write code</strong>
+              <span>Short, focused snippets</span>
+            </button>
+            <button class="chip" data-prompt="Explain the difference between async and threads in Python at a senior level.">
+              <strong>Explain concepts</strong>
+              <span>Technical explanations</span>
+            </button>
+          </div>
         </div>
       </div>
 
-      <form id="chat-form" class="composer">
-        <textarea id="input" rows="2" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
-        <button type="submit" id="send-btn" class="btn btn-primary">Send</button>
-        <button type="button" id="stop-btn" class="btn" style="display:none">⏹ Stop</button>
-      </form>
+      <div class="composer-wrap">
+        <form id="chat-form" class="composer">
+          <textarea id="input" rows="1" placeholder="Message your model…"></textarea>
+          <button type="submit" id="send-btn" class="btn btn-primary" title="Send (Enter)" aria-label="Send">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+          <button type="button" id="stop-btn" class="btn" style="display:none" title="Stop generation" aria-label="Stop">
+            <svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+          </button>
+        </form>
+      </div>
     </section>
   </main>
 
@@ -135,12 +196,24 @@
     <div class="modal">
       <div class="modal-header">
         <h3>API Integration Code</h3>
-        <button id="modal-close" class="btn btn-small">✕</button>
+        <button id="modal-close" class="icon-btn" title="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
       </div>
-      <div class="tabs">
-        <button class="tab active" data-tab="curl">cURL</button>
-        <button class="tab" data-tab="python">Python</button>
-        <button class="tab" data-tab="js">JavaScript</button>
+      <div class="modal-toolbar">
+        <div class="tabs" data-group="lang">
+          <button class="tab active" data-tab="curl">cURL</button>
+          <button class="tab" data-tab="python">Python</button>
+          <button class="tab" data-tab="js">JavaScript</button>
+        </div>
+        <div class="tabs" data-group="mode">
+          <button class="tab active" data-mode="stream">Streaming</button>
+          <button class="tab" data-mode="sync">Non-streaming</button>
+        </div>
+        <div class="tabs" data-group="style">
+          <button class="tab active" data-style="native">Native</button>
+          <button class="tab" data-style="openai">OpenAI-compat</button>
+        </div>
       </div>
       <pre><code id="code-snippet"></code></pre>
       <div class="modal-actions">

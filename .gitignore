@@ -27,3 +27,7 @@ Thumbs.db
 
 # Claude workspace (local only)
 .claude/
+CLAUDE.md
+
+# Local commit-message drafts
+COMMIT.md
