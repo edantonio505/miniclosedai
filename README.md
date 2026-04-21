@@ -1,6 +1,6 @@
 # MiniClosedAI
 
-A tiny, 100%-local LLM playground. Chat with small Ollama models (1B–10B parameters), tweak sampling parameters live, and turn each saved chat into a callable API endpoint. **No cloud, no API keys, no accounts.**
+A tiny, 100%-local LLM playground. Chat with small Ollama models (1B–10B parameters), tweak sampling parameters live, and turn each saved chat into a callable API endpoint. **No cloud, no API keys, no costs.**
 
 Built with **FastAPI** (3 Python deps), vanilla JS, and SQLite. Runs on a laptop.
 
