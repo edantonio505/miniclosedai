@@ -75,7 +75,13 @@ function fmtBytes(n) {
 }
 function esc(s) { return s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
 function render(md) { return marked.parse(md || ""); }
-function scrollToBottom() { els.messages.scrollTop = els.messages.scrollHeight; }
+function scrollToBottom() {
+  // Force an instant jump to the true bottom. Using rAF so we measure
+  // scrollHeight AFTER any just-appended DOM has laid out.
+  requestAnimationFrame(() => {
+    els.messages.scrollTop = els.messages.scrollHeight;
+  });
+}
 
 function getParams() {
   const p = {
@@ -444,6 +450,7 @@ async function sendMessage(text) {
   const assistantEl = renderMessage({ role: "assistant", content: "" });
   const body = assistantEl.querySelector(".msg-body");
   assistantEl.classList.add("cursor");
+  scrollToBottom();
   let assistantText = "";
   let thinkingText = "";
   let thinkingEl = null;
@@ -562,6 +569,7 @@ async function sendMessage(text) {
     els.sendBtn.disabled = false;
     els.input.disabled = false;
     els.input.focus();
+    scrollToBottom();   // settle the viewport on the fully-rendered final message
     loadConversations();
   }
 }

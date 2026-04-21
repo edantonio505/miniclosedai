@@ -603,12 +603,17 @@ body.sidebar-collapsed #sidebar-toggle {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  /* Center a 820px-wide content column; fall back to 24px padding when narrow. */
-  padding: 28px max(24px, calc(50% - 410px)) 20px;
+  overflow-anchor: none;       /* prevent browser auto-anchoring during streaming */
+  /* Center a 820px-wide content column; fall back to 24px padding when narrow.
+     Generous bottom padding so the last reply never collides with the composer. */
+  padding: 28px max(24px, calc(50% - 410px)) 56px;
   display: flex;
   flex-direction: column;
   gap: 18px;
-  scroll-behavior: smooth;
+  /* No smooth-scroll: during streaming the target moves on every token,
+     and a smooth animation lags behind the real bottom. Instant is correct. */
+  scroll-behavior: auto;
+  scroll-padding-bottom: 56px;
 }
 .messages::-webkit-scrollbar { width: 10px; }
 .messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; border: 2px solid var(--bg); }
