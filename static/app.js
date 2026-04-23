@@ -172,9 +172,12 @@ function thinkLabel(v) {
 }
 
 function saveSettings() {
+  const opt = els.modelSelect.selectedOptions[0];
+  const backendId = opt && opt.dataset.backendId ? parseInt(opt.dataset.backendId, 10) : undefined;
   const s = {
     ...getParams(),
-    model: els.modelSelect.value,
+    model: (opt && opt.value) || "",
+    backend_id: Number.isFinite(backendId) ? backendId : undefined,
     system_prompt: els.systemPrompt.value,
     think_select: els.think.value,
   };
@@ -207,9 +210,12 @@ function syncParamDisplay() {
 let saveTimer = null;
 
 function _buildConfigPatch() {
+  const opt = els.modelSelect.selectedOptions[0];
+  const backendId = opt && opt.dataset.backendId ? parseInt(opt.dataset.backendId, 10) : undefined;
   return {
     ...getParams(),
-    model: els.modelSelect.value || undefined,
+    model: (opt && opt.value) || undefined,
+    backend_id: Number.isFinite(backendId) ? backendId : undefined,
     system_prompt: els.systemPrompt.value || undefined,
   };
 }
@@ -265,54 +271,126 @@ function bindParamDisplay() {
   syncParamDisplay();
 }
 
-// ---------- Models ----------
-async function loadModels() {
-  const r = await fetch("/api/models");
-  const data = await r.json();
-  els.modelSelect.innerHTML = "";
+// ---------- Models (aggregated across all registered endpoints) ----------
+//
+// Builds a grouped <optgroup> dropdown — one group per enabled+reachable
+// backend, with models listed below. Each option carries both the model name
+// (value) and its backend id (data-backend-id), so switching models also
+// changes the conversation's backend.
+//
+// OpenWebUI-style: a single picker that shows everything available across all
+// registered endpoints.
 
-  if (!data.ollama_running) {
-    const opt = new Option("(Ollama not running)", "");
-    opt.disabled = true;
-    els.modelSelect.add(opt);
-    setStatus("err", "Ollama is not running. Start it with `ollama serve` (see INSTALL.md).");
-    return [];
-  }
-  // Filter out cloud proxies (not local) and embedding-only models
-  const usable = data.models.filter(m => {
+function _usableOllamaModels(models) {
+  return models.filter(m => {
     if (m.name.includes(":cloud") || m.remote_model) return false;
-    const fam = (m.details && (m.details.family || "")) + " " + ((m.details && m.details.families) || []).join(" ");
+    const fam = (m.details && (m.details.family || "")) + " "
+              + ((m.details && m.details.families) || []).join(" ");
     if (/bert|embed/i.test(fam) || /embed/i.test(m.name)) return false;
     return true;
   });
+}
 
-  if (!usable.length) {
-    const opt = new Option("(no local chat models installed)", "");
-    opt.disabled = true;
-    els.modelSelect.add(opt);
-    setStatus("warn", "Ollama is running but no local chat models are installed. Try: ollama pull llama3.2:3b");
-    return [];
-  }
-
-  // Sort: small/recommended first, then alphabetical
-  const models = [...usable].sort((a, b) => {
+function _sortModels(models) {
+  return [...models].sort((a, b) => {
     const aRec = SMALL_MODEL_PREFIXES.some(p => a.name.startsWith(p));
     const bRec = SMALL_MODEL_PREFIXES.some(p => b.name.startsWith(p));
     if (aRec !== bRec) return aRec ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
+}
 
-  for (const m of models) {
-    const size = m.size ? ` (${fmtBytes(m.size)})` : "";
-    els.modelSelect.add(new Option(`${m.name}${size}`, m.name));
+async function loadModels() {
+  const r = await fetch("/api/models");
+  const data = await r.json();
+  els.modelSelect.innerHTML = "";
+
+  const backends = data.backends || [];
+  let totalModels = 0;
+  let reachableCount = 0;
+
+  for (const b of backends) {
+    const group = document.createElement("optgroup");
+    // Include a short status hint in the label so disabled / unreachable
+    // backends are still represented (greyed out).
+    let label = b.name;
+    if (!b.enabled) label += " — disabled";
+    else if (!b.running) label += " — unreachable";
+    group.label = label;
+
+    let models = b.models || [];
+    if (b.kind === "ollama") models = _usableOllamaModels(models);
+    models = _sortModels(models);
+
+    if (!models.length) {
+      const placeholder = document.createElement("option");
+      placeholder.textContent = b.enabled
+        ? (b.running ? "(no models)" : "(unreachable)")
+        : "(disabled)";
+      placeholder.disabled = true;
+      group.appendChild(placeholder);
+    } else {
+      for (const m of models) {
+        const opt = document.createElement("option");
+        const size = m.size ? ` (${fmtBytes(m.size)})` : "";
+        opt.textContent = `${m.name}${size}`;
+        opt.value = m.name;
+        opt.dataset.backendId = String(b.id);
+        group.appendChild(opt);
+      }
+      totalModels += models.length;
+      if (b.running) reachableCount += 1;
+    }
+
+    els.modelSelect.appendChild(group);
   }
 
-  const saved = JSON.parse(localStorage.getItem("miniclosedai:settings") || "{}");
-  if (saved.model && models.some(m => m.name === saved.model)) {
-    els.modelSelect.value = saved.model;
+  if (!backends.length) {
+    const opt = new Option("(no endpoints registered)", "");
+    opt.disabled = true;
+    els.modelSelect.add(opt);
+    setStatus("err", "No endpoints configured. Open Settings → Add endpoint.");
+    return [];
   }
-  setStatus("ok", `Ollama connected · ${models.length} model${models.length === 1 ? "" : "s"} available`);
-  return models;
+
+  // Restore last-used (model, backend_id) pair from localStorage.
+  try {
+    const saved = JSON.parse(localStorage.getItem("miniclosedai:settings") || "{}");
+    if (saved.model) _selectModelOption(saved.model, saved.backend_id);
+  } catch {}
+
+  if (totalModels === 0) {
+    setStatus("warn", `No models available. Endpoints: ${backends.length} · reachable: ${reachableCount}.`);
+  } else {
+    const total = backends.length;
+    setStatus("ok", `${reachableCount}/${total} endpoint${total === 1 ? "" : "s"} reachable · ${totalModels} model${totalModels === 1 ? "" : "s"}`);
+  }
+  return backends;
+}
+
+/**
+ * Select an option by (value, backend_id) pair.
+ * Returns true if matched, false otherwise (and clears selection).
+ */
+function _selectModelOption(modelName, backendId) {
+  if (!modelName) return false;
+  const bid = backendId != null ? String(backendId) : null;
+  for (const group of els.modelSelect.querySelectorAll("optgroup")) {
+    for (const opt of group.querySelectorAll("option")) {
+      if (opt.disabled) continue;
+      if (opt.value === modelName && (bid == null || opt.dataset.backendId === bid)) {
+        els.modelSelect.value = opt.value;  // doesn't pick the right option cross-group
+        // setting .value alone can pick a different group; mark explicitly:
+        opt.selected = true;
+        return true;
+      }
+    }
+  }
+  // Fallback: match by name only, ignore backend_id
+  if (bid != null) return _selectModelOption(modelName, null);
+  // No match — deselect.
+  els.modelSelect.selectedIndex = -1;
+  return false;
 }
 
 function setStatus(kind, text) {
@@ -342,10 +420,13 @@ async function openConversation(id) {
   state.conversationId = c.id;
   state.messages = c.messages || [];
   if (c.system_prompt) els.systemPrompt.value = c.system_prompt;
-  if (c.model) {
-    const opts = [...els.modelSelect.options].map(o => o.value);
-    if (opts.includes(c.model)) els.modelSelect.value = c.model;
-  }
+
+  // Match by (model, backend_id) pair. Falls back to model-only if the exact
+  // pair can't be found (e.g. the endpoint was deleted). If nothing matches,
+  // selection is cleared and the model dropdown shows no option — Send will
+  // still attempt to call, and server will 404 on backend_load.
+  if (c.model) _selectModelOption(c.model, c.backend_id);
+
   // Load saved per-conversation params into the sliders.
   const p = c.params || {};
   if (p.temperature != null) els.temperature.value = p.temperature;
@@ -360,23 +441,27 @@ async function openConversation(id) {
 }
 
 async function newConversation() {
-  const model = els.modelSelect.value;
+  const opt = els.modelSelect.selectedOptions[0];
+  const model = opt && opt.value;
   if (!model) {
     alert("Pick a model first.");
     return;
   }
+  const backendId = opt.dataset.backendId
+    ? parseInt(opt.dataset.backendId, 10)
+    : 1;
   const input = prompt("Name this chat:", "");
   if (input === null) return;                 // user cancelled
   const title = input.trim() || "New Chat";
 
   // Every new bot starts from a clean slate — default system prompt and params.
-  // Model is carried over from the current selection since there's no universal
-  // "default" model (it depends on what the user has pulled in Ollama).
+  // Model + backend are carried over from the current selection.
   const r = await fetch("/api/conversations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model,
+      backend_id: backendId,
       system_prompt: DEFAULT_SYSTEM_PROMPT,
       title,
       ...DEFAULTS,
@@ -581,7 +666,8 @@ async function sendMessage(text) {
           if (!truncatedNotice) {
             truncatedNotice = document.createElement("div");
             truncatedNotice.className = "truncated-notice";
-            truncatedNotice.textContent = `⛔ Stopped: thinking exceeded ${data.limit} tokens.`;
+            truncatedNotice.textContent =
+              `✂ Thinking hidden after ${data.limit} tokens. Model still finishing its reasoning; the answer will follow.`;
             body.appendChild(truncatedNotice);
           }
           scrollToBottom();
@@ -1159,9 +1245,390 @@ function autoGrowInput() {
   els.input.style.height = Math.min(200, els.input.scrollHeight) + "px";
 }
 
+// =====================================================================
+// Settings page — LLM endpoint CRUD
+// =====================================================================
+
+// Fetched on settings open + refreshed after any CRUD action. The Dashboard's
+// aggregated-model loader reads /api/models separately, so this cache is
+// settings-page local.
+let backendCache = [];
+
+// Tracks which backend the modal is editing. null → creating a new one.
+let backendModalEditingId = null;
+
+const BACKEND_KIND_LABEL = { ollama: "Ollama", openai: "OpenAI-compat" };
+const BACKEND_URL_PLACEHOLDER = {
+  ollama: "http://localhost:11434",
+  openai: "http://localhost:1234/v1",
+};
+
+async function loadBackends() {
+  try {
+    const r = await fetch("/api/backends");
+    backendCache = await r.json();
+  } catch {
+    backendCache = [];
+  }
+  return backendCache;
+}
+
+function _backendStatusDot(running, enabled, hadErr) {
+  if (!enabled) return "warn";
+  if (hadErr) return "err";
+  if (running) return "ok";
+  return "err";
+}
+
+function _renderBackendCard(b) {
+  const card = document.createElement("div");
+  card.className = "backend-card";
+  card.dataset.backendId = b.id;
+
+  const meta = document.createElement("div");
+  meta.className = "backend-meta";
+
+  const titleRow = document.createElement("div");
+  titleRow.className = "backend-title-row";
+
+  const name = document.createElement("span");
+  name.className = "backend-name";
+  name.textContent = b.name;
+  titleRow.appendChild(name);
+
+  const kindBadge = document.createElement("span");
+  kindBadge.className = "backend-kind-badge";
+  kindBadge.textContent = BACKEND_KIND_LABEL[b.kind] || b.kind;
+  titleRow.appendChild(kindBadge);
+
+  if (b.is_builtin) {
+    const badge = document.createElement("span");
+    badge.className = "backend-kind-badge backend-builtin-badge";
+    badge.textContent = "Built-in";
+    titleRow.appendChild(badge);
+  }
+  if (b.api_key_set) {
+    const badge = document.createElement("span");
+    badge.className = "backend-kind-badge";
+    badge.textContent = "Key set";
+    titleRow.appendChild(badge);
+  }
+  if (!b.enabled) {
+    const badge = document.createElement("span");
+    badge.className = "backend-kind-badge";
+    badge.textContent = "Disabled";
+    titleRow.appendChild(badge);
+  }
+  meta.appendChild(titleRow);
+
+  const url = document.createElement("div");
+  url.className = "backend-url";
+  url.textContent = b.base_url;
+  meta.appendChild(url);
+
+  const status = document.createElement("div");
+  status.className = "backend-status";
+  status.innerHTML = `<span class="status-dot"></span><span class="status-text">checking…</span>`;
+  meta.appendChild(status);
+
+  card.appendChild(meta);
+
+  const actions = document.createElement("div");
+  actions.className = "backend-actions";
+
+  const editBtn = document.createElement("button");
+  editBtn.className = "btn btn-small";
+  editBtn.textContent = "Edit";
+  editBtn.addEventListener("click", () => openBackendModalForEdit(b));
+  actions.appendChild(editBtn);
+
+  if (!b.is_builtin) {
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "btn btn-small";
+    deleteBtn.textContent = "Delete";
+    deleteBtn.addEventListener("click", () => deleteBackend(b));
+    actions.appendChild(deleteBtn);
+  }
+
+  card.appendChild(actions);
+  return card;
+}
+
+async function _pollBackendStatus(backendId, cardEl) {
+  try {
+    const [statusRes, modelsRes] = await Promise.all([
+      fetch(`/api/backends/${backendId}/status`).then(r => r.json()),
+      fetch(`/api/backends/${backendId}/models`).then(r => r.json()),
+    ]);
+    const dot = cardEl.querySelector(".status-dot");
+    const text = cardEl.querySelector(".status-text");
+    const kind = _backendStatusDot(statusRes.running, statusRes.enabled, false);
+    dot.className = "status-dot " + kind;
+    const count = (modelsRes.models || []).length;
+    if (!statusRes.enabled) {
+      text.textContent = "Disabled";
+    } else if (statusRes.running) {
+      text.textContent = `Reachable · ${count} model${count === 1 ? "" : "s"}`;
+    } else {
+      text.textContent = `Unreachable at ${statusRes.base_url}`;
+    }
+  } catch {
+    const dot = cardEl.querySelector(".status-dot");
+    const text = cardEl.querySelector(".status-text");
+    dot.className = "status-dot err";
+    text.textContent = "Status check failed";
+  }
+}
+
+async function renderSettingsPage() {
+  const list = document.getElementById("backend-list");
+  if (!list) return;
+  list.innerHTML = "";
+  await loadBackends();
+  if (!backendCache.length) {
+    const empty = document.createElement("p");
+    empty.className = "settings-hint";
+    empty.textContent = "No endpoints registered. Add your first one →";
+    list.appendChild(empty);
+    return;
+  }
+  for (const b of backendCache) {
+    const card = _renderBackendCard(b);
+    list.appendChild(card);
+    _pollBackendStatus(b.id, card);
+  }
+}
+
+// --------- Add/Edit modal ---------
+
+function _fillBackendForm(b) {
+  document.getElementById("backend-name").value = b ? b.name : "";
+  document.getElementById("backend-kind").value = b ? b.kind : "openai";
+  document.getElementById("backend-base-url").value = b ? b.base_url : "";
+  document.getElementById("backend-base-url").placeholder = BACKEND_URL_PLACEHOLDER[(b && b.kind) || "openai"];
+  document.getElementById("backend-api-key").value = "";
+  document.getElementById("backend-headers").value = b && b.headers && Object.keys(b.headers).length
+    ? JSON.stringify(b.headers, null, 2) : "";
+  document.getElementById("backend-test-result").textContent = "";
+  document.getElementById("backend-headers-error").textContent = "";
+}
+
+function openBackendModalForCreate() {
+  backendModalEditingId = null;
+  document.getElementById("backend-modal-title").textContent = "Add endpoint";
+  _fillBackendForm(null);
+  // Default to OpenAI-compat for new entries (Ollama's already built-in).
+  document.getElementById("backend-kind").value = "openai";
+  document.getElementById("backend-kind").disabled = false;
+  document.getElementById("backend-base-url").placeholder = BACKEND_URL_PLACEHOLDER.openai;
+  document.getElementById("backend-modal-backdrop").classList.remove("hidden");
+  document.getElementById("backend-name").focus();
+}
+
+function openBackendModalForEdit(b) {
+  backendModalEditingId = b.id;
+  document.getElementById("backend-modal-title").textContent = `Edit ${b.name}`;
+  _fillBackendForm(b);
+  // kind is immutable on update.
+  document.getElementById("backend-kind").disabled = true;
+  document.getElementById("backend-modal-backdrop").classList.remove("hidden");
+  document.getElementById("backend-name").focus();
+}
+
+function closeBackendModal() {
+  document.getElementById("backend-modal-backdrop").classList.add("hidden");
+}
+
+function _readBackendForm() {
+  const name = document.getElementById("backend-name").value.trim();
+  const kind = document.getElementById("backend-kind").value;
+  const base_url = document.getElementById("backend-base-url").value.trim().replace(/\/+$/, "");
+  const api_key = document.getElementById("backend-api-key").value;
+  const headersRaw = document.getElementById("backend-headers").value.trim();
+  const headersErrEl = document.getElementById("backend-headers-error");
+  headersErrEl.textContent = "";
+  let headers = {};
+  if (headersRaw) {
+    try {
+      headers = JSON.parse(headersRaw);
+      if (headers === null || typeof headers !== "object" || Array.isArray(headers)) {
+        throw new Error("Must be a JSON object");
+      }
+    } catch (e) {
+      headersErrEl.textContent = "Invalid JSON: " + e.message;
+      return null;
+    }
+  }
+  return { name, kind, base_url, api_key: api_key || null, headers };
+}
+
+async function saveBackend() {
+  const data = _readBackendForm();
+  if (!data) return;
+  if (!data.name || !data.base_url) return;
+
+  // Soft guard: for OpenAI-compat URLs missing a /vN suffix, probe before
+  // saving. If 0 models come back, ask the user to confirm — otherwise the
+  // saved endpoint quietly contributes no models to the Dashboard dropdown.
+  if (data.kind === "openai" && !/\/v\d+\/?$/.test(data.base_url)) {
+    try {
+      const probe = await fetch("/api/backends/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: data.name || "draft",
+          kind: data.kind,
+          base_url: data.base_url,
+          api_key: data.api_key || null,
+          headers: data.headers || {},
+        }),
+      }).then(r => r.json()).catch(() => ({ running: false }));
+      if (probe.running && (probe.models_count || 0) === 0) {
+        const ok = confirm(
+          `The URL ${data.base_url} reached the server but returned 0 models.\n\n` +
+          `Most OpenAI-compatible servers (LM Studio, vLLM, OpenAI) need a '/v1' suffix. ` +
+          `Try '${data.base_url.replace(/\/+$/,'')}/v1' first?\n\n` +
+          `OK = let me fix the URL   |   Cancel = save anyway (0 models)`
+        );
+        if (ok) return;   // user wants to edit — leave the modal open
+      }
+    } catch { /* probe is advisory only; don't block save if it fails */ }
+  }
+
+  try {
+    if (backendModalEditingId == null) {
+      await fetch("/api/backends", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      }).then(_throwIfNotOk);
+    } else {
+      const { kind, ...patch } = data;
+      if (!patch.api_key) delete patch.api_key;
+      await fetch(`/api/backends/${backendModalEditingId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      }).then(_throwIfNotOk);
+    }
+    closeBackendModal();
+    await renderSettingsPage();
+    if (typeof loadModels === "function") await loadModels();
+  } catch (e) {
+    alert("Save failed: " + (e && e.message || e));
+  }
+}
+
+async function deleteBackend(b) {
+  if (!confirm(`Delete endpoint "${b.name}"?`)) return;
+  try {
+    const r = await fetch(`/api/backends/${b.id}`, { method: "DELETE" });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      const msg = (body.detail && body.detail.message) || body.detail || `HTTP ${r.status}`;
+      alert("Delete blocked: " + msg);
+      return;
+    }
+    await renderSettingsPage();
+    if (typeof loadModels === "function") await loadModels();
+  } catch (e) {
+    alert("Delete failed: " + e.message);
+  }
+}
+
+async function testBackendConnection() {
+  const resultEl = document.getElementById("backend-test-result");
+  resultEl.textContent = "Testing…";
+  const data = _readBackendForm();
+  if (!data) { resultEl.textContent = ""; return; }
+
+  // Soft hint: OpenAI-compat URLs nearly always end in /v1. Warn but don't
+  // block — occasionally people run a proxy that mounts /v2 or /openai.
+  let hint = "";
+  if (data.kind === "openai" && !/\/v\d+\/?$/.test(data.base_url)) {
+    hint = "  (Hint: URL usually ends in '/v1'.)";
+  }
+
+  // Always probe through our server. Cross-origin direct fetches from the
+  // browser to LM Studio / vLLM / etc. get CORS-blocked and surface as the
+  // unhelpful "Failed to fetch" error. The server has no such restriction.
+  try {
+    const r = await fetch("/api/backends/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: data.name || "draft",
+        kind: data.kind,
+        base_url: data.base_url,
+        api_key: data.api_key || null,
+        headers: data.headers || {},
+      }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok && body.running) {
+      resultEl.textContent = "✓ " + (body.message || "Reachable");
+    } else {
+      resultEl.textContent = "✗ " + (body.message || `HTTP ${r.status}`) + hint;
+    }
+  } catch (e) {
+    resultEl.textContent = "✗ " + (e && e.message || e) + hint;
+  }
+}
+
+async function _throwIfNotOk(r) {
+  if (r.ok) return r;
+  const body = await r.json().catch(() => ({}));
+  const msg = (body.detail && body.detail.message) || body.detail || `HTTP ${r.status}`;
+  throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+}
+
+function initBackendsUI() {
+  document.getElementById("add-backend-btn").addEventListener("click", openBackendModalForCreate);
+  document.getElementById("backend-modal-close").addEventListener("click", closeBackendModal);
+  document.getElementById("backend-cancel-btn").addEventListener("click", closeBackendModal);
+  document.getElementById("backend-modal-backdrop").addEventListener("click", e => {
+    if (e.target.id === "backend-modal-backdrop") closeBackendModal();
+  });
+  document.getElementById("backend-kind").addEventListener("change", e => {
+    document.getElementById("backend-base-url").placeholder =
+      BACKEND_URL_PLACEHOLDER[e.target.value] || "";
+  });
+  document.getElementById("backend-test-btn").addEventListener("click", testBackendConnection);
+  document.getElementById("backend-form").addEventListener("submit", e => {
+    e.preventDefault();
+    saveBackend();
+  });
+}
+
+// ---------- Page routing (activity bar) ----------
+// Purely CSS-driven — flipping body[data-page] hides/shows .page-* containers
+// without unmounting anything. Chat streams keep running across switches.
+const ACTIVE_PAGE_KEY = "miniclosedai:activePage";
+
+function applyActivePage(page) {
+  const p = (page === "settings") ? "settings" : "dashboard";
+  document.body.dataset.page = p;
+  document.querySelectorAll(".activity-bar .nav-item").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.page === p);
+  });
+  try { localStorage.setItem(ACTIVE_PAGE_KEY, p); } catch (_) {}
+  if (p === "settings" && typeof renderSettingsPage === "function") {
+    renderSettingsPage();
+  }
+}
+
+function initActivityBar() {
+  document.querySelectorAll(".activity-bar .nav-item").forEach(btn => {
+    btn.addEventListener("click", () => applyActivePage(btn.dataset.page));
+  });
+  const saved = (() => { try { return localStorage.getItem(ACTIVE_PAGE_KEY); } catch { return null; } })();
+  applyActivePage(saved || "dashboard");
+}
+
 async function init() {
   initTheme();
   initSidebarToggle();
+  initActivityBar();
   loadSettings();
   bindParamDisplay();
   bindChat();
@@ -1169,6 +1636,7 @@ async function init() {
   initSplitter();
   initHSplitter();
   initSuggestionChips();
+  if (typeof initBackendsUI === "function") initBackendsUI();
   els.input.addEventListener("input", autoGrowInput);
   await loadModels();
   await loadConversations();
