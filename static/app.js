@@ -76,7 +76,50 @@ function fmtBytes(n) {
   return `${n.toFixed(1)}${units[i]}`;
 }
 function esc(s) { return s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
-function render(md) { return marked.parse(md || ""); }
+
+// If the assistant's reply is valid JSON (bare, or inside a ```fenced block```),
+// reformat it with 2-space indentation and wrap it in a ```json code fence so
+// the Markdown renderer hands it to highlight.js afterwards. Returns the input
+// unchanged when nothing parses — safe to call on every chunk during streaming.
+function prettifyJSONInMarkdown(text) {
+  if (!text) return text;
+
+  // Case 1: the whole message is JSON.
+  const trimmed = text.trim();
+  if ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return "```json\n" + JSON.stringify(parsed, null, 2) + "\n```";
+    } catch (_) { /* not complete / not valid — fall through */ }
+  }
+
+  // Case 2: fenced code blocks whose body is JSON. Also upgrades blocks with
+  // no language tag or a different tag (e.g. ```) if the content parses.
+  return text.replace(/```(\w*)\n([\s\S]*?)```/g, (match, lang, body) => {
+    const content = body.trim();
+    if (!content) return match;
+    const looksJson = lang.toLowerCase() === "json" || /^[\{\[]/.test(content);
+    if (!looksJson) return match;
+    try {
+      const parsed = JSON.parse(content);
+      return "```json\n" + JSON.stringify(parsed, null, 2) + "\n```";
+    } catch (_) {
+      return match;
+    }
+  });
+}
+
+function render(md) { return marked.parse(prettifyJSONInMarkdown(md || "")); }
+
+// Run highlight.js over every <pre><code> inside a container. Idempotent.
+function highlightCodeBlocks(container) {
+  if (!window.hljs || !container) return;
+  container.querySelectorAll("pre code").forEach(el => {
+    if (el.dataset.highlighted === "yes") return;
+    try { hljs.highlightElement(el); } catch (_) {}
+  });
+}
 function scrollToBottom() {
   // Force an instant jump to the true bottom. Using rAF so we measure
   // scrollHeight AFTER any just-appended DOM has laid out.
@@ -416,6 +459,7 @@ function renderMessage(m) {
     body.className = "msg-body";
     body.innerHTML = render(m.content);
     div.appendChild(body);
+    highlightCodeBlocks(body);
     if (m.params) appendParamsBadge(body, m.params);
   }
   const emptyState = els.messages.querySelector(".empty-state");
@@ -566,6 +610,14 @@ async function sendMessage(text) {
     badge.className = "params-badge";
     badge.textContent = `${model} · T=${params.temperature} · max=${params.max_tokens} · top_p=${params.top_p} · top_k=${params.top_k}`;
     body.appendChild(badge);
+
+    // Final pass: pretty-print JSON (render() already calls prettifyJSONInMarkdown
+    // on every chunk, but the content only parses once the closing brace arrives)
+    // and run syntax highlighting once, now that streaming is done.
+    if (contentEl) {
+      contentEl.innerHTML = render(assistantText);
+      highlightCodeBlocks(contentEl);
+    }
 
     state.messages.push({ role: "assistant", content: assistantText, params: { model, ...params } });
     els.sendBtn.disabled = false;

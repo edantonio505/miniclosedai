@@ -25,6 +25,13 @@ Built with **FastAPI** (3 Python deps), vanilla JS, and SQLite. Runs on a laptop
   <br><em>Every saved chat is a microservice. Copy the snippet as cURL, Python, or JavaScript — native or OpenAI-SDK-compatible.</em>
 </p>
 
+<p align="center">
+  <img src="miniclosedai4.png"
+       alt="Support Ticket Router bot: the sidebar shows the JSON-extraction system prompt and deterministic sampling params; the chat shows a real inbound ticket on the right and the assistant's pretty-printed, syntax-highlighted JSON response next to it"
+       width="820">
+  <br><em>The Support Ticket Router recipe in action. A real inbound ticket (top right) goes in; structured, pretty-printed, syntax-highlighted JSON comes out — ready for a downstream CRM, Linear, or Slack webhook to consume. Recipes for this and a sister <a href="#7-inbound-lead-qualifier--full-walkthrough">Lead Qualifier</a> bot are documented as standalone walkthroughs.</em>
+</p>
+
 ![stack](https://img.shields.io/badge/FastAPI-0.110+-009688) ![Ollama](https://img.shields.io/badge/Ollama-local-000000) ![license](https://img.shields.io/badge/license-MIT-blue)
 
 > The defining idea: **each saved conversation is an addressable microservice.** You craft a system prompt + sampling params once in the UI, and that chat becomes a stable URL you can call from anything that speaks HTTP — including any OpenAI SDK.
@@ -595,6 +602,63 @@ No preamble, no praise, no code quoting.
 ```
 
 **Settings:** qwen3:8b, temperature `0.3`, Thinking `Medium`, max_tokens `400`.
+
+---
+
+### 6. Support ticket router — [full walkthrough](./Support%20Ticket%20Router.md)
+
+Takes an inbound support message, returns a JSON blob that classifies `intent`, picks a `team`, assigns `urgency` (p0–p3), extracts `key_entities` (product areas, order IDs, error codes, dates), scores `sentiment`, and suggests a reply tone. Includes a `needs_human_review` escape hatch for low-confidence cases.
+
+**Output shape (abridged):**
+```json
+{
+  "intent": "bug | billing | how_to | feature_request | account | complaint | spam | ...",
+  "team":   "engineering | billing | support | sales | success | trust_safety | unknown",
+  "urgency":"p0 | p1 | p2 | p3",
+  "sentiment":"angry | frustrated | neutral | satisfied | delighted",
+  "customer_blocked": true,
+  "needs_human_review": false,
+  "key_entities": { "product_areas":[], "order_ids":[], "emails":[], "error_codes":[], "dates":[] },
+  "suggested_reply_tone":"empathetic | apologetic | informative | celebratory | cautious",
+  "summary":"...",
+  "confidence": 0.0
+}
+```
+
+**Settings:** `qwen3:8b`, temperature `0.1`, Thinking `Off`, max_tokens `700`.
+
+**Archetype:** classify → route → extract → flag-for-human. The canonical LLM-as-decision-service pattern. Drop-in replacement for the rules-plus-regex ticket-triage scripts every support team has written three times. Full system prompt, example I/O, integration code, and variant ideas in **[`Support Ticket Router.md`](./Support%20Ticket%20Router.md)**.
+
+---
+
+### 7. Inbound lead qualifier — [full walkthrough](./Inbound%20Lead%20Qualifier.md)
+
+B2B sibling of the ticket router. Takes an inbound prospect message (form-fill, email, chat), returns a JSON blob with a numeric `fit_score` (0–100), `intent`, `role_signal`, company-size and industry guesses, budget + timeline signals, and a routing decision that maps to CRM stages (`book_demo`, `send_pricing`, `escalate_to_AE`, etc.).
+
+**Output shape (abridged):**
+```json
+{
+  "fit_score": 0,                          // integer 0-100, rounded to nearest 5
+  "fit_label": "cold | lukewarm | warm | hot | evangelist",
+  "intent": "pricing | demo_request | trial | comparison | rfp | partner | spam | ...",
+  "role_signal": "decision_maker | influencer | end_user | gatekeeper | unknown",
+  "company_size_guess": "solopreneur | smb | midmarket | enterprise | unknown",
+  "budget_signal": "none | low | mid | high | unstated",
+  "timeline_signal": "now | month | quarter | year | unclear",
+  "competitor_mentioned": null,
+  "use_case_summary":"...",
+  "next_action":"book_demo | send_pricing | nurture_email | escalate_to_AE | ...",
+  "assigned_rep_hint":"AE | SDR | CSM | automation | trash",
+  "key_entities": { ... },
+  "red_flags": [],
+  "needs_human_review": false,
+  "confidence": 0.0
+}
+```
+
+**Settings:** `qwen3:8b`, temperature `0.1`, Thinking `Off`, max_tokens `900`.
+
+**Archetype:** adds a numeric scoring dimension on top of the ticket-router pattern, plus a first-match routing table stated in plain English. Great proof that an 8B local model is enough to replace a spreadsheet-and-two-contractors lead-triage process. Full system prompt, example I/O, `match`/`case` routing code, and four more schema variants (applicant screener, investor inbound, beta applicant, partnership inbound) in **[`Inbound Lead Qualifier.md`](./Inbound%20Lead%20Qualifier.md)**.
 
 ---
 
