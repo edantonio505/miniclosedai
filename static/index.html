@@ -20,7 +20,20 @@
     })();
   </script>
 </head>
-<body>
+<body data-page="dashboard">
+  <nav class="activity-bar" aria-label="Primary">
+    <button class="nav-item active" data-page="dashboard" title="Dashboard" aria-label="Dashboard">
+      <!-- Feather: grid -->
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+    </button>
+    <button class="nav-item nav-item-bottom" data-page="settings" title="Settings" aria-label="Settings">
+      <!-- Feather: settings -->
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
+  </nav>
+
+  <div class="main-area">
+  <div class="page page-dashboard">
   <header class="topbar">
     <div class="brand">
       <button id="sidebar-toggle" class="icon-btn" title="Hide sidebar" aria-label="Hide sidebar">
@@ -190,6 +203,22 @@
       </div>
     </section>
   </main>
+  </div> <!-- /.page-dashboard -->
+
+  <div class="page page-settings">
+    <div class="settings-container">
+      <h1>Settings</h1>
+      <section class="settings-section">
+        <div class="settings-section-header">
+          <h2>LLM Endpoints</h2>
+          <button id="add-backend-btn" class="btn btn-primary btn-small">+ Add endpoint</button>
+        </div>
+        <p class="settings-hint">Register Ollama or any OpenAI-compatible server (LM Studio, vLLM, llama.cpp&nbsp;server, etc.). Each saved chat picks one endpoint; models from all reachable endpoints appear in the Dashboard's model dropdown.</p>
+        <div id="backend-list" class="backend-list"></div>
+      </section>
+    </div>
+  </div>
+  </div> <!-- /.main-area -->
 
   <!-- API Code Modal -->
   <div id="modal-backdrop" class="modal-backdrop hidden">
@@ -219,6 +248,52 @@
       <div class="modal-actions">
         <button id="copy-code" class="btn btn-primary">Copy</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Add/Edit Endpoint Modal -->
+  <div id="backend-modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="backend-modal-title">Add endpoint</h3>
+        <button id="backend-modal-close" class="icon-btn" title="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <form id="backend-form" class="backend-form">
+        <label class="form-field">
+          <span>Name</span>
+          <input type="text" id="backend-name" required maxlength="80" placeholder="LM Studio" />
+        </label>
+        <label class="form-field">
+          <span>Kind</span>
+          <select id="backend-kind" required>
+            <option value="ollama">Ollama</option>
+            <option value="openai" selected>OpenAI-compatible</option>
+          </select>
+        </label>
+        <label class="form-field">
+          <span>Base URL</span>
+          <input type="text" id="backend-base-url" required placeholder="http://localhost:1234/v1" />
+          <small class="form-hint" id="backend-url-hint">Include the <code>/v1</code> suffix for LM Studio / vLLM / OpenAI-compat servers.</small>
+        </label>
+        <label class="form-field">
+          <span>API key (optional)</span>
+          <input type="password" id="backend-api-key" placeholder="leave blank for local servers" autocomplete="new-password" />
+        </label>
+        <details class="form-advanced">
+          <summary>Advanced: extra headers (JSON)</summary>
+          <textarea id="backend-headers" rows="3" placeholder='{"X-Custom": "value"}'></textarea>
+          <small class="form-hint" id="backend-headers-error"></small>
+        </details>
+        <div class="modal-actions">
+          <button type="button" id="backend-test-btn" class="btn btn-small">Test connection</button>
+          <span id="backend-test-result" class="form-hint"></span>
+          <div style="flex:1"></div>
+          <button type="button" id="backend-cancel-btn" class="btn btn-small">Cancel</button>
+          <button type="submit" id="backend-save-btn" class="btn btn-primary btn-small">Save</button>
+        </div>
+      </form>
     </div>
   </div>
 

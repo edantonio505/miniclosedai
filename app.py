@@ -1,8 +1,15 @@
-"""MiniClosedAI — FastAPI app exposing a minimal Ollama playground."""
+"""MiniClosedAI — FastAPI app exposing a multi-backend local LLM playground.
+
+Each saved conversation (bot) is pinned to a single backend via
+`conversations.backend_id`. Backends can be Ollama or any OpenAI-compatible
+server (LM Studio, vLLM, llama.cpp's `server`, etc.). All backend handling
+lives in llm.py — this module is HTTP routing + persistence.
+"""
 import json
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -22,7 +29,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="MiniClosedAI", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="MiniClosedAI", version="0.2.0", lifespan=lifespan)
 
 
 # ---------- Schemas ----------
@@ -46,6 +53,7 @@ class ChatRequest(BaseModel):
     think: ThinkValue = None
     max_thinking_tokens: int | None = Field(None, ge=1, le=100000)
     conversation_id: int | None = None
+    backend_id: int | None = None   # None → default to 1 (built-in Ollama)
 
 
 class ConversationCreate(BaseModel):
@@ -58,6 +66,7 @@ class ConversationCreate(BaseModel):
     top_k: int = Field(40, ge=1, le=500)
     think: ThinkValue = None
     max_thinking_tokens: int | None = Field(None, ge=1, le=100000)
+    backend_id: int = 1   # default: built-in Ollama
 
 
 class ConversationUpdate(BaseModel):
@@ -70,29 +79,278 @@ class ConversationUpdate(BaseModel):
     top_k: int | None = Field(None, ge=1, le=500)
     think: ThinkValue = None
     max_thinking_tokens: int | None = Field(None, ge=1, le=100000)
+    backend_id: int | None = None
 
 
 class ConversationChatRequest(BaseModel):
     """Body for POST /api/conversations/{id}/chat.
 
-    The bot's config (model, system prompt, sampling params, thinking level) is
-    locked to what the GUI saved. API callers only supply the conversation
-    content — everything else is rejected.
+    Bot config (model, system prompt, sampling params, backend) is locked to
+    whatever the GUI saved. API callers only supply the conversation content.
     """
     model_config = ConfigDict(extra="forbid")
 
     message: str | None = None
     messages: list[Message] | None = None
-    persist: bool = False  # save this turn to the conversation's display log
+    persist: bool = False
 
 
-# ---------- Models (Ollama) ----------
+class BackendCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    kind: Literal["ollama", "openai"]
+    base_url: str = Field(..., min_length=1)
+    api_key: str | None = None
+    headers: dict[str, str] = {}
+    enabled: bool = True
+
+
+class BackendUpdate(BaseModel):
+    """Everything except `kind` is updatable. `is_builtin` is server-controlled."""
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    headers: dict[str, str] | None = None
+    enabled: bool | None = None
+
+
+# ---------- Helpers ----------
+
+_PARAM_KEYS = ("temperature", "max_tokens", "top_p", "top_k", "think", "max_thinking_tokens")
+
+
+def _load_backend(backend_id: int | None) -> dict:
+    """Load a backend row by id (defaults to 1 = built-in Ollama)."""
+    bid = backend_id if backend_id is not None else 1
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM backends WHERE id = ?", (bid,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, f"Backend {bid} not found")
+    return db.row_to_dict(row)
+
+
+def _scrub_backend(b: dict) -> dict:
+    """Public-safe view of a backend row (hide api_key, show only api_key_set)."""
+    out = {k: v for k, v in b.items() if k != "api_key"}
+    out["api_key_set"] = bool(b.get("api_key"))
+    return out
+
+
+def _normalize_base_url(url: str) -> str:
+    return (url or "").rstrip("/")
+
+
+def _backend_err(backend: dict) -> str:
+    return f"Cannot reach '{backend.get('name','backend')}' at {backend.get('base_url','?')}"
+
+
+# ---------- Backends CRUD ----------
+
+@app.get("/api/backends")
+def api_list_backends():
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM backends ORDER BY id"
+        ).fetchall()
+    return [_scrub_backend(db.row_to_dict(r)) for r in rows]
+
+
+@app.post("/api/backends")
+def api_create_backend(data: BackendCreate):
+    base_url = _normalize_base_url(data.base_url)
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO backends (name, kind, base_url, api_key, headers, enabled, is_builtin)
+               VALUES (?, ?, ?, ?, ?, ?, 0)""",
+            (
+                data.name,
+                data.kind,
+                base_url,
+                data.api_key,
+                json.dumps(data.headers or {}),
+                1 if data.enabled else 0,
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM backends WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _scrub_backend(db.row_to_dict(row))
+
+
+@app.patch("/api/backends/{backend_id}")
+def api_update_backend(backend_id: int, data: BackendUpdate):
+    supplied = data.model_dump(exclude_none=True)
+    if not supplied:
+        # Load + return current state so clients can refresh.
+        return _scrub_backend(_load_backend(backend_id))
+
+    fields: list[str] = []
+    values: list = []
+    if "name" in supplied:
+        fields.append("name = ?")
+        values.append(supplied["name"])
+    if "base_url" in supplied:
+        fields.append("base_url = ?")
+        values.append(_normalize_base_url(supplied["base_url"]))
+    if "api_key" in supplied:
+        fields.append("api_key = ?")
+        values.append(supplied["api_key"])
+    if "headers" in supplied:
+        fields.append("headers = ?")
+        values.append(json.dumps(supplied["headers"] or {}))
+    if "enabled" in supplied:
+        fields.append("enabled = ?")
+        values.append(1 if supplied["enabled"] else 0)
+
+    values.append(backend_id)
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            f"UPDATE backends SET {', '.join(fields)} WHERE id = ?",
+            values,
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, f"Backend {backend_id} not found")
+        row = conn.execute("SELECT * FROM backends WHERE id = ?", (backend_id,)).fetchone()
+    return _scrub_backend(db.row_to_dict(row))
+
+
+@app.delete("/api/backends/{backend_id}")
+def api_delete_backend(backend_id: int):
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, name, is_builtin FROM backends WHERE id = ?", (backend_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"Backend {backend_id} not found")
+        if row["is_builtin"]:
+            raise HTTPException(403, "The built-in backend can't be deleted.")
+
+        bound = conn.execute(
+            "SELECT id, title FROM conversations WHERE backend_id = ?", (backend_id,)
+        ).fetchall()
+        if bound:
+            raise HTTPException(
+                409,
+                {
+                    "message": f"Backend {backend_id} is still bound to "
+                               f"{len(bound)} conversation(s). Rebind them first.",
+                    "bound_conversations": [
+                        {"id": r["id"], "title": r["title"]} for r in bound
+                    ],
+                },
+            )
+
+        conn.execute("DELETE FROM backends WHERE id = ?", (backend_id,))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/backends/test")
+async def api_backend_test(data: BackendCreate):
+    """Probe a draft (unsaved) backend config. Used by the Settings modal's
+    Test-connection button, so the browser doesn't have to make a cross-origin
+    call that CORS would block.
+    """
+    probe = {
+        "id": 0,
+        "name": data.name or "draft",
+        "kind": data.kind,
+        "base_url": _normalize_base_url(data.base_url),
+        "api_key": data.api_key,
+        "headers": data.headers or {},
+    }
+    try:
+        running = await llm.is_running(probe)
+    except Exception as e:
+        return {"running": False, "message": f"{type(e).__name__}: {e}"}
+    if not running:
+        return {
+            "running": False,
+            "message": f"No response at {probe['base_url']}.",
+        }
+    try:
+        models = await llm.list_models(probe)
+    except Exception as e:
+        return {"running": True, "models_count": 0, "message": f"Reachable but /models failed: {e}"}
+    count = len(models)
+    if count == 0:
+        return {
+            "running": True,
+            "models_count": 0,
+            "message": f"Reachable, but 0 models available. (If this is LM Studio, is a model loaded? Also confirm the URL ends with '/v1'.)",
+        }
+    return {"running": True, "models_count": count, "message": f"Reachable · {count} model(s)"}
+
+
+@app.get("/api/backends/{backend_id}/models")
+async def api_backend_models(backend_id: int):
+    backend = _load_backend(backend_id)
+    if not backend.get("enabled"):
+        return {"running": False, "models": [], "disabled": True}
+    running = await llm.is_running(backend)
+    models = await llm.list_models(backend) if running else []
+    return {"running": running, "models": models}
+
+
+@app.get("/api/backends/{backend_id}/status")
+async def api_backend_status(backend_id: int):
+    backend = _load_backend(backend_id)
+    running = await llm.is_running(backend) if backend.get("enabled") else False
+    return {
+        "running": running,
+        "base_url": backend["base_url"],
+        "kind": backend["kind"],
+        "enabled": bool(backend.get("enabled")),
+    }
+
+
+# ---------- Models (aggregated across all backends) ----------
 
 @app.get("/api/models")
 async def api_models():
-    running = await llm.is_running()
-    models = await llm.list_models() if running else []
-    return {"ollama_running": running, "models": models}
+    """Aggregated view for the Dashboard model dropdown.
+
+    Returns one entry per backend with its model list. Disabled backends are
+    included with `running=False` + empty models so the UI can still show them
+    greyed out. Preserves `ollama_running` for older front-end code until the
+    frontend is updated.
+    """
+    with db.get_conn() as conn:
+        rows = conn.execute("SELECT * FROM backends ORDER BY id").fetchall()
+    backends = [db.row_to_dict(r) for r in rows]
+
+    result = []
+    any_ollama_running = False
+    flat_ollama_models: list[dict] = []
+
+    for b in backends:
+        enabled = bool(b.get("enabled"))
+        running = await llm.is_running(b) if enabled else False
+        models = await llm.list_models(b) if (enabled and running) else []
+        if b["kind"] == "ollama" and running:
+            any_ollama_running = True
+            flat_ollama_models = models
+        result.append({
+            "id": b["id"],
+            "name": b["name"],
+            "kind": b["kind"],
+            "base_url": b["base_url"],
+            "enabled": enabled,
+            "is_builtin": bool(b.get("is_builtin")),
+            "running": running,
+            "models": models,
+        })
+
+    return {
+        # Aggregated shape — new frontend consumes this.
+        "backends": result,
+        # Back-compat: any still-alive Ollama client reads these two:
+        "ollama_running": any_ollama_running,
+        "models": flat_ollama_models,
+    }
 
 
 # ---------- Conversations ----------
@@ -101,21 +359,22 @@ async def api_models():
 def api_list_conversations():
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, title, model, updated_at FROM conversations ORDER BY updated_at DESC"
+            "SELECT id, title, model, backend_id, updated_at FROM conversations ORDER BY updated_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
 
 
-_PARAM_KEYS = ("temperature", "max_tokens", "top_p", "top_k", "think", "max_thinking_tokens")
-
-
 @app.post("/api/conversations")
 def api_create_conversation(data: ConversationCreate):
+    # Validate the backend exists before inserting.
+    _load_backend(data.backend_id)
+
     params = {k: getattr(data, k) for k in _PARAM_KEYS}
     with db.get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO conversations (title, model, system_prompt, params) VALUES (?, ?, ?, ?)",
-            (data.title, data.model, data.system_prompt, json.dumps(params)),
+            """INSERT INTO conversations (title, model, system_prompt, params, backend_id)
+               VALUES (?, ?, ?, ?, ?)""",
+            (data.title, data.model, data.system_prompt, json.dumps(params), data.backend_id),
         )
         conn.commit()
         row = conn.execute(
@@ -138,13 +397,19 @@ def api_get_conversation(conv_id: int):
 @app.patch("/api/conversations/{conv_id}")
 def api_update_conversation(conv_id: int, data: ConversationUpdate):
     supplied = data.model_dump(exclude_none=True)
+
+    # Validate a backend_id change points to a real backend.
+    if "backend_id" in supplied:
+        _load_backend(supplied["backend_id"])
+
     fields, values = [], []
-    # Plain columns:
-    for col in ("title", "model", "system_prompt"):
+    # Plain columns on the conversations table.
+    for col in ("title", "model", "system_prompt", "backend_id"):
         if col in supplied:
             fields.append(f"{col} = ?")
             values.append(supplied[col])
-    # Param overrides: merge into the params JSON column.
+
+    # Sampling params go into the JSON `params` column.
     param_updates = {k: supplied[k] for k in _PARAM_KEYS if k in supplied}
     with db.get_conn() as conn:
         if param_updates:
@@ -180,7 +445,7 @@ def api_delete_conversation(conv_id: int):
 
 @app.post("/api/conversations/{conv_id}/clear")
 def api_clear_conversation(conv_id: int):
-    """Wipe messages for this conversation, keep its config (model, system prompt, params)."""
+    """Wipe messages for this conversation, keep its config."""
     with db.get_conn() as conn:
         cur = conn.execute(
             "UPDATE conversations SET messages = '[]', updated_at = datetime('now') WHERE id = ?",
@@ -192,7 +457,7 @@ def api_clear_conversation(conv_id: int):
     return {"ok": True}
 
 
-# ---------- Chat ----------
+# ---------- Chat (legacy generic endpoint — ChatRequest carries everything) ----------
 
 def _build_messages(req: ChatRequest) -> list[dict]:
     msgs = [{"role": "system", "content": req.system_prompt}]
@@ -200,18 +465,20 @@ def _build_messages(req: ChatRequest) -> list[dict]:
     return msgs
 
 
-def _persist_turn(req: ChatRequest, assistant_text: str) -> None:
-    """Append the latest user turn + assistant reply (with param snapshot) to the conversation."""
+def _persist_turn(req: ChatRequest, assistant_text: str, backend: dict) -> None:
+    """Append the latest user turn + assistant reply to the conversation."""
     if not req.conversation_id or not req.messages:
         return
     last_user = req.messages[-1]
-    params = {
+    snapshot = {
         "model": req.model,
         "temperature": req.temperature,
         "max_tokens": req.max_tokens,
         "top_p": req.top_p,
         "top_k": req.top_k,
         "think": req.think,
+        "backend_id": backend["id"],
+        "backend_name": backend["name"],
     }
     with db.get_conn() as conn:
         row = conn.execute(
@@ -220,8 +487,8 @@ def _persist_turn(req: ChatRequest, assistant_text: str) -> None:
         if not row:
             return
         existing = json.loads(row["messages"] or "[]")
-        existing.append({"role": last_user.role, "content": last_user.content, "params": params})
-        existing.append({"role": "assistant", "content": assistant_text, "params": params})
+        existing.append({"role": last_user.role, "content": last_user.content, "params": snapshot})
+        existing.append({"role": "assistant", "content": assistant_text, "params": snapshot})
         conn.execute(
             "UPDATE conversations SET messages = ?, model = ?, updated_at = datetime('now') WHERE id = ?",
             (json.dumps(existing), req.model, req.conversation_id),
@@ -231,8 +498,10 @@ def _persist_turn(req: ChatRequest, assistant_text: str) -> None:
 
 @app.post("/api/chat")
 async def api_chat(req: ChatRequest):
+    backend = _load_backend(req.backend_id)
     try:
         text = await llm.chat(
+            backend,
             req.model,
             _build_messages(req),
             temperature=req.temperature,
@@ -242,17 +511,21 @@ async def api_chat(req: ChatRequest):
             think=req.think,
         )
     except httpx.ConnectError:
-        raise HTTPException(503, "Cannot connect to Ollama at localhost:11434")
+        raise HTTPException(503, _backend_err(backend))
     except RuntimeError as e:
         raise HTTPException(502, str(e))
-    _persist_turn(req, text)
+    _persist_turn(req, text, backend)
     return {"response": text}
 
 
-def _resolve_conversation_chat(conv_id: int, req: ConversationChatRequest) -> tuple[dict, list[dict], dict]:
-    """Load the conversation, merge request overrides with saved config, build the messages list.
+# ---------- Chat (per-conversation microservice endpoint) ----------
 
-    Returns (conv_row_dict, ollama_messages, effective_params).
+def _resolve_conversation_chat(
+    conv_id: int, req: ConversationChatRequest
+) -> tuple[dict, list[dict], dict, dict]:
+    """Load conv + its backend + build the ollama-messages list from the request.
+
+    Returns (conv, ollama_messages, effective_params, backend).
     """
     with db.get_conn() as conn:
         row = conn.execute(
@@ -265,7 +538,8 @@ def _resolve_conversation_chat(conv_id: int, req: ConversationChatRequest) -> tu
     if (req.message is None) == (req.messages is None):
         raise HTTPException(400, "Provide exactly one of 'message' (string) or 'messages' (array).")
 
-    # Config is locked to whatever the GUI saved. No per-request overrides.
+    backend = _load_backend(conv.get("backend_id", 1))
+
     saved = conv.get("params", {}) or {}
     effective = {
         "model": conv["model"],
@@ -278,26 +552,29 @@ def _resolve_conversation_chat(conv_id: int, req: ConversationChatRequest) -> tu
         "max_thinking_tokens": saved.get("max_thinking_tokens"),
     }
 
-    # Build the message list to send to Ollama.
     if req.message is not None:
         user_msgs = [{"role": "user", "content": req.message}]
     else:
         user_msgs = [m.model_dump() for m in req.messages]
 
-    # Pure-function semantic: the model sees ONLY the saved system prompt
-    # + saved params + the messages supplied in this request. Saved chat
-    # history is never replayed — it exists only for the UI to render.
-    # Callers that want multi-turn context must pass the full `messages`
-    # array themselves.
+    # Pure-function semantic — model sees only (system + request msgs). Saved
+    # chat history is never replayed; it exists only for the UI to render.
     ollama_messages = [{"role": "system", "content": effective["system_prompt"]}]
     ollama_messages.extend(user_msgs)
 
-    return conv, ollama_messages, effective
+    return conv, ollama_messages, effective, backend
 
 
-def _persist_conv_chat_turn(conv_id: int, user_msgs: list[dict], assistant_text: str, effective: dict) -> None:
+def _persist_conv_chat_turn(
+    conv_id: int, user_msgs: list[dict], assistant_text: str, effective: dict, backend: dict
+) -> None:
     params = {k: effective[k] for k in _PARAM_KEYS}
-    snapshot = {**params, "model": effective["model"]}
+    snapshot = {
+        **params,
+        "model": effective["model"],
+        "backend_id": backend["id"],
+        "backend_name": backend["name"],
+    }
     with db.get_conn() as conn:
         row = conn.execute(
             "SELECT messages FROM conversations WHERE id = ?", (conv_id,)
@@ -318,27 +595,29 @@ def _persist_conv_chat_turn(conv_id: int, user_msgs: list[dict], assistant_text:
 @app.post("/api/conversations/{conv_id}/chat")
 async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
     """Call the saved conversation as a configured function (non-streaming)."""
-    conv, messages, eff = _resolve_conversation_chat(conv_id, req)
+    conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
     try:
         text = await llm.chat(
+            backend,
             eff["model"], messages,
             temperature=eff["temperature"], max_tokens=eff["max_tokens"],
             top_p=eff["top_p"], top_k=eff["top_k"],
             think=eff["think"],
         )
     except httpx.ConnectError:
-        raise HTTPException(503, "Cannot connect to Ollama at localhost:11434")
+        raise HTTPException(503, _backend_err(backend))
     except RuntimeError as e:
         raise HTTPException(502, str(e))
 
     if req.persist:
         user_msgs = [{"role": "user", "content": req.message}] if req.message is not None else [m.model_dump() for m in req.messages]
-        _persist_conv_chat_turn(conv_id, user_msgs, text, eff)
+        _persist_conv_chat_turn(conv_id, user_msgs, text, eff, backend)
 
     return {
         "response": text,
         "conversation_id": conv_id,
         "model": eff["model"],
+        "backend_id": backend["id"],
         "persisted": req.persist,
     }
 
@@ -346,7 +625,7 @@ async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
 @app.post("/api/conversations/{conv_id}/chat/stream")
 async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
     """Call the saved conversation as a configured function (SSE streaming)."""
-    conv, messages, eff = _resolve_conversation_chat(conv_id, req)
+    conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
 
     async def event_stream():
         collected: list[str] = []
@@ -355,6 +634,7 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
         truncated = False
         try:
             async for ev in llm.chat_stream(
+                backend,
                 eff["model"], messages,
                 temperature=eff["temperature"], max_tokens=eff["max_tokens"],
                 top_p=eff["top_p"], top_k=eff["top_k"],
@@ -366,20 +646,27 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
                 elif "thinking" in ev:
                     think_count += 1
                     if max_think and think_count > max_think:
-                        truncated = True
-                        yield f"data: {json.dumps({'thinking_truncated': True, 'reason': 'max_thinking_tokens', 'limit': max_think})}\n\n"
-                        break  # closes Ollama stream → stops generation
+                        # Soft cap: stop emitting *visible* reasoning to the UI
+                        # and keep the connection open so the model can finish
+                        # reasoning and produce the actual answer. The overall
+                        # `max_tokens` still serves as the hard kill switch.
+                        if not truncated:
+                            truncated = True
+                            yield f"data: {json.dumps({'thinking_truncated': True, 'reason': 'max_thinking_tokens', 'limit': max_think})}\n\n"
+                        continue
                     yield f"data: {json.dumps({'thinking': ev['thinking']})}\n\n"
         except httpx.ConnectError:
-            yield f"data: {json.dumps({'error': 'Cannot connect to Ollama at localhost:11434. Is `ollama serve` running?'})}\n\n"
+            yield f"data: {json.dumps({'error': _backend_err(backend)})}\n\n"
             return
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
 
-        if req.persist and not truncated:
+        # Persist whenever we actually produced a response. Truncated-thinking
+        # is no longer a persistence-blocker because generation completed.
+        if req.persist:
             user_msgs = [{"role": "user", "content": req.message}] if req.message is not None else [m.model_dump() for m in req.messages]
-            _persist_conv_chat_turn(conv_id, user_msgs, "".join(collected), eff)
+            _persist_conv_chat_turn(conv_id, user_msgs, "".join(collected), eff, backend)
 
         yield f"data: {json.dumps({'end': True, 'truncated': truncated})}\n\n"
 
@@ -392,6 +679,7 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
 
 @app.post("/api/chat/stream")
 async def api_chat_stream(req: ChatRequest):
+    backend = _load_backend(req.backend_id)
     messages = _build_messages(req)
 
     async def event_stream():
@@ -401,6 +689,7 @@ async def api_chat_stream(req: ChatRequest):
         truncated = False
         try:
             async for ev in llm.chat_stream(
+                backend,
                 req.model,
                 messages,
                 temperature=req.temperature,
@@ -415,19 +704,20 @@ async def api_chat_stream(req: ChatRequest):
                 elif "thinking" in ev:
                     think_count += 1
                     if max_think and think_count > max_think:
-                        truncated = True
-                        yield f"data: {json.dumps({'thinking_truncated': True, 'reason': 'max_thinking_tokens', 'limit': max_think})}\n\n"
-                        break
+                        # Soft cap — truncate visible reasoning, keep the stream open.
+                        if not truncated:
+                            truncated = True
+                            yield f"data: {json.dumps({'thinking_truncated': True, 'reason': 'max_thinking_tokens', 'limit': max_think})}\n\n"
+                        continue
                     yield f"data: {json.dumps({'thinking': ev['thinking']})}\n\n"
         except httpx.ConnectError:
-            yield f"data: {json.dumps({'error': 'Cannot connect to Ollama at localhost:11434. Is `ollama serve` running?'})}\n\n"
+            yield f"data: {json.dumps({'error': _backend_err(backend)})}\n\n"
             return
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
 
-        if not truncated:
-            _persist_turn(req, "".join(collected))
+        _persist_turn(req, "".join(collected), backend)
         yield f"data: {json.dumps({'end': True, 'truncated': truncated})}\n\n"
 
     return StreamingResponse(
@@ -438,11 +728,9 @@ async def api_chat_stream(req: ChatRequest):
 
 
 # ---------- OpenAI-compatible endpoint ----------
-# Lets any OpenAI SDK (Python `openai`, `@openai/openai`, etc.) talk to this
-# app by setting base_url to http://<host>:8095/v1 and using the conversation
-# ID as the `model` field. The bot's GUI-saved config (system prompt, model,
-# sampling params) is the source of truth — any caller-supplied temperature,
-# max_tokens, etc. are tolerated but ignored, matching the native endpoint.
+# External clients using the OpenAI SDK hit MiniClosedAI with the conversation
+# ID in `model`. We resolve the bot's saved backend and call through it —
+# so a conversation bound to LM Studio routes there, not to Ollama.
 
 class OAIMessage(BaseModel):
     role: str
@@ -450,12 +738,7 @@ class OAIMessage(BaseModel):
 
 
 class OAICompletionRequest(BaseModel):
-    """Minimal OpenAI /v1/chat/completions request shape.
-
-    `extra="allow"` lets us tolerate fields we don't use (temperature, top_p,
-    presence_penalty, logit_bias, response_format, …) without failing the
-    request. Those fields are silently ignored — the bot config is locked.
-    """
+    """Minimal OpenAI /v1/chat/completions request shape."""
     model_config = ConfigDict(extra="allow")
 
     model: str
@@ -464,7 +747,7 @@ class OAICompletionRequest(BaseModel):
 
 
 def _conv_id_from_openai_model(model_field: str) -> int:
-    """Accept the `model` field in any of: "12", "conv-12", "bot-12", "miniclosed/12"."""
+    """Accept any of: "12", "conv-12", "bot-12", "miniclosed/12"."""
     raw = model_field.strip()
     for prefix in ("conv-", "bot-", "miniclosed/"):
         if raw.startswith(prefix):
@@ -494,6 +777,7 @@ def _load_conv_for_openai(conv_id: int) -> dict:
 async def openai_chat_completions(req: OAICompletionRequest):
     conv_id = _conv_id_from_openai_model(req.model)
     conv = _load_conv_for_openai(conv_id)
+    backend = _load_backend(conv.get("backend_id", 1))
 
     saved = conv.get("params", {}) or {}
     effective = {
@@ -505,7 +789,7 @@ async def openai_chat_completions(req: OAICompletionRequest):
         "think": saved.get("think"),
     }
 
-    # Bot's system prompt wins. Drop any system messages the caller sent.
+    # Bot's system prompt wins; drop caller-supplied system messages.
     ollama_messages = [{"role": "system", "content": conv["system_prompt"]}]
     ollama_messages.extend(
         {"role": m.role, "content": m.content}
@@ -521,6 +805,7 @@ async def openai_chat_completions(req: OAICompletionRequest):
             sent_any = False
             try:
                 async for ev in llm.chat_stream(
+                    backend,
                     effective["model"], ollama_messages,
                     temperature=effective["temperature"], max_tokens=effective["max_tokens"],
                     top_p=effective["top_p"], top_k=effective["top_k"],
@@ -528,6 +813,10 @@ async def openai_chat_completions(req: OAICompletionRequest):
                 ):
                     if "content" not in ev:
                         continue
+                    delta = {"content": ev["content"]}
+                    if not sent_any:
+                        delta["role"] = "assistant"
+                    sent_any = True
                     chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -535,19 +824,14 @@ async def openai_chat_completions(req: OAICompletionRequest):
                         "model": effective["model"],
                         "choices": [{
                             "index": 0,
-                            "delta": {"content": ev["content"]} if not sent_any
-                                     else {"content": ev["content"]},
+                            "delta": delta,
                             "finish_reason": None,
                         }],
                     }
-                    # First chunk conventionally also sets role:"assistant" in delta.
-                    if not sent_any:
-                        chunk["choices"][0]["delta"]["role"] = "assistant"
-                    sent_any = True
                     yield f"data: {json.dumps(chunk)}\n\n"
             except httpx.ConnectError:
-                err = {"error": {"message": "Cannot connect to Ollama at localhost:11434",
-                                  "type": "upstream_unavailable"}}
+                err = {"error": {"message": _backend_err(backend),
+                                 "type": "upstream_unavailable"}}
                 yield f"data: {json.dumps(err)}\n\n"
                 return
             except Exception as e:
@@ -574,13 +858,14 @@ async def openai_chat_completions(req: OAICompletionRequest):
     # Non-streaming
     try:
         text = await llm.chat(
+            backend,
             effective["model"], ollama_messages,
             temperature=effective["temperature"], max_tokens=effective["max_tokens"],
             top_p=effective["top_p"], top_k=effective["top_k"],
             think=effective["think"],
         )
     except httpx.ConnectError:
-        raise HTTPException(503, "Cannot connect to Ollama at localhost:11434")
+        raise HTTPException(503, _backend_err(backend))
     except RuntimeError as e:
         raise HTTPException(502, str(e))
 
@@ -603,7 +888,7 @@ async def openai_list_models():
     """OpenAI-compatible model listing — each MiniClosedAI conversation appears as a model."""
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, title, model, created_at FROM conversations ORDER BY id"
+            "SELECT id, title, model, backend_id, created_at FROM conversations ORDER BY id"
         ).fetchall()
     return {
         "object": "list",
@@ -615,6 +900,7 @@ async def openai_list_models():
                 "owned_by": "miniclosedai",
                 "title": r["title"],
                 "backend_model": r["model"],
+                "backend_id": r["backend_id"],
             }
             for r in rows
         ],
