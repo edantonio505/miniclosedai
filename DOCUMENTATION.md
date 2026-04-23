@@ -1,9 +1,19 @@
 # MiniClosedAI — Documentation
 
+> ⚠ **This file predates the multi-endpoint (OpenWebUI-style) feature.** The
+> README now covers install, the activity bar, the Settings page, LM Studio
+> and any-OpenAI-compatible endpoint setup, the grouped model dropdown, and
+> the full API surface (including `/api/backends` CRUD) at parity with the
+> current app. Treat **[README.md](./README.md)** as the canonical reference.
+> What remains here is a deeper architectural narrative for anyone who wants
+> to read around the code — not a contract.
+
 Full reference for architecture, features, API, and usage patterns.
 
 For install + quick start, see **[README.md](./README.md)**.
 For per-OS Ollama install details, see **[INSTALL.md](./INSTALL.md)**.
+For LM Studio / OpenAI-compat endpoint setup, see
+**[README § Connecting LM Studio and other OpenAI-compatible endpoints](./README.md#connecting-lm-studio-and-other-openai-compatible-endpoints)**.
 
 ---
 

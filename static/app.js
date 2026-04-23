@@ -129,20 +129,21 @@ function scrollToBottom() {
 }
 
 function getParams() {
-  const p = {
+  // Always include every param key. Empty/cleared fields become explicit `null`
+  // so the server can distinguish "unchanged" from "cleared" and actually wipe
+  // the saved value (otherwise a PATCH that omits a key silently preserves
+  // the old value).
+  const thinkVal = thinkFromSelect();
+  const mtRaw = els.maxThinking.value.trim();
+  const mtNum = mtRaw === "" ? null : parseInt(mtRaw, 10);
+  return {
     temperature: parseFloat(els.temperature.value),
     max_tokens: parseInt(els.maxTokens.value, 10),
     top_p: parseFloat(els.topP.value),
     top_k: parseInt(els.topK.value, 10),
+    think: thinkVal === undefined ? null : thinkVal,
+    max_thinking_tokens: Number.isFinite(mtNum) && mtNum > 0 ? mtNum : null,
   };
-  const t = thinkFromSelect();
-  if (t !== undefined) p.think = t;
-  const mt = els.maxThinking.value.trim();
-  if (mt !== "") {
-    const n = parseInt(mt, 10);
-    if (Number.isFinite(n) && n > 0) p.max_thinking_tokens = n;
-  }
-  return p;
 }
 
 // Translate <select> value into the value expected on the wire:

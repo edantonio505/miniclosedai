@@ -396,22 +396,30 @@ def api_get_conversation(conv_id: int):
 
 @app.patch("/api/conversations/{conv_id}")
 def api_update_conversation(conv_id: int, data: ConversationUpdate):
-    supplied = data.model_dump(exclude_none=True)
+    # exclude_unset=True (not exclude_none) so the client can distinguish
+    # "didn't supply this field" from "explicitly set it to null". For param
+    # keys, null means "clear the saved value" — e.g. blanking out
+    # max_thinking_tokens or flipping Thinking back to Default.
+    supplied = data.model_dump(exclude_unset=True)
 
-    # Validate a backend_id change points to a real backend.
+    # Validate a backend_id change points to a real backend (reject null; the
+    # column is NOT NULL with a logical FK).
     if "backend_id" in supplied:
+        if supplied["backend_id"] is None:
+            raise HTTPException(400, "backend_id cannot be null")
         _load_backend(supplied["backend_id"])
 
     fields, values = [], []
-    # Plain columns on the conversations table.
+    # Plain columns on the conversations table — all NOT NULL, so a null value
+    # here means "ignore" (client shouldn't have sent it, but be lenient).
     for col in ("title", "model", "system_prompt", "backend_id"):
-        if col in supplied:
+        if col in supplied and supplied[col] is not None:
             fields.append(f"{col} = ?")
             values.append(supplied[col])
 
-    # Sampling params go into the JSON `params` column.
-    param_updates = {k: supplied[k] for k in _PARAM_KEYS if k in supplied}
+    # Sampling params go into the JSON `params` column. null = clear the key.
     with db.get_conn() as conn:
+        param_updates = {k: supplied[k] for k in _PARAM_KEYS if k in supplied}
         if param_updates:
             row = conn.execute(
                 "SELECT params FROM conversations WHERE id = ?", (conv_id,)
@@ -419,7 +427,11 @@ def api_update_conversation(conv_id: int, data: ConversationUpdate):
             if not row:
                 raise HTTPException(404, "Conversation not found")
             merged = json.loads(row["params"] or "{}")
-            merged.update(param_updates)
+            for k, v in param_updates.items():
+                if v is None:
+                    merged.pop(k, None)
+                else:
+                    merged[k] = v
             fields.append("params = ?")
             values.append(json.dumps(merged))
         if not fields:

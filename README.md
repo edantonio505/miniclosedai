@@ -46,31 +46,33 @@ Built with **FastAPI** (3 Python deps), vanilla JS, and SQLite. Runs on a laptop
 4. [Run](#run)
 5. [Your first bot — 60 seconds](#your-first-bot--60-seconds)
 6. [UI guide](#ui-guide)
-7. [The microservice pattern](#the-microservice-pattern)
-8. [API reference — native endpoints](#api-reference--native-endpoints)
-9. [OpenAI-compatible endpoint](#openai-compatible-endpoint)
-10. [Recipes — common bot patterns](#recipes--common-bot-patterns)
-11. [Getting good responses from small models](#getting-good-responses-from-small-models)
-12. [LAN access](#lan-access)
-13. [Troubleshooting](#troubleshooting)
-14. [Project layout](#project-layout)
-15. [Security](#security)
-16. [License](#license)
+7. [Connecting LM Studio and other OpenAI-compatible endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)
+8. [The microservice pattern](#the-microservice-pattern)
+9. [API reference — native endpoints](#api-reference--native-endpoints)
+10. [OpenAI-compatible endpoint](#openai-compatible-endpoint)
+11. [Recipes — common bot patterns](#recipes--common-bot-patterns)
+12. [Getting good responses from small models](#getting-good-responses-from-small-models)
+13. [LAN access](#lan-access)
+14. [Troubleshooting](#troubleshooting)
+15. [Project layout](#project-layout)
+16. [Security](#security)
+17. [License](#license)
 
 ---
 
 ## What it is
 
-MiniClosedAI is a single-user, single-process web app that wraps **local** Ollama into a playground UI. Its feature list is short on purpose:
+MiniClosedAI is a single-user, single-process web app that wraps **local** LLMs into a playground UI. Its feature list is short on purpose:
 
-- 🧠 **100% local inference** via Ollama — no data leaves your machine.
+- 🧠 **100% local inference** — no data leaves your machine.
+- 🔌 **Multi-endpoint, OpenWebUI-style** — register Ollama plus any number of OpenAI-compatible servers (LM Studio, vLLM, llama.cpp server, etc.). One grouped model dropdown lists everything; each saved chat picks one endpoint + model.
 - 🎛️ **Live parameter sliders** — temperature, max tokens, top-p, top-k, thinking level, max thinking tokens. Every change auto-saves to the active conversation.
 - 🔁 **Per-chat microservice endpoints** — each saved conversation is an addressable URL that replays your GUI-configured bot. Callers just send `{"message": "..."}`.
-- 💭 **Reasoning-model aware** — `thinking` and `content` tokens from models like qwen3, deepseek-r1, and gpt-oss stream separately; "thoughts" appear in a collapsible block.
-- ⏹ **Manual + automatic stop** — a Stop button in the composer, plus server-side `max_thinking_tokens` auto-stop so runaway reasoning can't burn through your context.
-- 🔌 **OpenAI-compatible endpoint** — drop MiniClosedAI in place of `api.openai.com` with a one-line `base_url` change. Every bot appears as a "model" to the SDK.
-- 🎨 **Polished UI** — Light / Dark / System theme, draggable splitters (sidebar width + system-prompt height), Gemini-style empty state, syntax-highlighted API-code modal with Streaming/Non-streaming and Native/OpenAI variants.
-- 🗂️ **SQLite persistence** — one file, one table, JSON columns for messages. Delete to reset, copy to migrate.
+- 💭 **Reasoning-model aware** — `thinking` and `content` tokens from models like qwen3, deepseek-r1, and gpt-oss stream separately; "thoughts" appear in a collapsible block. `max_thinking_tokens` is a soft cap: visible reasoning is hidden but the model keeps running so the answer still arrives.
+- ⏹ **Manual stop** — a Stop button in the composer aborts the stream cleanly.
+- 🔁 **OpenAI-SDK-compatible server** — drop MiniClosedAI in place of `api.openai.com` with a one-line `base_url` change. Every bot appears as a "model" to the SDK; calls route to whichever backend that bot is pinned to.
+- 🎨 **Polished UI** — left activity bar (Dashboard / Settings), Light / Dark / System theme, draggable splitters (sidebar width + system-prompt height), Gemini-style empty state, syntax-highlighted API-code modal with Streaming/Non-streaming and Native/OpenAI variants.
+- 🗂️ **SQLite persistence** — one file, two tables (`backends`, `conversations`), JSON columns for messages. Delete to reset, copy to migrate.
 
 **What it is not:** a production inference platform. No authentication, no rate limiting, no multi-user. Intended for localhost or a trusted LAN.
 
@@ -81,8 +83,10 @@ MiniClosedAI is a single-user, single-process web app that wraps **local** Ollam
 | Requirement | Version | Notes |
 |---|---|---|
 | Python | 3.10 or newer | `python3 --version` |
-| Ollama | any recent release | Runs on `http://localhost:11434` |
-| At least one pulled model | see [recommended models](#recommended-models-1b10b) | `ollama list` |
+| At least one LLM backend | Ollama *or* LM Studio *or* any OpenAI-compatible server | Ollama is the built-in default |
+| Ollama | any recent release | Optional if you only use OpenAI-compat backends. Default URL `http://localhost:11434` |
+| LM Studio | any recent release with the *Local Server* feature | Optional. Serves `/v1` at (typically) `http://host:1234/v1` |
+| At least one model | pulled (Ollama) or loaded (LM Studio) | see [recommended models](#recommended-models-1b10b) |
 | RAM | ~2 GB for 1–3B models; 8+ GB for 7–9B | More for 20B+ |
 | Disk | ~1–10 GB per model | Plus 200 MB for the app itself |
 
@@ -176,15 +180,24 @@ That's the whole loop: **configure → save → call**.
 
 ## UI guide
 
-### Header
+### Activity bar (left edge)
+
+Vertical nav with two icons — clicking swaps the main content area without navigating:
+
+- **Dashboard** (top, grid icon) — the chat + sidebar you use for authoring and running bots. This is where you land.
+- **Settings** (bottom, gear icon) — register and manage LLM endpoints (see [Connecting LM Studio and other endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)).
+
+Your selection persists across reloads. Streaming chats keep playing when you flip to Settings and back — the DOM is never unmounted.
+
+### Header (Dashboard)
 
 | Control | Purpose |
 |---|---|
 | ◆ logo + title | Branding |
 | Sidebar toggle (panel-left icon) | Collapse/expand the sidebar. Preference persists. |
-| **Model** `<select>` | Every pulled Ollama chat model. Cloud proxies and embedding-only models are filtered out. Changing this mid-chat updates the active bot's saved model. |
+| **Model** `<select>` | **Grouped by endpoint.** Each registered backend contributes an `<optgroup>` with its available models. Picking a model from a different group switches the bot's backend too. |
 | **Conversation** `<select>` | Switch between saved bots. Shows title + backend model. |
-| **+ New Chat** | Prompts for a name, then creates a fresh bot with default params (model is kept from the current selection). |
+| **+ New Chat** | Prompts for a name, then creates a fresh bot with default params (model + backend inherited from current selection). |
 | **↺ Clear** | Wipes messages in the current conversation, keeps the config. |
 | **🗑 Delete** | Removes the current conversation entirely. |
 | **API Code** | Opens the snippet modal (see below). |
@@ -209,7 +222,7 @@ Two panels, separated by a **horizontal splitter** you can drag to resize:
 
 **Reset defaults** snaps everything back to stock values.
 
-**Status** at the bottom shows Ollama's connection state (green/amber/red dot) and model count.
+**Status** at the bottom reports the reachable / total endpoint count plus a combined model count (green dot = at least one endpoint reachable; amber = some down; red = none reachable).
 
 Also: a **vertical splitter** between sidebar and chat lets you widen the sidebar. Both splitters persist to localStorage; double-click either to reset.
 
@@ -234,6 +247,59 @@ Three independent toggles produce **12 snippet variants**:
 - **Style**: Native · OpenAI-compat
 
 Copy button works on both HTTPS/localhost (via `navigator.clipboard`) and plain-HTTP LAN (falls back to `document.execCommand("copy")`).
+
+---
+
+## Connecting LM Studio and other OpenAI-compatible endpoints
+
+MiniClosedAI ships with **Ollama as a built-in endpoint** and lets you register any number of additional **OpenAI-compatible** servers alongside it: [LM Studio](https://lmstudio.ai), [vLLM](https://docs.vllm.ai), `llama.cpp`'s `server` binary, [Text Generation WebUI](https://github.com/oobabooga/text-generation-webui)'s OpenAI extension, or the real OpenAI API itself if you want.
+
+Each saved conversation picks one endpoint + one model; the Dashboard's model dropdown groups everything into a single OpenWebUI-style `<optgroup>` picker so you can chat with a Qwen3.6 on LM Studio and a Llama3.2 on Ollama in separate tabs without swapping anything.
+
+### Adding LM Studio — step by step
+
+1. **In LM Studio**, open the *Developer* tab → turn on **Start Server** (port 1234 by default). Load at least one model from the chat sidebar so `/v1/models` has something to list.
+2. *(Optional)* Decide whether to gate the endpoint with an API key. For localhost-only use, turn *Require API key* **off** — easier. For LAN use with a key, copy the token LM Studio shows you.
+3. **In MiniClosedAI**, click the **Settings** icon (gear, bottom of the activity bar) → **+ Add endpoint**. Fill in:
+   - **Name**: anything readable, e.g. `LM Studio`
+   - **Kind**: *OpenAI-compatible*
+   - **Base URL**: **`http://localhost:1234/v1`** (local) or `http://<lan-host>:1234/v1` (remote). **The `/v1` suffix is required** — without it, requests hit LM Studio's admin routes and return 0 models.
+   - **API key**: paste the LM Studio token if you enabled auth, otherwise leave blank.
+   - **Extra headers**: usually empty.
+4. Click **Test connection** — should say *"✓ Reachable · N model(s)"*. If it says *"Reachable, but 0 models available"*, you're missing `/v1`.
+5. **Save.** Return to the Dashboard. The model dropdown now has a second `<optgroup>` labeled with your endpoint name; its options are the models LM Studio has loaded.
+
+### Using it
+
+- **Pick any LM Studio model** from the dropdown and chat normally. The bot saves the `(model, backend_id)` pair so the next time you open that conversation it routes to LM Studio automatically.
+- **API Code modal** emits snippets that call MiniClosedAI's `/api/conversations/{id}/chat` or `/v1/chat/completions`. Your downstream code talks to MiniClosedAI; MiniClosedAI relays to whichever endpoint the bot is pinned to.
+- **Mix freely.** One bot on Ollama (local), another on LM Studio (different host on your LAN), a third on a custom vLLM endpoint — all callable from the same URL base.
+
+### Reasoning models on LM Studio / vLLM
+
+The **Thinking** sidebar control translates as follows when a conversation is bound to an OpenAI-compatible endpoint:
+
+| Thinking value | What gets sent |
+|---|---|
+| Off | `chat_template_kwargs: {enable_thinking: false}` + `/no_think` appended to the last user message |
+| On | `chat_template_kwargs: {enable_thinking: true}` + `/think` appended to the last user message |
+| Low / Medium / High | `reasoning_effort: <value>` (gpt-oss family) |
+
+Whether the *server* honors these signals depends on the build. Newer vLLM and LM Studio versions respect `enable_thinking`; older ones don't. **If your model keeps reasoning after you set Thinking: Off, your LM Studio build is ignoring the flag** — MiniClosedAI has already sent it three different ways. The practical workaround is simple:
+
+- **Use a reasoning model for reasoning tasks** with Thinking: On and no `max_thinking_tokens` cap — Qwen3.x, DeepSeek-R1, gpt-oss.
+- **Use a non-reasoning model for strict-output tasks** (JSON extractors, classifiers, one-word answers) — Gemma 4, Mistral, Llama 3.x, qwen2.5 variants.
+
+`max_thinking_tokens` is a **soft cap**: when exceeded, MiniClosedAI hides further reasoning from the UI but keeps the stream open so the model can finish and emit its actual answer. The banner reads *"✂ Thinking hidden after N tokens. Model still finishing its reasoning; the answer will follow."* The hard kill switch is **Max Tokens**.
+
+### Managing endpoints
+
+From the Settings page:
+
+- **Test connection** (on each card or in the Add/Edit modal) probes the endpoint *through the MiniClosedAI server* — avoids browser CORS blocks on cross-origin calls to LM Studio.
+- **Edit** lets you change the name, URL, API key, or custom headers. `kind` is immutable once saved.
+- **Delete** removes a non-built-in endpoint. If any conversation is still bound to it, you get a 409 listing the conversations — rebind them first, then retry.
+- **The built-in Ollama endpoint** can be renamed or have its URL changed (useful if Ollama runs on a different port or host), but can't be deleted.
 
 ---
 
@@ -299,21 +365,86 @@ The GUI always sets `persist: true`. API callers default to false (each call is 
 
 Base URL: `http://<host>:8095`. All endpoints return JSON unless noted. Interactive OpenAPI docs at `/docs`.
 
-### Models
+### Models (aggregated)
 
 ```
 GET /api/models
 ```
 
-Returns the list of local Ollama chat models, with `ollama_running` flag.
+Returns every enabled backend and the models it reports, plus a legacy flat shape for back-compat with anything still expecting Ollama-only output.
 
 ```json
 {
+  "backends": [
+    {
+      "id": 1,
+      "name": "Ollama (built-in)",
+      "kind": "ollama",
+      "base_url": "http://localhost:11434",
+      "enabled": true,
+      "is_builtin": true,
+      "running": true,
+      "models": [
+        { "name": "llama3.2:3b", "size": 2019393189,
+          "details": { "parameter_size": "3.2B" } }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "LM Studio",
+      "kind": "openai",
+      "base_url": "http://localhost:1234/v1",
+      "enabled": true,
+      "is_builtin": false,
+      "running": true,
+      "models": [ { "name": "qwen/qwen3.6-35b-a3b", "size": 0, "details": {} } ]
+    }
+  ],
   "ollama_running": true,
-  "models": [
-    { "name": "llama3.2:3b", "size": 2019393189, "details": { "parameter_size": "3.2B" } }
-  ]
+  "models": [ /* legacy flat list from backend id=1 only */ ]
 }
+```
+
+### Backends (endpoint lifecycle)
+
+```
+GET    /api/backends              → list all (api_key scrubbed to api_key_set bool)
+POST   /api/backends              → create. Strip trailing /, normalize URL.
+PATCH  /api/backends/{id}         → update (kind is immutable)
+DELETE /api/backends/{id}         → 403 on is_builtin, 409 if bound to chats
+GET    /api/backends/{id}/models  → list that backend's models only
+GET    /api/backends/{id}/status  → is it reachable?
+POST   /api/backends/test         → probe a draft config without saving
+```
+
+**Create body:**
+
+```bash
+curl -X POST http://localhost:8095/api/backends \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "LM Studio",
+    "kind": "openai",
+    "base_url": "http://localhost:1234/v1",
+    "api_key": "optional-bearer-token",
+    "headers": {"X-Custom": "optional"}
+  }'
+```
+
+**Valid `kind` values:** `"ollama"` · `"openai"`. The OpenAI kind speaks the `/v1/chat/completions` wire format and works with any compliant server.
+
+**Delete guardrails:**
+
+- `DELETE /api/backends/1` (or any row with `is_builtin=1`) → **403 Forbidden**.
+- `DELETE /api/backends/<id>` when one or more conversations still point at it → **409 Conflict** with a `bound_conversations` list. Rebind those conversations first (change their saved model to one on a different backend), then retry the delete.
+
+**Test endpoint** (draft probe — server-side, bypasses browser CORS):
+
+```bash
+curl -X POST http://localhost:8095/api/backends/test \
+  -H "Content-Type: application/json" \
+  -d '{"name":"draft","kind":"openai","base_url":"http://localhost:1234/v1"}'
+# → {"running": true, "models_count": 7, "message": "Reachable · 7 model(s)"}
 ```
 
 ### Conversations (bot lifecycle)
@@ -327,7 +458,7 @@ DELETE /api/conversations/{id}        → delete
 POST   /api/conversations/{id}/clear  → wipe messages, keep config
 ```
 
-**Create** — supply any subset of config fields:
+**Create** — supply any subset of config fields. `backend_id` defaults to `1` (built-in Ollama); set it to pin the bot to an OpenAI-compatible endpoint you registered in Settings.
 
 ```bash
 curl -X POST http://localhost:8095/api/conversations \
@@ -335,6 +466,7 @@ curl -X POST http://localhost:8095/api/conversations \
   -d '{
     "title": "Info extractor",
     "model": "qwen3:8b",
+    "backend_id": 1,
     "system_prompt": "Return pure JSON. No prose.",
     "temperature": 0.1,
     "max_tokens": 1200,
@@ -349,6 +481,7 @@ curl -X POST http://localhost:8095/api/conversations \
   "id": 3,
   "title": "Info extractor",
   "model": "qwen3:8b",
+  "backend_id": 1,
   "system_prompt": "...",
   "messages": [ {"role":"user","content":"...","params":{...}}, ... ],
   "params": {"temperature": 0.1, "max_tokens": 1200, "top_p": 0.9,
@@ -356,6 +489,14 @@ curl -X POST http://localhost:8095/api/conversations \
   "created_at": "2026-04-21 01:23:45",
   "updated_at": "2026-04-21 01:24:10"
 }
+```
+
+**PATCH backend switch** — change which endpoint a bot runs on:
+
+```bash
+curl -X PATCH http://localhost:8095/api/conversations/3 \
+  -H "Content-Type: application/json" \
+  -d '{"backend_id": 2, "model": "qwen/qwen3.6-35b-a3b"}'
 ```
 
 **PATCH** — send only the fields you want to change. Sampling params merge into the saved JSON; other saved params are preserved.
@@ -736,6 +877,12 @@ Snippets generated by the **API Code** modal use `window.location.origin`, so LA
 | Can't access from phone on the same WiFi | Bind to `0.0.0.0` (not `127.0.0.1`) and allow the port in your firewall. See [LAN access](#lan-access). |
 | Sidebar settings don't apply to API calls | The sidebar auto-saves with a 350 ms debounce. The save also flushes automatically when you open **API Code** or send a message. If a one-off call still seems stale, verify with `curl http://localhost:8095/api/conversations/<id>` and look at `model`, `system_prompt`, `params`. |
 | GUI answer different from API answer for the same message | Usually means the UI response was accidentally influenced by prior chat history that happened to include examples. The stateless API never replays history. Add the examples to the system prompt. |
+| Add-endpoint **Test connection** says *"Reachable, but 0 models available"* | The base URL is missing `/v1` (LM Studio, vLLM, OpenAI all serve the API under `/v1/*`). Edit the endpoint and change `http://host:1234` → `http://host:1234/v1`. |
+| Add-endpoint Test says **"Failed to fetch"** | Fixed. Older frontend ran the probe directly from the browser and got CORS-blocked. Hard-refresh the page — the modern Test button goes through the MiniClosedAI server. |
+| LM Studio returns *"Invalid LM Studio API token"* (401) | Either paste a fresh key into the endpoint's **Edit → API key** field, or turn off *Require API key* in LM Studio's Developer tab for localhost use. |
+| Qwen3/DeepSeek-R1 on LM Studio keeps reasoning with **Thinking: Off** | Your LM Studio build is ignoring both `chat_template_kwargs.enable_thinking: false` and the `/no_think` magic token. Workaround: leave Thinking on (or pick a non-reasoning model like Gemma 4 / Llama 3.2 / Mistral for strict-output tasks). The soft-truncate fix still ensures the answer arrives even when reasoning runs. |
+| *"✂ Thinking hidden after N tokens. Model still finishing its reasoning; the answer will follow."* | Informational, not an error. The model exceeded your `max_thinking_tokens` soft cap; further reasoning is hidden from the UI but the stream stays open so content can still arrive. Raise the cap (or clear it) to see full thoughts; raise **Max Tokens** if the whole response gets cut off before the answer. |
+| Deleting an endpoint returns 409 with `bound_conversations` | Can't delete an endpoint any bot still uses. Either rebind each listed conversation to a different endpoint (change its model from the grouped dropdown) or delete those conversations first, then retry. |
 
 ---
 
@@ -743,21 +890,23 @@ Snippets generated by the **API Code** modal use `window.location.origin`, so LA
 
 ```
 miniclosedai/
-├── app.py                # FastAPI routes (native + OpenAI-compat)
-├── llm.py                # Ollama HTTP client — streaming + reasoning-aware
-├── db.py                 # SQLite schema + helpers (stdlib sqlite3)
+├── app.py                # FastAPI routes (native + OpenAI-compat, multi-backend)
+├── llm.py                # Kind-dispatched client: Ollama + OpenAI-compat
+├── db.py                 # SQLite schema + additive migrations (stdlib sqlite3)
 ├── requirements.txt      # fastapi, uvicorn, httpx  (that's all)
 ├── static/
-│   ├── index.html        # Single-page UI
+│   ├── index.html        # Single-page UI (activity bar + Dashboard + Settings)
 │   ├── style.css         # Design system (light + dark)
-│   └── app.js            # Theme, splitters, chat, modal, persistence
+│   └── app.js            # Theme, splitters, chat, endpoint CRUD, grouped model dropdown
 ├── README.md             # This document
 ├── DOCUMENTATION.md      # Extra architecture detail (this README covers 95% of it)
 ├── INSTALL.md            # Per-OS Ollama install detail
+├── Support Ticket Router.md      # Standalone bot recipe
+├── Inbound Lead Qualifier.md     # Standalone bot recipe
 └── miniclosedai.db       # SQLite file (gitignored, runtime-generated)
 ```
 
-**Backend:** ~600 LoC Python total. **Frontend:** ~1000 LoC JS + ~650 CSS + ~170 HTML.
+**Backend:** ~900 LoC Python total. **Frontend:** ~1700 LoC JS + ~850 CSS + ~240 HTML.
 
 ---
 
