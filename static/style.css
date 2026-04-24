@@ -985,6 +985,70 @@ body.sidebar-collapsed #sidebar-toggle {
   opacity: 0.7;
 }
 
+/* Edit-message affordance: pencil icon in the top-right of each message,
+   fades in on hover so it doesn't compete with reading. */
+.msg-edit-btn {
+  position: absolute;
+  top: 16px;
+  right: 6px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: inherit;
+  opacity: 0.25;
+  cursor: pointer;
+  transition: opacity var(--t-fast), background var(--t-fast), border-color var(--t-fast);
+}
+.msg:hover .msg-edit-btn { opacity: 0.75; }
+.msg-edit-btn:hover {
+  opacity: 1;
+  background: var(--panel-hover);
+  border-color: var(--border);
+}
+.msg-edit-btn svg { width: 14px; height: 14px; }
+
+/* In-place editor — replaces the rendered .msg-body while open. */
+.msg-edit-area {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 2px;
+}
+.msg-edit-area textarea {
+  width: 100%;
+  min-height: 72px;
+  max-height: 60vh;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.55;
+  resize: vertical;
+}
+.msg-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* "edited" marker — muted pill that sits alongside params-badge. */
+.msg-edited-badge {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 1px 8px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 9999px;
+  font-family: var(--font-mono);
+  opacity: 0.8;
+  user-select: none;
+}
+
 /* Streaming cursor */
 .cursor::after {
   content: "▍";

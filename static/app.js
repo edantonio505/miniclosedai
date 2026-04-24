@@ -5,6 +5,7 @@ const els = {
   convSelect: document.getElementById("conversation-select"),
   newChatBtn: document.getElementById("new-chat-btn"),
   clearChatBtn: document.getElementById("clear-chat-btn"),
+  downloadCsvBtn: document.getElementById("download-csv-btn"),
   deleteChatBtn: document.getElementById("delete-chat-btn"),
   apiCodeBtn: document.getElementById("api-code-btn"),
   systemPrompt: document.getElementById("system-prompt"),
@@ -529,16 +530,24 @@ function renderMessages() {
     els.messages.insertAdjacentHTML("beforeend", EMPTY_STATE_HTML);
     return;
   }
-  for (const m of state.messages) renderMessage(m);
+  state.messages.forEach((m, i) => renderMessage(m, i));
   scrollToBottom();
 }
 
-function renderMessage(m) {
+/**
+ * Render one message. `index` is its position in state.messages — stashed on
+ * the DOM node so the edit handler can look up the raw content without
+ * re-deriving it from the rendered HTML.
+ */
+function renderMessage(m, index) {
   const div = document.createElement("div");
   div.className = `msg ${m.role}`;
+  if (index != null) div.dataset.index = String(index);
   if (m.role === "user") {
-    div.textContent = m.content;
-    // params are stored on user messages for reproducibility but not displayed
+    const body = document.createElement("div");
+    body.className = "msg-body";
+    body.textContent = m.content;
+    div.appendChild(body);
   } else {
     // Wrap assistant content in a single child so the flex avatar lays out correctly.
     const body = document.createElement("div");
@@ -548,6 +557,11 @@ function renderMessage(m) {
     highlightCodeBlocks(body);
     if (m.params) appendParamsBadge(body, m.params);
   }
+  if (m.edited) appendEditedBadge(div, m);
+  // Pencil button — assistant turns only. Disabled while a stream is active
+  // so you can't clobber a message that's still growing.
+  if (index != null && m.role === "assistant") _appendEditButton(div, index);
+
   const emptyState = els.messages.querySelector(".empty-state");
   if (emptyState) emptyState.remove();
   els.messages.appendChild(div);
@@ -559,6 +573,159 @@ function appendParamsBadge(parent, params) {
   badge.className = "params-badge";
   badge.textContent = `${params.model || ""} · T=${params.temperature} · max=${params.max_tokens} · top_p=${params.top_p} · top_k=${params.top_k}`;
   parent.appendChild(badge);
+}
+
+function appendEditedBadge(msgEl, m) {
+  const badge = document.createElement("div");
+  badge.className = "msg-edited-badge";
+  badge.textContent = "edited";
+  if (m.original_content) {
+    badge.title = "Click to see the original model output";
+    badge.addEventListener("click", () => {
+      alert(
+        "Original (before editing):\n\n" +
+        (m.original_content.length > 2000
+          ? m.original_content.slice(0, 2000) + "\n\n…(truncated)"
+          : m.original_content)
+      );
+    });
+    badge.style.cursor = "pointer";
+  }
+  msgEl.appendChild(badge);
+}
+
+function _appendEditButton(msgEl, index) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "msg-edit-btn";
+  btn.title = "Edit message";
+  btn.setAttribute("aria-label", "Edit message");
+  btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>`;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (state.abortController) {
+      // Don't let anyone edit a turn while a stream is still growing.
+      return;
+    }
+    openInlineEditor(msgEl, index);
+  });
+  msgEl.appendChild(btn);
+}
+
+function openInlineEditor(msgEl, index) {
+  const m = state.messages[index];
+  if (!m) return;
+  // Only one editor open at a time.
+  if (msgEl.querySelector(".msg-edit-area")) return;
+
+  const body = msgEl.querySelector(".msg-body");
+  const editBtn = msgEl.querySelector(".msg-edit-btn");
+  if (!body) return;
+  const originalDisplay = body.style.display;
+  body.style.display = "none";
+  if (editBtn) editBtn.style.display = "none";
+
+  const wrap = document.createElement("div");
+  wrap.className = "msg-edit-area";
+
+  const textarea = document.createElement("textarea");
+  textarea.value = m.content || "";
+  textarea.rows = Math.min(24, Math.max(3, (m.content || "").split("\n").length + 1));
+  wrap.appendChild(textarea);
+
+  const actions = document.createElement("div");
+  actions.className = "msg-edit-actions";
+
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.className = "btn btn-primary btn-small";
+  saveBtn.textContent = "Save";
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "btn btn-small";
+  cancelBtn.textContent = "Cancel";
+
+  actions.appendChild(cancelBtn);
+  actions.appendChild(saveBtn);
+  wrap.appendChild(actions);
+  msgEl.appendChild(wrap);
+
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+
+  const close = () => {
+    wrap.remove();
+    body.style.display = originalDisplay;
+    if (editBtn) editBtn.style.display = "";
+  };
+
+  cancelBtn.addEventListener("click", close);
+  saveBtn.addEventListener("click", () => saveInlineEdit(msgEl, index, textarea.value, close, saveBtn));
+  textarea.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+    } else if ((e.key === "Enter") && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      saveInlineEdit(msgEl, index, textarea.value, close, saveBtn);
+    }
+  });
+}
+
+async function saveInlineEdit(msgEl, index, content, close, saveBtn) {
+  if (!state.conversationId) { close(); return; }
+  saveBtn.disabled = true;
+  const prevLabel = saveBtn.textContent;
+  saveBtn.textContent = "Saving…";
+  try {
+    const r = await fetch(
+      `/api/conversations/${state.conversationId}/messages/${index}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      }
+    );
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      const msg = (body.detail && body.detail.message) || body.detail || `HTTP ${r.status}`;
+      alert("Edit failed: " + (typeof msg === "string" ? msg : JSON.stringify(msg)));
+      return;
+    }
+    const updated = await r.json();
+    state.messages = updated.messages || [];
+    // Re-render this one message in place to preserve scroll position.
+    const fresh = state.messages[index];
+    if (fresh) _rerenderMessageInPlace(msgEl, fresh, index);
+    else close();
+  } catch (e) {
+    alert("Edit failed: " + (e && e.message || e));
+  } finally {
+    saveBtn.disabled = false;
+    saveBtn.textContent = prevLabel;
+  }
+}
+
+function _rerenderMessageInPlace(msgEl, m, index) {
+  // Wipe children, reuse the existing .msg element so the outer layout / data-
+  // index / flex position stay intact.
+  msgEl.innerHTML = "";
+  if (m.role === "user") {
+    const body = document.createElement("div");
+    body.className = "msg-body";
+    body.textContent = m.content;
+    msgEl.appendChild(body);
+  } else {
+    const body = document.createElement("div");
+    body.className = "msg-body";
+    body.innerHTML = render(m.content);
+    msgEl.appendChild(body);
+    highlightCodeBlocks(body);
+    if (m.params) appendParamsBadge(body, m.params);
+  }
+  if (m.edited) appendEditedBadge(msgEl, m);
+  if (m.role === "assistant") _appendEditButton(msgEl, index);
 }
 
 // ---------- Streaming chat ----------
@@ -1027,6 +1194,7 @@ function bindChat() {
   });
   els.newChatBtn.addEventListener("click", newConversation);
   els.clearChatBtn.addEventListener("click", clearCurrentConversation);
+  els.downloadCsvBtn.addEventListener("click", downloadCurrentConversationCsv);
   els.deleteChatBtn.addEventListener("click", deleteCurrentConversation);
   els.stopBtn.addEventListener("click", () => {
     if (state.abortController) state.abortController.abort();
@@ -1050,6 +1218,21 @@ async function clearCurrentConversation() {
   state.messages = [];
   renderMessages();
   els.input.focus();
+}
+
+async function downloadCurrentConversationCsv() {
+  if (!state.conversationId) {
+    alert("Save at least one exchange to this conversation before exporting.");
+    return;
+  }
+  // Just trigger a navigation — the endpoint returns
+  // Content-Disposition: attachment so the browser saves it as <title>.csv.
+  const a = document.createElement("a");
+  a.href = `/api/conversations/${state.conversationId}/export.csv`;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 async function deleteCurrentConversation() {

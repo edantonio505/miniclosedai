@@ -714,8 +714,133 @@ def _():
     r = client.get("/static/app.js")
     assert r.status_code == 200
     for needle in ("initActivityBar", "loadBackends", "prettifyJSONInMarkdown",
-                   "_selectModelOption", "flushPendingSave"):
+                   "_selectModelOption", "flushPendingSave",
+                   "openInlineEditor", "_appendEditButton"):
         assert needle in r.text, f"missing {needle} in served app.js"
+
+
+def _seed_conv_with_turn(title: str) -> int:
+    """Create a conversation and stream a single turn into it so message[0]/[1]
+    exist. Uses the fake Ollama backend so we don't depend on real upstreams.
+    """
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": title, "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    # Stream one turn with persist=true so messages[0] (user) and messages[1]
+    # (assistant) get written to the conv.
+    with client.stream(
+        "POST", f"/api/conversations/{c['id']}/chat/stream",
+        json={"message": "hi", "persist": True},
+    ) as r:
+        for _ in r.iter_bytes():
+            pass
+    return c["id"]
+
+
+@test("edit-message: PATCH happy path — content updated, original preserved, edited_at set")
+def _():
+    cid = _seed_conv_with_turn("edit-happy")
+    try:
+        # Index 1 is the assistant turn. Verify seed worked.
+        before = client.get(f"/api/conversations/{cid}").json()
+        assert len(before["messages"]) >= 2, f"seed produced {len(before['messages'])} msgs"
+        assert before["messages"][1]["role"] == "assistant"
+        pristine = before["messages"][1]["content"]
+
+        r = client.patch(
+            f"/api/conversations/{cid}/messages/1",
+            json={"content": "an ideal, human-written response"},
+        )
+        assert r.status_code == 200, r.text
+        after = r.json()
+        msg = after["messages"][1]
+        assert msg["content"] == "an ideal, human-written response"
+        assert msg.get("edited") is True
+        assert msg.get("original_content") == pristine
+        assert "edited_at" in msg and msg["edited_at"]
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("edit-message: second edit preserves the ORIGINAL original_content (not interim)")
+def _():
+    cid = _seed_conv_with_turn("edit-twice")
+    try:
+        pristine = client.get(f"/api/conversations/{cid}").json()["messages"][1]["content"]
+        client.patch(f"/api/conversations/{cid}/messages/1", json={"content": "v1"})
+        client.patch(f"/api/conversations/{cid}/messages/1", json={"content": "v2-final"})
+        msg = client.get(f"/api/conversations/{cid}").json()["messages"][1]
+        assert msg["content"] == "v2-final"
+        # Anchor must still be the pristine model output, NOT "v1".
+        assert msg["original_content"] == pristine, (
+            f"original drifted — expected {pristine!r}, got {msg['original_content']!r}"
+        )
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("edit-message: out-of-range index and missing conv_id both return 404")
+def _():
+    cid = _seed_conv_with_turn("edit-404")
+    try:
+        r = client.patch(
+            f"/api/conversations/{cid}/messages/999",
+            json={"content": "nope"},
+        )
+        assert r.status_code == 404, r.text
+
+        r = client.patch(
+            "/api/conversations/999999/messages/0",
+            json={"content": "nope"},
+        )
+        assert r.status_code == 404, r.text
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("edit-message: rejects extra fields (extra='forbid')")
+def _():
+    cid = _seed_conv_with_turn("edit-extra")
+    try:
+        r = client.patch(
+            f"/api/conversations/{cid}/messages/1",
+            json={"content": "x", "role": "system"},
+        )
+        assert r.status_code == 422, r.text
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("export CSV: input/output columns, one row per user→assistant pair")
+def _():
+    cid = _seed_conv_with_turn("csv-export")
+    try:
+        # Overwrite assistant reply with a value containing CSV-hostile chars
+        # so we also verify escaping.
+        tricky = 'line1, with comma\n"line2" with quotes'
+        client.patch(
+            f"/api/conversations/{cid}/messages/1", json={"content": tricky}
+        )
+        r = client.get(f"/api/conversations/{cid}/export.csv")
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"].startswith("text/csv"), r.headers
+        assert "attachment" in r.headers.get("content-disposition", ""), r.headers
+
+        import csv as _csv, io as _io
+        rows = list(_csv.reader(_io.StringIO(r.text)))
+        assert rows[0] == ["input", "output"], rows[0]
+        assert len(rows) == 2, f"expected header + 1 pair, got {rows}"
+        assert rows[1][0] == "hi"
+        assert rows[1][1] == tricky
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("export CSV: 404 on missing conversation")
+def _():
+    r = client.get("/api/conversations/999999/export.csv")
+    assert r.status_code == 404, r.text
 
 
 # ==================================================================
