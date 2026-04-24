@@ -248,18 +248,42 @@ def api_delete_backend(backend_id: int):
     return {"ok": True}
 
 
+class BackendTestRequest(BackendCreate):
+    """Draft-probe body. Adds an optional `use_saved_key_from` so the Edit-mode
+    Test button can fall back to the saved key without the frontend having to
+    echo secrets into the DOM.
+    """
+    # Allow the frontend to omit api_key (blank field in Edit mode) and signal
+    # "substitute the saved key from backend id N" for the probe only.
+    use_saved_key_from: int | None = None
+
+
 @app.post("/api/backends/test")
-async def api_backend_test(data: BackendCreate):
+async def api_backend_test(data: BackendTestRequest):
     """Probe a draft (unsaved) backend config. Used by the Settings modal's
     Test-connection button, so the browser doesn't have to make a cross-origin
     call that CORS would block.
+
+    When editing an existing backend, the frontend clears the api_key field so
+    the saved secret isn't echoed into the DOM. If it's blank at test-time and
+    `use_saved_key_from` is set, we fetch the saved key server-side and use it
+    for the probe only (never returned to the client).
     """
+    api_key = data.api_key
+    if not api_key and data.use_saved_key_from is not None:
+        try:
+            existing = _load_backend(data.use_saved_key_from)
+            api_key = existing.get("api_key")
+        except HTTPException:
+            # Referenced a non-existent backend — fall through with api_key=None.
+            pass
+
     probe = {
         "id": 0,
         "name": data.name or "draft",
         "kind": data.kind,
         "base_url": _normalize_base_url(data.base_url),
-        "api_key": data.api_key,
+        "api_key": api_key,
         "headers": data.headers or {},
     }
     try:

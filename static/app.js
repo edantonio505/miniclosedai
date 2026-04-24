@@ -1407,7 +1407,15 @@ function _fillBackendForm(b) {
   document.getElementById("backend-kind").value = b ? b.kind : "openai";
   document.getElementById("backend-base-url").value = b ? b.base_url : "";
   document.getElementById("backend-base-url").placeholder = BACKEND_URL_PLACEHOLDER[(b && b.kind) || "openai"];
-  document.getElementById("backend-api-key").value = "";
+
+  // Never echo the saved key back into the DOM. When editing a backend that
+  // already has one, the placeholder signals that blank = keep-current.
+  const apiKeyEl = document.getElementById("backend-api-key");
+  apiKeyEl.value = "";
+  apiKeyEl.placeholder = (b && b.api_key_set)
+    ? "•••••••• (leave blank to keep current key)"
+    : "leave blank for local servers";
+
   document.getElementById("backend-headers").value = b && b.headers && Object.keys(b.headers).length
     ? JSON.stringify(b.headers, null, 2) : "";
   document.getElementById("backend-test-result").textContent = "";
@@ -1553,17 +1561,26 @@ async function testBackendConnection() {
   // Always probe through our server. Cross-origin direct fetches from the
   // browser to LM Studio / vLLM / etc. get CORS-blocked and surface as the
   // unhelpful "Failed to fetch" error. The server has no such restriction.
+  //
+  // Edit-mode gotcha: the api_key field is intentionally blanked when a
+  // backend is opened for edit, so the user's saved secret doesn't echo
+  // into the DOM. When they hit Test without re-typing the key, we tell
+  // the server to substitute the saved one for this probe only.
+  const body = {
+    name: data.name || "draft",
+    kind: data.kind,
+    base_url: data.base_url,
+    api_key: data.api_key || null,
+    headers: data.headers || {},
+  };
+  if (!body.api_key && backendModalEditingId != null) {
+    body.use_saved_key_from = backendModalEditingId;
+  }
   try {
     const r = await fetch("/api/backends/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: data.name || "draft",
-        kind: data.kind,
-        base_url: data.base_url,
-        api_key: data.api_key || null,
-        headers: data.headers || {},
-      }),
+      body: JSON.stringify(body),
     });
     const body = await r.json().catch(() => ({}));
     if (r.ok && body.running) {
