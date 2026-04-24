@@ -18,7 +18,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "miniclosedai.db"
+DB_PATH = Path(os.environ.get("MINICLOSEDAI_DB_PATH") or (Path(__file__).parent / "miniclosedai.db"))
 
 _DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 

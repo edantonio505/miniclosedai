@@ -1,0 +1,68 @@
+# Defense-in-depth — the Dockerfiles COPY files by name, but this catches
+# accidental `COPY . .` or `docker build` context bloat.
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# Local runtime data (SQLite + its journal files) — the container creates
+# its own DB inside the named volume at /app/data/miniclosedai.db.
+miniclosedai.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Tests aren't part of the runtime image
+test_e2e.py
+
+# Docs, screenshots, and scratch files
+*.md
+!README.md
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+
+# Brainstorming / planning notes that shouldn't ship
+ChefAI_*.md
+MiniClosedAI_BuildPrompt.md
+MiniClosedAI_ExtendedRoadmap.md
+MiniClosedAI_vs_ChefAI_Comparison.md
+error*.png
+miniclosedai*.png
+miniclsedai*.png
+COMMIT.md
+
+# Editor / IDE
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Claude workspace (already gitignored)
+.claude/
+CLAUDE.md
+
+# Logs
+*.log
+
+# Docker itself — avoid recursive context
+Dockerfile
+Dockerfile.*
+docker-compose*.yml
+.dockerignore

@@ -2,6 +2,8 @@
 
 MiniClosedAI runs LLMs locally through **[Ollama](https://ollama.com)**. Install Ollama once, pull a model, and you're done — no API keys, no cloud.
 
+> **Prefer the one-command setup?** See [Docker quick start (with baked models)](./README.md#docker-quick-start-with-baked-models) in the README. It ships a container with `llama3.2:3b`, `qwen2.5:3b`, and `gemma2:2b` already inside — no manual Ollama install, no model pull, just `docker compose up`.
+
 ---
 
 ## 1. Install Ollama

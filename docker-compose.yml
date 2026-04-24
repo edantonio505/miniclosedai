@@ -1,0 +1,86 @@
+# MiniClosedAI + Ollama with baked models.
+#
+# Usage (GPU, NVIDIA):
+#   docker compose up -d --build
+#
+# Usage (CPU-only hosts):
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d --build
+#
+# After boot:
+#   http://127.0.0.1:8095      MiniClosedAI UI
+#   (ollama :11434 is INTERNAL — not published to host by default)
+#
+# Security: `ports: ["127.0.0.1:8095:8095"]` binds to loopback only.
+# MiniClosedAI has zero authentication — changing to `"8095:8095"` exposes
+# the full chat/bot/backend-config UI to your LAN. Do it consciously.
+
+services:
+  ollama:
+    build:
+      context: .
+      dockerfile: Dockerfile.ollama
+    image: miniclosedai/ollama-baked:latest
+    # Runtime-pulled models persist here across restarts and image rebuilds.
+    # Baked models live in the image layers and are union-mounted under
+    # this volume on first `up` (the volume initializes from image contents).
+    volumes:
+      - ollama_models:/root/.ollama
+    # Uncomment to debug /api/tags etc. directly from the host.
+    # ports:
+    #   - "127.0.0.1:11434:11434"
+    environment:
+      # Keep models resident in VRAM between requests so the UI feels snappy
+      # on hosts with <8 GB VRAM (avoids unload-reload churn when switching
+      # between the three baked models).
+      OLLAMA_KEEP_ALIVE: "5m"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    # NVIDIA GPU passthrough. Requires nvidia-container-toolkit installed on
+    # the host (`sudo apt install nvidia-container-toolkit && sudo systemctl
+    # restart docker`). Without the toolkit, `up` fails with
+    # "could not select device driver nvidia with capabilities [[gpu]]".
+    # CPU-only hosts: use docker-compose.cpu.yml override.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  miniclosedai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: miniclosedai/app:latest
+    depends_on:
+      ollama:
+        # Compose v2 only. v1 (`docker-compose`, hyphenated) silently ignores
+        # the condition — use `docker compose` (v2, space) if your CLI is old.
+        condition: service_healthy
+    environment:
+      OLLAMA_URL: "http://ollama:11434"
+      MINICLOSEDAI_DB_PATH: "/app/data/miniclosedai.db"
+    volumes:
+      - miniclosedai_db:/app/data
+    # 127.0.0.1 prefix = loopback only. Remove it to expose on LAN (no auth!).
+    ports:
+      - "127.0.0.1:8095:8095"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/', timeout=2)\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  # Named volumes — persist across `docker compose down` but destroyed by
+  # `docker compose down -v`. Both declared empty so compose manages them.
+  ollama_models:
+  miniclosedai_db:
