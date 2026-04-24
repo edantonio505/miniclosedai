@@ -5,6 +5,7 @@ const els = {
   convSelect: document.getElementById("conversation-select"),
   newChatBtn: document.getElementById("new-chat-btn"),
   clearChatBtn: document.getElementById("clear-chat-btn"),
+  downloadCsvBtn: document.getElementById("download-csv-btn"),
   deleteChatBtn: document.getElementById("delete-chat-btn"),
   apiCodeBtn: document.getElementById("api-code-btn"),
   systemPrompt: document.getElementById("system-prompt"),
@@ -557,9 +558,9 @@ function renderMessage(m, index) {
     if (m.params) appendParamsBadge(body, m.params);
   }
   if (m.edited) appendEditedBadge(div, m);
-  // Pencil button — editable on both user and assistant turns. Disabled while
-  // a stream is active so you can't clobber a message that's still growing.
-  if (index != null) _appendEditButton(div, index);
+  // Pencil button — assistant turns only. Disabled while a stream is active
+  // so you can't clobber a message that's still growing.
+  if (index != null && m.role === "assistant") _appendEditButton(div, index);
 
   const emptyState = els.messages.querySelector(".empty-state");
   if (emptyState) emptyState.remove();
@@ -724,7 +725,7 @@ function _rerenderMessageInPlace(msgEl, m, index) {
     if (m.params) appendParamsBadge(body, m.params);
   }
   if (m.edited) appendEditedBadge(msgEl, m);
-  _appendEditButton(msgEl, index);
+  if (m.role === "assistant") _appendEditButton(msgEl, index);
 }
 
 // ---------- Streaming chat ----------
@@ -1193,6 +1194,7 @@ function bindChat() {
   });
   els.newChatBtn.addEventListener("click", newConversation);
   els.clearChatBtn.addEventListener("click", clearCurrentConversation);
+  els.downloadCsvBtn.addEventListener("click", downloadCurrentConversationCsv);
   els.deleteChatBtn.addEventListener("click", deleteCurrentConversation);
   els.stopBtn.addEventListener("click", () => {
     if (state.abortController) state.abortController.abort();
@@ -1216,6 +1218,21 @@ async function clearCurrentConversation() {
   state.messages = [];
   renderMessages();
   els.input.focus();
+}
+
+async function downloadCurrentConversationCsv() {
+  if (!state.conversationId) {
+    alert("Save at least one exchange to this conversation before exporting.");
+    return;
+  }
+  // Just trigger a navigation — the endpoint returns
+  // Content-Disposition: attachment so the browser saves it as <title>.csv.
+  const a = document.createElement("a");
+  a.href = `/api/conversations/${state.conversationId}/export.csv`;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 async function deleteCurrentConversation() {

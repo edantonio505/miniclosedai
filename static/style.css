@@ -989,7 +989,7 @@ body.sidebar-collapsed #sidebar-toggle {
    fades in on hover so it doesn't compete with reading. */
 .msg-edit-btn {
   position: absolute;
-  top: 6px;
+  top: 16px;
   right: 6px;
   width: 26px;
   height: 26px;
@@ -1011,9 +1011,6 @@ body.sidebar-collapsed #sidebar-toggle {
   border-color: var(--border);
 }
 .msg-edit-btn svg { width: 14px; height: 14px; }
-/* User bubble is already colored; give the pencil just enough contrast. */
-.msg.user .msg-edit-btn { color: var(--user-bubble-text); }
-.msg.user .msg-edit-btn:hover { background: rgba(0,0,0,0.18); border-color: rgba(255,255,255,0.25); }
 
 /* In-place editor — replaces the rendered .msg-body while open. */
 .msg-edit-area {

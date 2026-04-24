@@ -812,6 +812,37 @@ def _():
         client.delete(f"/api/conversations/{cid}")
 
 
+@test("export CSV: input/output columns, one row per user→assistant pair")
+def _():
+    cid = _seed_conv_with_turn("csv-export")
+    try:
+        # Overwrite assistant reply with a value containing CSV-hostile chars
+        # so we also verify escaping.
+        tricky = 'line1, with comma\n"line2" with quotes'
+        client.patch(
+            f"/api/conversations/{cid}/messages/1", json={"content": tricky}
+        )
+        r = client.get(f"/api/conversations/{cid}/export.csv")
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"].startswith("text/csv"), r.headers
+        assert "attachment" in r.headers.get("content-disposition", ""), r.headers
+
+        import csv as _csv, io as _io
+        rows = list(_csv.reader(_io.StringIO(r.text)))
+        assert rows[0] == ["input", "output"], rows[0]
+        assert len(rows) == 2, f"expected header + 1 pair, got {rows}"
+        assert rows[1][0] == "hi"
+        assert rows[1][1] == tricky
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("export CSV: 404 on missing conversation")
+def _():
+    r = client.get("/api/conversations/999999/export.csv")
+    assert r.status_code == 404, r.text
+
+
 # ==================================================================
 # Main
 # ==================================================================

@@ -5,6 +5,8 @@ Each saved conversation (bot) is pinned to a single backend via
 server (LM Studio, vLLM, llama.cpp's `server`, etc.). All backend handling
 lives in llm.py — this module is HTTP routing + persistence.
 """
+import csv
+import io
 import json
 import time
 from contextlib import asynccontextmanager
@@ -13,7 +15,7 @@ from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -546,6 +548,48 @@ def api_edit_message(conv_id: int, index: int, data: MessageEditRequest):
             "SELECT * FROM conversations WHERE id = ?", (conv_id,)
         ).fetchone()
     return db.row_to_dict(updated)
+
+
+@app.get("/api/conversations/{conv_id}/export.csv")
+def api_export_conversation_csv(conv_id: int):
+    """Download this conversation as a fine-tuning CSV.
+
+    Columns: `input` (user turn) and `output` (assistant reply). We walk the
+    messages list and emit one row per adjacent user→assistant pair. Orphan
+    user messages with no reply yet are skipped — partial turns aren't useful
+    SFT data. Edited content is exported as-is (that's the whole point of the
+    edit feature).
+    """
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT title, messages FROM conversations WHERE id = ?", (conv_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Conversation not found")
+
+    messages = json.loads(row["messages"] or "[]")
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["input", "output"])
+    i = 0
+    while i < len(messages) - 1:
+        a, b = messages[i], messages[i + 1]
+        if a.get("role") == "user" and b.get("role") == "assistant":
+            writer.writerow([a.get("content", ""), b.get("content", "")])
+            i += 2
+        else:
+            i += 1
+
+    safe_title = "".join(
+        c if c.isalnum() or c in ("-", "_") else "_" for c in (row["title"] or f"conv{conv_id}")
+    ).strip("_") or f"conv{conv_id}"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_title}.csv"',
+        },
+    )
 
 
 # ---------- Chat (legacy generic endpoint — ChatRequest carries everything) ----------
