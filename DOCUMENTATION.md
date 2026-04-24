@@ -14,6 +14,8 @@ For install + quick start, see **[README.md](./README.md)**.
 For per-OS Ollama install details, see **[INSTALL.md](./INSTALL.md)**.
 For LM Studio / OpenAI-compat endpoint setup, see
 **[README § Connecting LM Studio and other OpenAI-compatible endpoints](./README.md#connecting-lm-studio-and-other-openai-compatible-endpoints)**.
+For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on port 8080), see
+**[README § Adding Bonsai (PrismML's 1-bit 8B) — step by step](./README.md#adding-bonsai-prismmls-1-bit-8b--step-by-step)**.
 
 ---
 
@@ -23,16 +25,17 @@ For LM Studio / OpenAI-compat endpoint setup, see
 2. [Architecture overview](#architecture-overview)
 3. [Running](#running)
 4. [UI features](#ui-features)
-5. [Per-chat microservice pattern](#per-chat-microservice-pattern)
-6. [API reference](#api-reference)
-7. [Thinking / reasoning control](#thinking--reasoning-control)
-8. [Stopping generation](#stopping-generation)
-9. [Fine-tuning data export](#fine-tuning-data-export)
-10. [Database](#database)
-11. [Configuration](#configuration)
-12. [File layout](#file-layout)
-13. [Security](#security)
-14. [Troubleshooting](#troubleshooting)
+5. [Worked example — connecting Bonsai (1-bit 8B)](#worked-example--connecting-bonsai-1-bit-8b)
+6. [Per-chat microservice pattern](#per-chat-microservice-pattern)
+7. [API reference](#api-reference)
+8. [Thinking / reasoning control](#thinking--reasoning-control)
+9. [Stopping generation](#stopping-generation)
+10. [Fine-tuning data export](#fine-tuning-data-export)
+11. [Database](#database)
+12. [Configuration](#configuration)
+13. [File layout](#file-layout)
+14. [Security](#security)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -147,6 +150,111 @@ Two draggable dividers persist to `localStorage`:
 - **Horizontal splitter** (between System Prompt and Parameters) — drag to resize the System Prompt panel height. Double-click to reset to 220 px.
 
 The sidebar's scrollbar is hidden across all browsers; scrolling still works via wheel / trackpad / keyboard.
+
+---
+
+## Worked example — connecting Bonsai (1-bit 8B)
+
+This section walks through registering **[PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo)** — a 1-bit quantized 8-billion-parameter model that runs at ~1.15 GB on disk — as an endpoint. It's a good end-to-end illustration of how the multi-backend architecture handles anything that exposes the OpenAI-compat `/v1` surface.
+
+### Why Bonsai
+
+Bonsai is an extreme-quantization experiment from [PrismML](https://prismml.com). A full-precision 8B LLM weighs ~16 GB; aggressive 4-bit quantization brings that to ~5 GB. Bonsai quantizes to true **1-bit** weights (~1.15 GB), and the PrismML whitepaper reports ~70.5% average on standard benchmarks — within striking distance of full-precision baselines. The model is served through the standard `llama.cpp --server` binary, which exposes the OpenAI-compat REST shape natively. From MiniClosedAI's point of view, it's just another OpenAI-kind endpoint.
+
+**Reference links:**
+- Demo scripts + pre-built GGUF models: [github.com/PrismML-Eng/Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo)
+- PrismML (team): [prismml.com](https://prismml.com)
+- Whitepaper: `1-bit-bonsai-8b-whitepaper.pdf` in the demo repo
+- Runtime: [llama.cpp](https://github.com/ggerganov/llama.cpp)
+
+### Install + boot the Bonsai server
+
+```bash
+git clone https://github.com/PrismML-Eng/Bonsai-demo.git
+cd Bonsai-demo
+./setup.sh                             # builds llama.cpp + downloads Bonsai-8B.gguf
+
+./scripts/start_llama_server.sh        # serves at http://localhost:8080
+# Model-size switch:
+BONSAI_MODEL=4B ./scripts/start_llama_server.sh
+# Valid values: 8B (default), 4B, 1.7B
+```
+
+The server's canonical endpoints once running:
+
+| Path | Purpose |
+|---|---|
+| `GET  http://localhost:8080/health` | Readiness probe — MiniClosedAI's **Test connection** calls this equivalent path. |
+| `GET  http://localhost:8080/v1/models` | Lists the loaded model(s). Only one at a time. |
+| `POST http://localhost:8080/v1/chat/completions` | OpenAI-compatible chat. Streaming + non-streaming both supported. |
+
+`start_llama_server.sh` boots llama.cpp with these pre-set flags (source-of-truth is the script itself):
+
+```
+-ngl 99                               # offload everything to GPU
+-c 0                                  # auto-fit context (Bonsai-8B trained at 65536)
+--temp 0.5 --top-p 0.85 --top-k 20 --min-p 0
+--reasoning-budget 0
+--reasoning-format none
+--chat-template-kwargs '{"enable_thinking": false}'
+```
+
+The `--reasoning-*` flags matter because Bonsai uses a Qwen3-family chat template — without them the server would try to emit `<think>` blocks even though Bonsai itself is distilled to a non-reasoning regime.
+
+### Register the endpoint
+
+In MiniClosedAI → **Settings** (gear icon, bottom of activity bar) → **+ Add endpoint**:
+
+```
+Name:     Bonsai
+Kind:     OpenAI-compatible
+Base URL: http://localhost:8080/v1         ← not 8095; see pitfall below
+API key:  (blank — llama.cpp doesn't auth by default)
+Headers:  (blank)
+```
+
+Click **Test connection** → expect *"✓ Reachable · 1 model(s)"*, listing `Bonsai-8B.gguf`. Save.
+
+Internally MiniClosedAI persists the backend in the `backends` SQLite table with `kind='openai'` and `base_url='http://localhost:8080/v1'`. The client dispatcher in `llm.py` picks the OpenAI code path for this backend on every request, so streaming, non-streaming, reasoning-field mapping, error translation, and the `Cache-Control: no-cache` / `X-Accel-Buffering: no` proxy headers all apply uniformly.
+
+### Chatting with Bonsai
+
+Back on the Dashboard:
+
+1. The model dropdown has a new `Bonsai` optgroup; its option is `Bonsai-8B.gguf`.
+2. Create a new chat (➕ icon) → pick `Bonsai-8B.gguf` → name it → the conversation persists with `(backend_id=<Bonsai's id>, model="Bonsai-8B.gguf")`.
+3. Every subsequent turn routes to `http://localhost:8080/v1/chat/completions` because that pair is locked server-side.
+
+The microservice pattern applies unchanged: `POST /api/conversations/{id}/chat` is now a stable Bonsai-backed endpoint, and the API Code modal emits cURL / Python / JavaScript snippets that call it. The downstream caller never knows the bot is 1-bit — MiniClosedAI's `extra="forbid"` guard rails on `ConversationChatRequest` make the bot's config immutable from the caller's side.
+
+### Bonsai-specific gotchas
+
+- **Thinking control.** Leave MiniClosedAI's Thinking slider on `Default` or `Off`. The server booted with `enable_thinking=false` and `--reasoning-budget 0`, so any reasoning signal MiniClosedAI sends is ignored. Setting Thinking to `On` costs tokens but produces no useful `<think>` content.
+- **Sampling.** The server's defaults (temp `0.5`, top-p `0.85`, top-k `20`) are per-session seeds; the per-conversation sliders override them on every `/v1/chat/completions` call. Tune as usual.
+- **Only one model loaded at a time.** `llama.cpp --server` can serve exactly one GGUF. If you want multiple Bonsai sizes side by side, register each one as a separate endpoint on a different port (`start_llama_server.sh` uses `PORT=8080` hardcoded — patch it or pass `--port 8081` to llama-server directly) and add each to MiniClosedAI's Settings.
+- **aarch64 / ARM.** The pre-built `llama-server` binary is x86_64. Build from source first: `./scripts/build_cuda_linux.sh` (Linux + NVIDIA) or `./scripts/build_mac.sh` (macOS + Metal).
+- **Shutdown.** `kill $(lsof -ti TCP:8080)`.
+
+### Pitfall: loopback via the wrong port
+
+If the Base URL is set to `http://localhost:8095/v1` instead of `8080/v1`, the endpoint ends up pointing at **MiniClosedAI itself**. MiniClosedAI's own `/v1/models` implementation returns **saved conversation IDs as model names** (so the OpenAI SDK can address each bot as a "model"), which means:
+
+- The Bonsai optgroup in the model dropdown will be populated with numeric strings (`"30"`, `"31"`, …) — each one is actually the ID of a pre-existing conversation, not a real Bonsai model.
+- Picking one and sending a message creates an infinite-looking routing loop: MiniClosedAI → (misconfigured Bonsai endpoint) → `http://localhost:8095/v1/chat/completions` → MiniClosedAI receives the request → routes to the conversation with that ID → Ollama answers with *that* bot's system prompt and model.
+- Concretely, the user reported sending "Hello" to a fresh Bonsai chat and receiving a Lead Qualifier JSON back — because the stale "model" was `"30"`, the Inbound Lead Qualifier's conversation ID.
+
+**Fix:** edit the Bonsai endpoint, change the port to `8080`, Test connection (should now list one real model file), Save, reopen the Bonsai chat, and reselect `Bonsai-8B.gguf` from the dropdown. Clear the bad turn with the broom icon before asking again.
+
+### How this slots into the architecture
+
+Nothing in MiniClosedAI's core is Bonsai-specific. The integration reuses:
+
+- `backends` table (append-only row, no schema change)
+- OpenAI client in `llm.py` (same code path as LM Studio, vLLM, or real OpenAI)
+- Conversation persistence, edit-message endpoint, CSV export, fine-tuning curation flow — all identical
+- `/v1/chat/completions` and `/v1/models` on MiniClosedAI's side, so OpenAI-SDK callers against MiniClosedAI never know Bonsai is downstream
+
+That's the point of the OpenWebUI-style multi-endpoint design: adding a new backend is a data change, not a code change.
 
 ---
 
