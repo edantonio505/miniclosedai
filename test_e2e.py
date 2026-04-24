@@ -906,6 +906,56 @@ def _():
         client.delete(f"/api/conversations/{cid}")
 
 
+@test("per-conv /chat: include_history=true replays saved turns to the model")
+def _():
+    """Without this, conversational bots (FAQ chat, Doctors Office Bot) forget
+    every prior turn — catastrophic UX. The flag is opt-in so one-shot
+    classifier bots keep their pure-function semantics by default.
+    """
+    cid = _seed_conv_with_turn("history-replay")
+    try:
+        fake_ollama.captured.clear()
+
+        # Send a follow-up with include_history=true.
+        r = client.post(
+            f"/api/conversations/{cid}/chat",
+            json={"message": "do you remember what I said?", "include_history": True},
+        )
+        assert r.status_code == 200, r.text
+
+        # Inspect what got sent to the upstream LLM.
+        assert len(fake_ollama.captured) == 1
+        sent = fake_ollama.captured[0]["payload"]["messages"]
+        # Expect: [system, user(prev), assistant(prev), user(now)] — four messages.
+        roles = [m["role"] for m in sent]
+        assert roles == ["system", "user", "assistant", "user"], f"unexpected roles: {roles}"
+        assert sent[1]["content"] == "hi", f"prior user turn not replayed: {sent[1]}"
+        assert sent[3]["content"] == "do you remember what I said?"
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("per-conv /chat: include_history defaults to false (microservice contract)")
+def _():
+    """Regression guard — flipping the default would silently break every
+    classifier bot already deployed against this endpoint.
+    """
+    cid = _seed_conv_with_turn("no-history-default")
+    try:
+        fake_ollama.captured.clear()
+        r = client.post(
+            f"/api/conversations/{cid}/chat",
+            json={"message": "fresh call with no history flag"},
+        )
+        assert r.status_code == 200, r.text
+        sent = fake_ollama.captured[0]["payload"]["messages"]
+        roles = [m["role"] for m in sent]
+        # Just [system, user(now)] — no replay.
+        assert roles == ["system", "user"], f"history leaked in without flag: {roles}"
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
 @test("static: no-cache headers on /static/* so stale JS can't bite users")
 def _():
     """We hit a real time-sink debugging the edit-message feature when Chrome

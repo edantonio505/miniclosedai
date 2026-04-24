@@ -163,6 +163,10 @@ Bonsai is an extreme-quantization experiment from [PrismML](https://prismml.com)
 
 **Why it's a strong default for microservice bots.** MiniClosedAI's core idea is that each saved conversation is a callable API endpoint — you write a system prompt once, then pound it with programmatic requests from downstream code. That workload profile (many short, structured completions; latency matters more than nuance) is almost the opposite of an interactive chat session. Bonsai's tiny weight footprint plus GPU-offloaded llama.cpp inference means first-token latency and sustained throughput are both substantially better than a dense 7B/8B on Ollama, while factual capability stays high enough for classification, JSON extraction, routing, and sentiment work. Pair it with a strict `temperature ≤ 0.2` + "respond with only X" system prompt and you have a production-grade microservice bot on a laptop. See the [Recommended models table in README](./README.md#recommended-models-1b10b) for the side-by-side comparison against Ollama models.
 
+**Where Bonsai is NOT a good fit.** 1-bit quantization weakens conditional multi-rule instruction-following. For bots whose output format has *branches* — natural prose on some turns, natural prose PLUS a fenced JSON action block on others — Bonsai matches the tone of the in-prompt examples but tends to drop the structural JSON emission. Verified live on the [Doctor's Office Bot](./Doctors%20Office%20Bot.md): with an identical few-shot-patched prompt, `qwen3:8b` emits the `create_appointment` / `urgent_redirect_911` / `transfer_to_human` actions reliably; Bonsai skips them and claims to have "scheduled" an appointment without the JSON — which means no event fires downstream, a dangerous silent failure mode.
+
+**Rule of thumb:** count the branches in your output format. Always-JSON or always-prose → Bonsai is the fast pick. Prose-sometimes-with-JSON → full-precision 7-9B. MiniClosedAI's multi-backend design exists precisely so you can use both in the same app — Bonsai for the RAG Query Router, `qwen3:8b` for the Doctor's Office Bot, both callable from the same `/api/conversations/{id}/chat` URL base.
+
 **Reference links:**
 - Demo scripts + pre-built GGUF models: [github.com/PrismML-Eng/Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo)
 - PrismML (team): [prismml.com](https://prismml.com)
@@ -228,6 +232,8 @@ Back on the Dashboard:
 3. Every subsequent turn routes to `http://localhost:8080/v1/chat/completions` because that pair is locked server-side.
 
 The microservice pattern applies unchanged: `POST /api/conversations/{id}/chat` is now a stable Bonsai-backed endpoint, and the API Code modal emits cURL / Python / JavaScript snippets that call it. The downstream caller never knows the bot is 1-bit — MiniClosedAI's `extra="forbid"` guard rails on `ConversationChatRequest` make the bot's config immutable from the caller's side.
+
+**Concrete recipe designed for Bonsai's speed profile:** **[`RAG Query Router.md`](./RAG%20Query%20Router.md)** — a latency-critical query classifier that runs in front of a retrieval-augmented QA pipeline. Every inbound user question hits the router first (~200 ms on Bonsai), which decides whether to hit a cache, fire a fast LLM-only reply, run light or deep RAG, or ask a clarifying question. Temperature `0.0` for pure greedy decoding; reproducible. Includes full system prompt with few-shot examples, Python `match/case` dispatcher, worked input/output, and five variant archetypes.
 
 ### Bonsai-specific gotchas
 
@@ -303,6 +309,7 @@ Response:
 
 - `persist: true` appends this turn to the saved conversation history (useful for multi-turn clients).
 - `persist: false` (default) = stateless call, no DB write, each call fully independent.
+- `include_history: true` — **only valid with the single-`message` form.** Tells the server to prepend the conversation's saved turns to the LLM context before calling the model. Defaults to `false` so classifier / router bots keep pure-function semantics (every call independent). Set it to `true` for conversational bots (FAQ chat, [Doctor's Office Bot](./Doctors%20Office%20Bot.md), support agents) that need memory across turns. The MiniClosedAI browser UI sets it to `true` automatically on every Send. Callers who use the multi-turn `messages=[...]` form own the history themselves and should leave this flag false.
 
 ### Multi-turn payload
 
@@ -324,6 +331,25 @@ Instead of a single `message` string, send a full `messages` array:
 - **No redeploys.** Change the prompt in the UI, and the next call uses the new behavior.
 - **Multiple specialized endpoints.** Create as many chats as you want — each is independent.
 - **Deterministic.** Set temperature low, think off, and you've got a reproducible API.
+
+### Production-grade recipes
+
+Three full, copy-paste walkthroughs live alongside this doc. Each is a standalone `.md` file with the exact system prompt, recommended sampling settings, worked input/output examples, Python + cURL + OpenAI-SDK integration code, and variant ideas:
+
+| Recipe | File | Workload profile | Best backend |
+|---|---|---|---|
+| **Support Ticket Router** | [`Support Ticket Router.md`](./Support%20Ticket%20Router.md) | Classify inbound support messages → Zendesk/Linear routing. One-shot JSON per ticket. | `qwen3:8b` on Ollama (Bonsai also works) |
+| **Inbound Lead Qualifier** | [`Inbound Lead Qualifier.md`](./Inbound%20Lead%20Qualifier.md) | Score B2B prospects (fit_score 0–100, intent, role, budget/timeline signals) → CRM routing. | `qwen3:8b` on Ollama (Bonsai also works) |
+| **RAG Query Router** | [`RAG Query Router.md`](./RAG%20Query%20Router.md) | Latency-critical pre-router for retrieval-augmented QA. Classifies every user query; decides cache/fast-LLM/light-RAG/deep-RAG/ask-clarification. | **Bonsai-8B** on llama.cpp (port 8080) — ~200 ms per call; see [Worked example — connecting Bonsai](#worked-example--connecting-bonsai-1-bit-8b). |
+| **Doctor's Office Bot** | [`Doctors Office Bot.md`](./Doctors%20Office%20Bot.md) | Conversational front-of-house chatbot for a primary-care practice. FAQs + multi-turn appointment booking + red-flag symptom → 911 redirect + refill routing. Emits fenced JSON action blocks on action-triggering turns only. | `qwen3:8b` on Ollama. **Not Bonsai** — mixed-mode output (prose + conditional JSON) exceeds 1-bit instruction-following reliability; verified live. |
+
+All four share the same archetype — *small structured decision (or action), driven by a focused system prompt, called as an HTTP microservice* — but differ in where they sit in the pipeline:
+
+- **End-state record** (Ticket Router, Lead Qualifier) — one-shot classification per call, same JSON schema every time.
+- **Intermediate orchestration decision** (RAG Query Router) — one-shot decision about where to route an incoming request; every output is JSON.
+- **Conversational agent with side-effecting actions** (Doctor's Office Bot) — multi-turn state, dual-mode output, fenced JSON action block on a subset of turns.
+
+Study all four before authoring a new one; the similarities show you which patterns are reusable and the differences show you which knobs actually matter for your workload. **Rule of thumb for picking a model:** if output is always JSON (single-mode), Bonsai 1-bit is often the best pick for latency. If output is prose sometimes and JSON sometimes (multi-mode), use a full-precision 7–9B.
 
 ---
 

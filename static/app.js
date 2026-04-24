@@ -782,7 +782,11 @@ async function sendMessage(text) {
       signal: ac.signal,
       body: JSON.stringify({
         message: text,
-        persist: true,   // save turn for UI display; model still sees stateless input
+        persist: true,
+        // Conversational UI — the model needs to see prior turns. Without this
+        // flag the server runs pure-function semantics (each turn stateless),
+        // which is correct for classifier/router bots but breaks chat.
+        include_history: true,
       }),
     });
 

@@ -95,6 +95,12 @@ class ConversationChatRequest(BaseModel):
     message: str | None = None
     messages: list[Message] | None = None
     persist: bool = False
+    # When true + `message` is provided, the server prepends the conversation's
+    # saved turns to the LLM context. Needed for conversational bots (FAQ chat,
+    # doctor's office, support agent) where the model must remember earlier
+    # turns. Default false preserves the one-shot microservice pattern callers
+    # rely on (classifiers, routers, extractors).
+    include_history: bool = False
 
 
 class BackendCreate(BaseModel):
@@ -700,9 +706,18 @@ def _resolve_conversation_chat(
     else:
         user_msgs = [m.model_dump() for m in req.messages]
 
-    # Pure-function semantic — model sees only (system + request msgs). Saved
-    # chat history is never replayed; it exists only for the UI to render.
+    # Default: pure-function semantic — model sees only (system + request msgs).
+    # Opt-in: when `include_history=true` AND the request uses single-message
+    # form, prepend the conversation's saved turns so conversational bots have
+    # memory. Not applied when the caller already supplies `messages=[...]`,
+    # since they're already in control of the history.
     ollama_messages = [{"role": "system", "content": effective["system_prompt"]}]
+    if req.include_history and req.message is not None:
+        for m in (conv.get("messages") or []):
+            role = m.get("role")
+            content = m.get("content", "")
+            if role in ("user", "assistant") and content:
+                ollama_messages.append({"role": role, "content": content})
     ollama_messages.extend(user_msgs)
 
     return conv, ollama_messages, effective, backend

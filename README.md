@@ -46,6 +46,13 @@ Built with **FastAPI** (3 Python deps), vanilla JS, and SQLite. Runs on a laptop
   <br><em>Settings → LLM Endpoints. Register as many backends as you want: the built-in Ollama, an LM Studio instance on your LAN, and PrismML's 1-bit Bonsai server all coexist. Each card shows its kind, base URL, API-key status, and a live reachability count. Models from every reachable endpoint merge into one grouped dropdown on the Dashboard, OpenWebUI-style. See <a href="#connecting-lm-studio-and-other-openai-compatible-endpoints">Connecting LM Studio and other endpoints</a> and <a href="#adding-bonsai-prismmls-1-bit-8b--step-by-step">Adding Bonsai</a>.</em>
 </p>
 
+<p align="center">
+  <img src="miniclosedai7.png"
+       alt="Doctor's Office Bot chat running on qwen3:8b. The sidebar shows the system prompt with the 'Required-fields gate (HARD RULE)' section visible. The chat shows the bot asking for patient details, the user's one-shot info-dump reply ('Ed Johnson, 1989-02-23, (347) 853-8734, new patient. Routine checkup, any available provider. Morning works best...'), and the bot's response — a natural confirmation sentence followed by a fenced create_appointment JSON block rendered as a code block in the chat, containing patient, visit, insurance, and confirmation sub-objects"
+       width="820">
+  <br><em>A conversational bot that emits structured actions. The <a href="#9-doctors-office-chatbot--full-walkthrough">Doctor's Office Bot</a> replies in natural language during info gathering, then emits a fenced <code>create_appointment</code> JSON block the moment every required field is present. Downstream apps strip the fence and dispatch to the real scheduler. Works with <code>qwen3:8b</code> on Ollama — full system prompt, worked examples, and the load-bearing few-shot section in <a href="./Doctors%20Office%20Bot.md"><code>Doctors Office Bot.md</code></a>.</em>
+</p>
+
 ![stack](https://img.shields.io/badge/FastAPI-0.110+-009688) ![Ollama](https://img.shields.io/badge/Ollama-local-000000) ![license](https://img.shields.io/badge/license-MIT-blue)
 
 > The defining idea: **each saved conversation is an addressable microservice.** You craft a system prompt + sampling params once in the UI, and that chat becomes a stable URL you can call from anything that speaks HTTP — including any OpenAI SDK.
@@ -339,6 +346,8 @@ Click **Test connection** — should say *"✓ Reachable · 1 model(s)"* and lis
 Back on the Dashboard, open the model dropdown → there's a `Bonsai` optgroup with `Bonsai-8B.gguf` inside it. Create a new chat, pick that model, write a prompt. Every subsequent turn routes automatically to `http://localhost:8080/v1/chat/completions` because the conversation is pinned to `(backend_id=<Bonsai>, model="Bonsai-8B.gguf")`.
 
 The per-conv microservice pattern applies unchanged: `POST /api/conversations/{id}/chat` is your Bonsai bot's stable callable URL, and the API Code modal emits cURL / Python / JavaScript snippets that point at it.
+
+**Ready-made Bonsai microservice recipe:** see **[`RAG Query Router.md`](./RAG%20Query%20Router.md)** for a complete system prompt, recommended settings, and Python integration code for a latency-critical query-classification bot that's purpose-built for Bonsai's speed profile. Covered in the Recipes section below as [#8 RAG query router](#8-rag-query-router-bonsai-paired--full-walkthrough).
 
 #### Notes and gotchas specific to Bonsai
 
@@ -898,6 +907,51 @@ B2B sibling of the ticket router. Takes an inbound prospect message (form-fill, 
 **Settings:** `qwen3:8b`, temperature `0.1`, Thinking `Off`, max_tokens `900`.
 
 **Archetype:** adds a numeric scoring dimension on top of the ticket-router pattern, plus a first-match routing table stated in plain English. Great proof that an 8B local model is enough to replace a spreadsheet-and-two-contractors lead-triage process. Full system prompt, example I/O, `match`/`case` routing code, and four more schema variants (applicant screener, investor inbound, beta applicant, partnership inbound) in **[`Inbound Lead Qualifier.md`](./Inbound%20Lead%20Qualifier.md)**.
+
+---
+
+### 8. RAG query router (Bonsai-paired) — [full walkthrough](./RAG%20Query%20Router.md)
+
+A latency-critical pre-router for retrieval-augmented QA systems. Every inbound user question hits this bot first; it returns a JSON decision telling the orchestrator whether to hit the cache, fire a fast LLM-only reply, run light RAG, run deep RAG, or ask the user a clarifying question. Designed specifically to be paired with **[Bonsai-8B](#adding-bonsai-prismmls-1-bit-8b--step-by-step)** — the 1-bit model's ~200 ms inference makes this classifier free on the hot path of every user turn, which is the difference between a router being usable and being a bottleneck.
+
+**Output shape (abridged):**
+```json
+{
+  "question_type": "factual | multi_fact | comparative | procedural | conversational | hypothetical | ambiguous",
+  "primary_topic": "...",
+  "entities": ["..."],
+  "requires_realtime": false,
+  "min_facts_needed": 0,
+  "routing_decision": "fast_cache | fast_llm_only | rag_light | rag_deep | ask_clarification",
+  "clarifying_question": null,
+  "estimated_tier": "trivial | easy | medium | hard",
+  "pii_present": false,
+  "confidence": 0.0
+}
+```
+
+**Settings:** `Bonsai-8B.gguf` on the Bonsai endpoint, **temperature `0.0`** (pure greedy — same question always routes the same way), Thinking `Off`, max_tokens `400`. Works equally well with `llama3.2:3b` or `gemma2:2b` on Ollama if you don't want to run a separate llama.cpp server.
+
+**Archetype:** *classify → decide → delegate*, not *classify → answer*. Differs from the ticket router / lead qualifier in that the output is an intermediate orchestration decision rather than an end-state record. Includes explicit handling for demonstrative pronouns ("how does this work?" → `ask_clarification` with a clarifying question) which is where small classifiers typically fail. Full system prompt, example I/O, Python `match/case` dispatcher, and five variant ideas (prompt-safety gatekeeper, agent-task decomposer, cache key canonicalizer, and more) in **[`RAG Query Router.md`](./RAG%20Query%20Router.md)**.
+
+---
+
+### 9. Doctor's office chatbot — [full walkthrough](./Doctors%20Office%20Bot.md)
+
+A front-of-house chatbot for a primary-care practice. Answers FAQs from an explicit knowledge base in the system prompt, collects appointment-booking details across multiple turns, detects red-flag symptoms and redirects to 911, routes prescription-refill requests to a nurse callback, and offers a human-transfer path on request. **Different archetype from the three routers above:** conversational state + **dual-mode output** — plain text on info-gathering turns, plus a fenced JSON action block on the turn it's ready to execute (booking, emergency redirect, refill request, human handoff).
+
+**Output — visible reply PLUS (on action turns) one of:**
+```json
+{"type": "create_appointment",       "patient": {...}, "visit": {...}, "insurance": {...}, "confirmation": {...}}
+{"type": "urgent_redirect_911",      "trigger_signs": [...], "time_first_mentioned": null}
+{"type": "request_prescription_refill", "patient": {...}, "medication": {...}}
+{"type": "transfer_to_human",        "reason": "faq_out_of_scope | patient_requested | ...", "short_summary": "..."}
+{"type": "request_callback",         "patient": {...}, "topic": "...", "preferred_window": "..."}
+```
+
+**Settings:** `qwen3:8b` on Ollama, temperature `0.3`, Thinking `Off`, max_tokens `600`. The MiniClosedAI UI sends `include_history: true` automatically so the model sees every prior turn. **Do not use Bonsai-8B (1-bit) for this bot** — verified live on this repo that 1-bit quantization drops the conditional JSON emission even with the few-shot-patched prompt. 1-bit is for single-mode classifiers (RAG Query Router, Ticket Router); mixed-mode needs full-precision 7–9B.
+
+**Archetype:** *converse → gather → emit side effect*. Sits at the front door of a real website or patient portal. The bot is a chatbot for the user AND a microservice for your backend at the same time — dual-audience design. Includes hard guardrails (no medical advice, no policy invention, no prompt disclosure), a required-fields gate that prevents premature booking, and three load-bearing few-shot examples inside the system prompt (booking, red-flag, FAQ-out-of-scope) without which the JSON emission drops. Full system prompt, eight worked conversation examples (including an adversarial prompt-injection turn and an after-hours callback), Python session-state integration with regex-stripping of the fenced action block, and five domain variants (veterinary, dental, PT, mental-health, HVAC) in **[`Doctors Office Bot.md`](./Doctors%20Office%20Bot.md)**.
 
 ---
 
