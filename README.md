@@ -74,7 +74,7 @@ Built with **FastAPI** (3 Python deps), vanilla JS, and SQLite. Runs on a laptop
 MiniClosedAI is a single-user, single-process web app that wraps **local** LLMs into a playground UI. Its feature list is short on purpose:
 
 - 🧠 **100% local inference** — no data leaves your machine.
-- 🔌 **Multi-endpoint, OpenWebUI-style** — register Ollama plus any number of OpenAI-compatible servers (LM Studio, vLLM, llama.cpp server, etc.). One grouped model dropdown lists everything; each saved chat picks one endpoint + model.
+- 🔌 **Multi-endpoint, OpenWebUI-style** — register Ollama plus any number of OpenAI-compatible servers (LM Studio, vLLM, [PrismML Bonsai (1-bit 8B)](https://github.com/PrismML-Eng/Bonsai-demo), raw `llama.cpp --server`, etc.). One grouped model dropdown lists everything; each saved chat picks one endpoint + model.
 - 🎛️ **Live parameter sliders** — temperature, max tokens, top-p, top-k, thinking level, max thinking tokens. Every change auto-saves to the active conversation.
 - 🔁 **Per-chat microservice endpoints** — each saved conversation is an addressable URL that replays your GUI-configured bot. Callers just send `{"message": "..."}`.
 - 💭 **Reasoning-model aware** — `thinking` and `content` tokens from models like qwen3, deepseek-r1, and gpt-oss stream separately; "thoughts" appear in a collapsible block. `max_thinking_tokens` is a soft cap: visible reasoning is hidden but the model keeps running so the answer still arrives.
@@ -281,11 +281,71 @@ Each saved conversation picks one endpoint + one model; the Dashboard's model dr
 4. Click **Test connection** — should say *"✓ Reachable · N model(s)"*. If it says *"Reachable, but 0 models available"*, you're missing `/v1`.
 5. **Save.** Return to the Dashboard. The model dropdown now has a second `<optgroup>` labeled with your endpoint name; its options are the models LM Studio has loaded.
 
+### Adding Bonsai (PrismML's 1-bit 8B) — step by step
+
+**[PrismML Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo)** is an extreme-quantization experiment: a 1-bit 8-billion-parameter model that ships at ~1.15 GB on disk (about **14× smaller** than the fp16 version of the same base architecture) while staying within striking distance of full-precision baselines on factual / reasoning benchmarks. It runs via `llama.cpp`'s `llama-server`, which speaks the OpenAI-compatible API natively — so it slots in as another endpoint in MiniClosedAI with no translation layer.
+
+**Useful links:**
+- **Repo & demo scripts:** [github.com/PrismML-Eng/Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo)
+- **PrismML:** [prismml.com](https://prismml.com) — the team behind the model
+- **Whitepaper:** `1-bit-bonsai-8b-whitepaper.pdf` (ships with the demo repo) — explains the quantization approach and benchmark methodology
+- **llama.cpp** (runtime): [github.com/ggerganov/llama.cpp](https://github.com/ggerganov/llama.cpp)
+
+#### 1. Install and start the Bonsai server
+
+```bash
+# Clone PrismML's demo repo
+git clone https://github.com/PrismML-Eng/Bonsai-demo.git
+cd Bonsai-demo
+
+# One-shot setup — builds llama.cpp and downloads the default GGUF model (Bonsai-8B)
+./setup.sh
+
+# Start the OpenAI-compatible server
+./scripts/start_llama_server.sh
+# Serves at http://localhost:8080 — health check at /health, API at /v1/chat/completions
+```
+
+Pick a different size by setting `BONSAI_MODEL` before the script: `8B` (default), `4B`, or `1.7B`.
+```bash
+BONSAI_MODEL=4B ./scripts/start_llama_server.sh
+```
+
+**aarch64 / ARM**: the shipped binaries are x86_64. Build from source with `./scripts/build_cuda_linux.sh` (Linux+NVIDIA) or `./scripts/build_mac.sh` (macOS+Metal) before the `start_llama_server` step.
+
+#### 2. Register Bonsai as an endpoint in MiniClosedAI
+
+Settings (gear icon, bottom of activity bar) → **+ Add endpoint**:
+
+| Field | Value |
+|---|---|
+| **Name** | `Bonsai` (or anything readable) |
+| **Kind** | **OpenAI-compatible** |
+| **Base URL** | **`http://localhost:8080/v1`** — local. For LAN, substitute the host's IP. **Do not confuse `8080` (Bonsai) with `8095` (MiniClosedAI itself)** — see the pitfall below. The `/v1` suffix is required. |
+| **API key** | *(leave blank — `llama.cpp --server` doesn't require auth by default)* |
+| **Extra headers** | *(leave empty)* |
+
+Click **Test connection** — should say *"✓ Reachable · 1 model(s)"* and list `Bonsai-8B.gguf` (or whichever size you loaded). Save.
+
+#### 3. Chat with Bonsai
+
+Back on the Dashboard, open the model dropdown → there's a `Bonsai` optgroup with `Bonsai-8B.gguf` inside it. Create a new chat, pick that model, write a prompt. Every subsequent turn routes automatically to `http://localhost:8080/v1/chat/completions` because the conversation is pinned to `(backend_id=<Bonsai>, model="Bonsai-8B.gguf")`.
+
+The per-conv microservice pattern applies unchanged: `POST /api/conversations/{id}/chat` is your Bonsai bot's stable callable URL, and the API Code modal emits cURL / Python / JavaScript snippets that point at it.
+
+#### Notes and gotchas specific to Bonsai
+
+- **Thinking: Off (or Default).** `start_llama_server.sh` already boots with `--reasoning-budget 0 --reasoning-format none --chat-template-kwargs '{"enable_thinking": false}'` — thinking is disabled upstream. Leave MiniClosedAI's Thinking control on `Off` or `Default` to match. Flipping it to `On` just wastes tokens; the server still won't emit reasoning.
+- **Context window.** Bonsai-8B is trained at 65,536 tokens; the start script uses llama.cpp's `-c 0` (auto-fit). For very long contexts your GPU VRAM will be the binding constraint, not MiniClosedAI.
+- **Server-side sampling defaults** (set in `start_llama_server.sh`): `temp=0.5`, `top-p=0.85`, `top-k=20`, `min-p=0`. MiniClosedAI's per-conversation sliders override these on every request, so tune per-chat as usual.
+- **Pitfall — wrong port = feedback loop.** If you accidentally set Bonsai's Base URL to `http://localhost:8095/v1` (MiniClosedAI's own port), the endpoint's `/v1/models` call loops back and returns *MiniClosedAI's saved conversations as "models"*. The model dropdown will show conversation IDs (e.g. `"30"`) under the Bonsai optgroup; picking one sends the chat through that conversation's bot instead of Bonsai, producing nonsensically on-topic responses (the Lead Qualifier's JSON, etc.). Fix: edit the endpoint, change the port to **`8080`**.
+- **Stop the server** when you're done: `kill $(lsof -ti TCP:8080)` (or `Ctrl+C` in the terminal you started it in).
+
 ### Using it
 
-- **Pick any LM Studio model** from the dropdown and chat normally. The bot saves the `(model, backend_id)` pair so the next time you open that conversation it routes to LM Studio automatically.
+- **Pick any external model** from the dropdown and chat normally. The bot saves the `(model, backend_id)` pair so the next time you open that conversation it routes to the correct endpoint automatically.
 - **API Code modal** emits snippets that call MiniClosedAI's `/api/conversations/{id}/chat` or `/v1/chat/completions`. Your downstream code talks to MiniClosedAI; MiniClosedAI relays to whichever endpoint the bot is pinned to.
-- **Mix freely.** One bot on Ollama (local), another on LM Studio (different host on your LAN), a third on a custom vLLM endpoint — all callable from the same URL base.
+- **Mix freely.** One bot on Ollama, another on LM Studio (different host on your LAN), a third on Bonsai, a fourth on vLLM — all callable from the same URL base.
 
 ### Reasoning models on LM Studio / vLLM
 
@@ -992,6 +1052,7 @@ Snippets generated by the **API Code** modal use `window.location.origin`, so LA
 | Add-endpoint Test says **"Failed to fetch"** | Fixed. Older frontend ran the probe directly from the browser and got CORS-blocked. Hard-refresh the page — the modern Test button goes through the MiniClosedAI server. |
 | LM Studio returns *"Invalid LM Studio API token"* (401) | Either paste a fresh key into the endpoint's **Edit → API key** field, or turn off *Require API key* in LM Studio's Developer tab for localhost use. |
 | Qwen3/DeepSeek-R1 on LM Studio keeps reasoning with **Thinking: Off** | Your LM Studio build is ignoring both `chat_template_kwargs.enable_thinking: false` and the `/no_think` magic token. Workaround: leave Thinking on (or pick a non-reasoning model like Gemma 4 / Llama 3.2 / Mistral for strict-output tasks). The soft-truncate fix still ensures the answer arrives even when reasoning runs. |
+| Bonsai endpoint returns responses that look like *another* bot's output | You pointed the Bonsai endpoint at `http://localhost:8095/v1` (MiniClosedAI's own port) instead of `http://localhost:8080/v1` (the llama.cpp server). The endpoint's model list then comes from MiniClosedAI's `/v1/models` (your saved conversation IDs), so picking one routes the chat through an unrelated bot. Edit the endpoint, change the port to **`8080`**, then reopen the Bonsai chat and reselect `Bonsai-8B.gguf` from the dropdown. |
 | *"✂ Thinking hidden after N tokens. Model still finishing its reasoning; the answer will follow."* | Informational, not an error. The model exceeded your `max_thinking_tokens` soft cap; further reasoning is hidden from the UI but the stream stays open so content can still arrive. Raise the cap (or clear it) to see full thoughts; raise **Max Tokens** if the whole response gets cut off before the answer. |
 | Deleting an endpoint returns 409 with `bound_conversations` | Can't delete an endpoint any bot still uses. Either rebind each listed conversation to a different endpoint (change its model from the grouped dropdown) or delete those conversations first, then retry. |
 
