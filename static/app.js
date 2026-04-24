@@ -1566,27 +1566,27 @@ async function testBackendConnection() {
   // backend is opened for edit, so the user's saved secret doesn't echo
   // into the DOM. When they hit Test without re-typing the key, we tell
   // the server to substitute the saved one for this probe only.
-  const body = {
+  const reqBody = {
     name: data.name || "draft",
     kind: data.kind,
     base_url: data.base_url,
     api_key: data.api_key || null,
     headers: data.headers || {},
   };
-  if (!body.api_key && backendModalEditingId != null) {
-    body.use_saved_key_from = backendModalEditingId;
+  if (!reqBody.api_key && backendModalEditingId != null) {
+    reqBody.use_saved_key_from = backendModalEditingId;
   }
   try {
     const r = await fetch("/api/backends/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(reqBody),
     });
-    const body = await r.json().catch(() => ({}));
-    if (r.ok && body.running) {
-      resultEl.textContent = "✓ " + (body.message || "Reachable");
+    const result = await r.json().catch(() => ({}));
+    if (r.ok && result.running) {
+      resultEl.textContent = "✓ " + (result.message || "Reachable");
     } else {
-      resultEl.textContent = "✗ " + (body.message || `HTTP ${r.status}`) + hint;
+      resultEl.textContent = "✗ " + (result.message || `HTTP ${r.status}`) + hint;
     }
   } catch (e) {
     resultEl.textContent = "✗ " + (e && e.message || e) + hint;
