@@ -479,6 +479,20 @@ The app does not ship with HTTPS. `navigator.clipboard` requires HTTPS or `local
 
 ---
 
+## Testing
+
+Full end-to-end coverage lives in **`test_e2e.py`** at the repo root. Run:
+
+```bash
+python test_e2e.py
+```
+
+28 tests, ~1.5 seconds, no external dependencies (no pytest), no real Ollama or LM Studio required — upstream backends are simulated in-process via two tiny `http.server` instances. The test DB is a tempfile; your real `miniclosedai.db` is never touched. Exits 0 on all-pass, 1 on any failure.
+
+For the full coverage matrix and hook-setup instructions, see **[README → Testing](./README.md#testing)**.
+
+---
+
 ## License
 
 MIT.
