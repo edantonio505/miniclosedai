@@ -1,0 +1,19 @@
+# CPU-only override. Layer on top of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d --build
+#
+# Removes the NVIDIA GPU reservation so hosts without
+# nvidia-container-toolkit (or without a GPU at all) can still boot the
+# stack. Inference will be noticeably slower on the 3B models; the 2B
+# Gemma is still usable in real time.
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          # `!reset` (Compose v2.24+) replaces the list from the base file
+          # rather than merging with it. Without it, override maps get
+          # deep-merged and the GPU reservation stays — which means
+          # `up` still fails on CPU-only hosts.
+          devices: !reset []
