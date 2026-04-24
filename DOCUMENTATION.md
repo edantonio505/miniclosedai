@@ -27,11 +27,12 @@ For LM Studio / OpenAI-compat endpoint setup, see
 6. [API reference](#api-reference)
 7. [Thinking / reasoning control](#thinking--reasoning-control)
 8. [Stopping generation](#stopping-generation)
-9. [Database](#database)
-10. [Configuration](#configuration)
-11. [File layout](#file-layout)
-12. [Security](#security)
-13. [Troubleshooting](#troubleshooting)
+9. [Fine-tuning data export](#fine-tuning-data-export)
+10. [Database](#database)
+11. [Configuration](#configuration)
+12. [File layout](#file-layout)
+13. [Security](#security)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -135,6 +136,8 @@ OLLAMA_URL=http://192.168.1.42:11434 python app.py
 - Thinking tokens (for reasoning models) appear in a collapsible `💭 Thinking` block that auto-collapses when normal output starts.
 - Per-message badge shows the exact model + params used for reproducibility.
 - **⏹ Stop** button during streaming — aborts generation immediately (see [Stopping generation](#stopping-generation)).
+- **Edit pencil** on every assistant message (top-right) opens an in-place textarea for rewriting the response. `Save` persists (first edit pins the pristine output under `original_content`), `Cancel` or `Esc` discards. Disabled while a stream is active. See [Fine-tuning data export](#fine-tuning-data-export).
+- **Download CSV** in the header exports the current chat as a two-column `input,output` SFT dataset. See [Fine-tuning data export](#fine-tuning-data-export).
 
 ### Splitters
 
@@ -234,12 +237,14 @@ Lists Ollama models available locally.
 ### Conversations
 
 ```
-GET    /api/conversations             → list all
-POST   /api/conversations             → create
-GET    /api/conversations/{id}        → get full conversation (including messages)
-PATCH  /api/conversations/{id}        → update any subset of fields
-DELETE /api/conversations/{id}        → delete
-POST   /api/conversations/{id}/clear  → wipe messages, keep config
+GET    /api/conversations                         → list all
+POST   /api/conversations                         → create
+GET    /api/conversations/{id}                    → get full conversation (including messages)
+PATCH  /api/conversations/{id}                    → update any subset of fields
+DELETE /api/conversations/{id}                    → delete
+POST   /api/conversations/{id}/clear              → wipe messages, keep config
+PATCH  /api/conversations/{id}/messages/{index}   → edit one stored message in place
+GET    /api/conversations/{id}/export.csv         → download the chat as input/output CSV
 ```
 
 **Create body**:
@@ -274,6 +279,10 @@ POST   /api/conversations/{id}/clear  → wipe messages, keep config
 ```
 
 **PATCH**: supply any subset of the same fields. Param fields merge into the saved JSON (other saved params are preserved).
+
+**Edit a single message** — `PATCH /api/conversations/{id}/messages/{index}`. Body: `{"content": "<new text>"}`; any extra key returns **422**. The first edit of a message copies the existing content to `original_content` and stamps `edited: true` + an ISO-8601 `edited_at`. Subsequent edits only update `content`; `original_content` remains pinned to the pristine model output. Returns the full updated conversation. 404 when the conversation is missing or `index` is out of range.
+
+**Export as CSV** — `GET /api/conversations/{id}/export.csv`. Returns `text/csv` with a `Content-Disposition: attachment` header so the browser saves it directly. Columns are `input,output`; one row per complete user→assistant pair; RFC-4180 quoted; leading/trailing whitespace stripped from both columns; orphan user messages (no reply yet) are skipped. Full details in [Fine-tuning data export](#fine-tuning-data-export).
 
 ### Chat
 
@@ -369,6 +378,70 @@ Can be overridden per call:
 ```bash
 curl ... -d '{"message":"hi","max_thinking_tokens":50}'
 ```
+
+---
+
+## Fine-tuning data export
+
+Every chat doubles as a curation surface for supervised fine-tuning (SFT). The workflow uses demonstration data: keep the real user prompts, rewrite imperfect assistant responses into the ideal output, export the pairs as CSV.
+
+### Surfaces
+
+| UI control | What it does |
+|---|---|
+| ✏️ Pencil (top-right of each assistant bubble) | Inline editor. Textarea prefilled with the raw response (whitespace-trimmed for display). `Save` commits; `Cancel` / `Esc` aborts; `Ctrl/⌘+Enter` saves. Disabled while a stream is active. |
+| ⬇ Download icon (header, between Clear and Delete) | Saves `<chat_title>.csv` to the browser's Downloads. Columns are `input,output`, one row per user→assistant pair. |
+
+Edits to user messages are intentionally not supported — the value of the dataset is in the **real prompts** you'd actually send in production. Only assistant outputs are rewriteable.
+
+### Storage model
+
+No schema migration was needed. The conversation's `messages` column is a JSON array of `{role, content, params}` dicts; the edit endpoint just adds three optional fields to each message it touches:
+
+| Field | Type | Populated when |
+|---|---|---|
+| `edited` | bool | First `PATCH .../messages/{i}`. Stays `true`. |
+| `edited_at` | string (ISO-8601 UTC) | Overwritten on every edit. |
+| `original_content` | string | Set on the **first** edit only — pinned to the pristine model output; not overwritten by subsequent edits. |
+
+The second edit of a message updates `content` and `edited_at` but leaves `original_content` alone. That matters: it keeps the audit trail (and any future DPO pipeline) anchored to what the model *originally* produced, not the last intermediate revision.
+
+### CSV shape and escaping
+
+```
+input,output
+"Hello!","Hi there — how can I help?"
+"What's ERR_INT_8822?","ERR_INT_8822 is a payout-processor timeout. Typical causes are…"
+```
+
+- Columns are literally `input` and `output`.
+- Rows are emitted in conversation order, one per adjacent user→assistant pair. If two user messages appear in a row (rare, e.g. after a mid-stream abort), only the second forms a pair with the next assistant reply; the orphan is skipped.
+- Escaping is RFC-4180 via Python's stdlib `csv.writer`:
+  - Fields containing `,`, `"`, `\r`, or `\n` are wrapped in double quotes.
+  - Literal `"` inside a value becomes `""`.
+- Leading / trailing whitespace is `strip()`'d on both columns. Important because LM Studio + Qwen3-family models emit a leading `\n\n` separator between their (hidden) thinking block and the answer — training on it teaches the fine-tuned model to emit junk whitespace too.
+- Content-Disposition header sets a sanitized filename derived from the conversation title (non-alphanumeric characters → `_`).
+
+### Programmatic access
+
+```python
+import httpx, pandas as pd
+
+# Single conversation
+csv = httpx.get("http://localhost:8095/api/conversations/3/export.csv").text
+df = pd.read_csv(pd.io.common.StringIO(csv))
+
+# Many conversations → one dataset
+ids = [3, 7, 11, 18]
+frames = [pd.read_csv(pd.io.common.StringIO(
+    httpx.get(f"http://localhost:8095/api/conversations/{i}/export.csv").text
+)) for i in ids]
+pd.concat(frames, ignore_index=True).to_csv("sft.csv", index=False)
+```
+
+### From SFT to DPO
+
+The `original_content` field means the database already contains preference triples whenever you've edited a message: `(prompt, chosen=edited content, rejected=original_content)`. A short script reading the raw `messages` JSON produces a DPO JSONL file with no UI changes required. This is the intended upgrade path when your demonstration dataset stops improving the model (typically many thousands of pairs in).
 
 ---
 

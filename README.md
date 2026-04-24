@@ -52,12 +52,13 @@ Built with **FastAPI** (3 Python deps), vanilla JS, and SQLite. Runs on a laptop
 10. [OpenAI-compatible endpoint](#openai-compatible-endpoint)
 11. [Recipes — common bot patterns](#recipes--common-bot-patterns)
 12. [Getting good responses from small models](#getting-good-responses-from-small-models)
-13. [LAN access](#lan-access)
-14. [Troubleshooting](#troubleshooting)
-15. [Testing](#testing)
-16. [Project layout](#project-layout)
-17. [Security](#security)
-18. [License](#license)
+13. [Curating fine-tuning data](#curating-fine-tuning-data)
+14. [LAN access](#lan-access)
+15. [Troubleshooting](#troubleshooting)
+16. [Testing](#testing)
+17. [Project layout](#project-layout)
+18. [Security](#security)
+19. [License](#license)
 
 ---
 
@@ -74,6 +75,7 @@ MiniClosedAI is a single-user, single-process web app that wraps **local** LLMs 
 - 🔁 **OpenAI-SDK-compatible server** — drop MiniClosedAI in place of `api.openai.com` with a one-line `base_url` change. Every bot appears as a "model" to the SDK; calls route to whichever backend that bot is pinned to.
 - 🎨 **Polished UI** — left activity bar (Dashboard / Settings), Light / Dark / System theme, draggable splitters (sidebar width + system-prompt height), Gemini-style empty state, syntax-highlighted API-code modal with Streaming/Non-streaming and Native/OpenAI variants.
 - 🗂️ **SQLite persistence** — one file, two tables (`backends`, `conversations`), JSON columns for messages. Delete to reset, copy to migrate.
+- 🧪 **Fine-tuning data curation built-in** — edit any assistant response in place to turn it into the ideal output, then download the whole conversation as a two-column `input,output` CSV ready for SFT. The original pristine response is preserved under `original_content` for audit / DPO later.
 
 **What it is not:** a production inference platform. No authentication, no rate limiting, no multi-user. Intended for localhost or a trusted LAN.
 
@@ -234,6 +236,8 @@ Also: a **vertical splitter** between sidebar and chat lets you widen the sideba
 - Reasoning models emit a collapsible `💭 Thinking` block; it auto-collapses when the actual response begins streaming.
 - Each assistant message shows a params badge (model · T · max · top_p · top_k) for reproducibility.
 - **Stop button** (square icon) replaces **Send** (paper-plane icon) while streaming — click to abort.
+- **Edit pencil** (top-right of every assistant bubble) opens an in-place textarea so you can rewrite the response. Save commits the new text to storage and re-renders. `Esc` cancels, `Ctrl/⌘+Enter` saves. Disabled while a stream is in flight. The pristine original output is preserved the first time you edit (`original_content`); a small `edited` pill appears next to the params badge — click it to see the original.
+- **Download CSV** (tray icon in the header, between Clear and Delete) exports the current conversation as a two-column `input,output` CSV — one row per user→assistant pair, edited content as-is, leading/trailing whitespace stripped, proper CSV escaping for commas/quotes/newlines. Orphan user messages with no reply are skipped.
 
 ### Empty state
 
@@ -451,12 +455,14 @@ curl -X POST http://localhost:8095/api/backends/test \
 ### Conversations (bot lifecycle)
 
 ```
-GET    /api/conversations             → list all
-POST   /api/conversations             → create
-GET    /api/conversations/{id}        → get full conversation (config + messages)
-PATCH  /api/conversations/{id}        → update any subset of fields
-DELETE /api/conversations/{id}        → delete
-POST   /api/conversations/{id}/clear  → wipe messages, keep config
+GET    /api/conversations                         → list all
+POST   /api/conversations                         → create
+GET    /api/conversations/{id}                    → get full conversation (config + messages)
+PATCH  /api/conversations/{id}                    → update any subset of fields
+DELETE /api/conversations/{id}                    → delete
+POST   /api/conversations/{id}/clear              → wipe messages, keep config
+PATCH  /api/conversations/{id}/messages/{index}   → edit a stored message in place
+GET    /api/conversations/{id}/export.csv         → download this chat as an SFT CSV
 ```
 
 **Create** — supply any subset of config fields. `backend_id` defaults to `1` (built-in Ollama); set it to pin the bot to an OpenAI-compatible endpoint you registered in Settings.
@@ -501,6 +507,23 @@ curl -X PATCH http://localhost:8095/api/conversations/3 \
 ```
 
 **PATCH** — send only the fields you want to change. Sampling params merge into the saved JSON; other saved params are preserved.
+
+**PATCH `.../messages/{index}`** — edit a single stored message in place. Body accepts exactly `{"content": "new text"}` (empty string allowed; any extra field returns **422**). The first edit of a given message copies the existing text to `original_content` and stamps `edited: true` + `edited_at: <ISO-8601 UTC>`; subsequent edits update `content` only — the pristine original is preserved. Returns the full updated conversation. 404 if the conversation doesn't exist or `index` is out of range.
+
+```bash
+curl -X PATCH http://localhost:8095/api/conversations/3/messages/1 \
+  -H "Content-Type: application/json" \
+  -d '{"content": "The rewritten assistant answer that becomes the SFT target."}'
+```
+
+**GET `.../export.csv`** — download every user→assistant pair in this conversation as a two-column CSV. Columns are literally `input,output`. Rows use RFC-4180 quoting (commas, double quotes, and embedded newlines handled). Leading and trailing whitespace is stripped from both columns. Orphan user turns (no reply yet) are skipped. Response is `text/csv` with a `Content-Disposition: attachment; filename="<title>.csv"` header so the browser saves it directly. 404 if the conversation doesn't exist.
+
+```bash
+curl -o mybot.csv http://localhost:8095/api/conversations/3/export.csv
+head -3 mybot.csv
+# input,output
+# "Subject: URGENT — payout broken…","{""intent"":""bug"",""urgency"":""p1"",…}"
+```
 
 ### Chat
 
@@ -839,6 +862,86 @@ Small local models are *capable* but *literal*. A few rules of thumb:
 | `gpt-oss:20b` | ~14 GB | `ollama pull gpt-oss:20b` | Largest listed; supports `think` effort levels (low/medium/high) |
 
 The UI reads `ollama list` at startup and auto-populates the model dropdown. Cloud proxies and embedding-only models are filtered out.
+
+---
+
+## Curating fine-tuning data
+
+Every chat in MiniClosedAI is both a playground and a dataset-in-progress. The workflow is deliberately the simplest one that works for small high-quality SFT datasets: **demonstration data collection** — keep the real user prompts, rewrite imperfect assistant responses into the ideal ones, export the pairs as CSV.
+
+That's the whole loop. No separate rating UI. No thumbs-up/down table. No second sampling pass. The chat IS the dataset editor.
+
+### Why demonstration data (not thumbs-up / preferences)
+
+| Approach | What you collect | Training method | Data efficiency |
+|---|---|---|---|
+| **Demonstration** (edit to ideal) | `(prompt, ideal_response)` pairs | Supervised fine-tuning (SFT) | ~3× stronger per example on small (<5k pair) datasets |
+| **Preferences** (thumbs-up vs thumbs-down) | `(prompt, chosen, rejected)` triples | DPO / RLHF | Needs more pairs; more infra |
+
+If you have **<5,000 pairs**, demonstration data is the canonical choice — it trains a stronger policy per example and requires nothing beyond a text editor. Preference-based DPO is the right next step when your demonstration dataset stops improving the model, typically many thousands of pairs in. That's a conscious upgrade path, not the starting point.
+
+### The three-click curation loop
+
+1. **Run a normal chat.** Send the kinds of prompts you want the fine-tuned model to handle well. Use all the usual MiniClosedAI tools — sliders, system prompts, Thinking, different backends — to explore.
+
+2. **Hover any assistant response → click the pencil (top-right).** An inline textarea appears with the raw response. Rewrite it into the "ideal" version. Save (or `Ctrl/⌘+Enter`). The bubble re-renders with the new content, a small `edited` pill appears, and the pristine output is preserved under `original_content` server-side.
+
+3. **Click the download (tray) icon in the header.** You get `<chat-title>.csv` with `input,output` columns — one row per completed user→assistant pair, edited text as the `output`. Open it in any spreadsheet, load it into `pandas`, or stream it straight into a trainer.
+
+Repeat 1–2 as many times as you want before step 3. You can also edit user messages? **No** — only assistant responses are editable. Your real prompts are the whole point of the dataset; you're training the model to handle the prompts you actually write.
+
+### What's in the CSV
+
+```
+input,output
+"What does MiniClosedAI do?","MiniClosedAI wraps local LLMs in a playground UI and turns every chat into a callable API endpoint."
+"Summarize the support ticket below:\n\n<ticket text>","{""intent"":""bug"",""urgency"":""p1"",…}"
+```
+
+- Two columns, literally named `input` and `output`.
+- One row per **complete** user→assistant pair. Orphan user messages with no reply are skipped.
+- RFC-4180 escaping: values containing commas, double quotes, or newlines are wrapped in double quotes and internal `"` are doubled to `""`. Every standard CSV parser (pandas, Excel, `csv.reader`) round-trips cleanly.
+- Leading/trailing whitespace stripped from both cells. Important for models like LM Studio's Qwen3.6 which emit a leading `\n\n` separator between their (hidden) reasoning and the answer — training on that pollutes the target and teaches the model to emit junk whitespace.
+- The file is named after the conversation title; non-alphanumeric characters collapse to `_`.
+
+### Full workflow example
+
+```python
+import pandas as pd
+
+# Download one conversation's data via the API (or just click the UI icon):
+import httpx
+csv_text = httpx.get("http://localhost:8095/api/conversations/3/export.csv").text
+df = pd.read_csv(pd.io.common.StringIO(csv_text))
+print(df.head())
+print(f"{len(df)} pairs ready for SFT")
+
+# Combine several curated conversations into one training file:
+frames = []
+for conv_id in [3, 7, 11, 18]:
+    t = httpx.get(f"http://localhost:8095/api/conversations/{conv_id}/export.csv").text
+    frames.append(pd.read_csv(pd.io.common.StringIO(t)))
+pd.concat(frames, ignore_index=True).to_csv("sft_dataset.csv", index=False)
+```
+
+Pair `sft_dataset.csv` with any SFT runner (`axolotl`, Hugging Face `trl`, Unsloth) using its generic `input/output` column mapping — or convert to `{"messages": [...]}` JSONL with a four-line script.
+
+### Tips for good demonstration data
+
+- **Edit decisively.** Don't nudge — rewrite the response to look exactly like the *final answer you want the fine-tuned model to produce*. Half-hearted edits make half-hearted datasets.
+- **Keep the prompts realistic.** If you'd rephrase a user message so the model would do better, you're optimizing the dataset for a prompt the user won't actually write in prod. Edit only the `output` side for SFT purposes.
+- **Cover your edges.** Include a deliberate mix of easy-in-distribution examples *and* the tricky ones that used to trip the model. A handful of well-curated adversarial examples often beats hundreds of unremarkable ones.
+- **Cross-conversation variety.** Create a few distinct conversations — one per task archetype (ticket router, SQL gen, sentiment, JSON extractor) — then concat their CSVs. That's closer to a real training distribution than one enormous single chat.
+- **Quality over quantity.** 200 excellent pairs often out-perform 2,000 mediocre ones, especially on 1B–9B base models.
+
+### Audit trail / DPO upgrade path
+
+Every edited message preserves its *first* stored version under `original_content` in the conversation's `messages` JSON. The CSV export intentionally uses the edited content, but the original is still there for later use:
+
+- **Manual audit.** Click the small `edited` pill on any rewritten message in the UI to see the pristine version.
+- **DPO dataset construction.** When you outgrow SFT, you already have `(prompt, chosen=edited_content, rejected=original_content)` triples sitting in your database. A short script over the `messages` JSON emits them as a DPO JSONL file without any new UI work.
+
+That's the full curation story: start with demonstrations today; the preference-data upgrade is a data-transformation away, not a product rebuild.
 
 ---
 
