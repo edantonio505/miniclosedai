@@ -20,12 +20,15 @@
 # full re-bakes when the base updates.
 FROM ollama/ollama:0.5.13
 
-# Reset the entrypoint during build so `RUN <shell command>` doesn't get
-# prefixed with `/bin/ollama`. Restored at the end of the file.
-ENTRYPOINT []
+# Note: no `ENTRYPOINT []` reset here. Docker's ENTRYPOINT only affects
+# runtime — RUN commands already execute via `/bin/sh -c`, so there's
+# nothing to suppress. Earlier drafts had the reset and a "restore" at the
+# end, which triggered the MultipleInstructionsDisallowed warning for
+# zero benefit.
 
 # The bake script lives in its own layer so model-list edits don't
-# invalidate it.
+# invalidate it. The script uses `ollama list` as its readiness probe
+# because the base image ships without curl/wget.
 COPY scripts/bake-models.sh /usr/local/bin/bake-models.sh
 RUN chmod +x /usr/local/bin/bake-models.sh
 
@@ -38,11 +41,9 @@ RUN /usr/local/bin/bake-models.sh gemma2:2b
 
 # Healthcheck: `ollama list` is cheap and verifies both that the daemon is
 # up AND that the manifest store is readable. `start_period` gives the
-# daemon time to settle after container start.
-HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
+# daemon time to settle after container start (ssh keygen happens once).
+HEALTHCHECK --interval=15s --timeout=5s --start-period=90s --retries=5 \
   CMD ollama list > /dev/null 2>&1 || exit 1
 
-# Restore the base-image behavior for runtime.
-ENTRYPOINT ["/bin/ollama"]
-CMD ["serve"]
-EXPOSE 11434
+# Base image already sets ENTRYPOINT ["/bin/ollama"] + CMD ["serve"] +
+# EXPOSE 11434, so we inherit those without redeclaring.

@@ -132,7 +132,7 @@ One-command setup that boots MiniClosedAI **and** Ollama with three small-but-ca
 |---|---|---|
 | Docker Engine | 20.10+ (Compose v2 bundled) | `docker --version`. Use `docker compose` (space), not `docker-compose` (hyphen, v1 — ignores healthcheck conditions). |
 | NVIDIA drivers + `nvidia-container-toolkit` | current | Linux: `sudo apt install nvidia-container-toolkit && sudo systemctl restart docker`. Without it, `up` fails with *"could not select device driver nvidia with capabilities [[gpu]]"*. |
-| Free disk | ~15 GB | Build-time working space on Docker's `data-root` (model blobs + layer commit). The resulting image is ~5.8 GB. |
+| Free disk | ~20 GB | Build-time working space on Docker's `data-root` — ~10.3 GB final Ollama image (base ships CUDA/ROCm libs) + model blobs + layer commit overhead. |
 
 #### Bring it up
 
@@ -1273,7 +1273,7 @@ miniclosedai/
 ├── scripts/
 │   └── bake-models.sh         # Docker: background-daemon Ollama pull with clean shutdown
 ├── Dockerfile                 # App image — python:3.12-slim, ~160 MB
-├── Dockerfile.ollama          # Ollama image with 3 models baked in, ~5.8 GB
+├── Dockerfile.ollama          # Ollama image with 3 models baked in, ~10.3 GB
 ├── docker-compose.yml         # Two-service orchestration, GPU, healthchecks
 ├── docker-compose.cpu.yml     # Override for CPU-only hosts (`devices: !reset []`)
 ├── .dockerignore              # Build-context exclusions
