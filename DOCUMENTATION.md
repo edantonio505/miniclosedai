@@ -478,7 +478,7 @@ Instead of a single `message` string, send a full `messages` array:
 
 ### Production-grade recipes
 
-Three full, copy-paste walkthroughs live alongside this doc. Each is a standalone `.md` file with the exact system prompt, recommended sampling settings, worked input/output examples, Python + cURL + OpenAI-SDK integration code, and variant ideas:
+Seven full, copy-paste walkthroughs live alongside this doc. Each is a standalone `.md` file with the exact system prompt, recommended sampling settings, worked input/output examples, Python + cURL + OpenAI-SDK integration code, and variant ideas:
 
 | Recipe | File | Workload profile | Best backend |
 |---|---|---|---|
@@ -486,14 +486,22 @@ Three full, copy-paste walkthroughs live alongside this doc. Each is a standalon
 | **Inbound Lead Qualifier** | [`Inbound Lead Qualifier.md`](./Inbound%20Lead%20Qualifier.md) | Score B2B prospects (fit_score 0–100, intent, role, budget/timeline signals) → CRM routing. | `qwen3:8b` on Ollama (Bonsai also works) |
 | **RAG Query Router** | [`RAG Query Router.md`](./RAG%20Query%20Router.md) | Latency-critical pre-router for retrieval-augmented QA. Classifies every user query; decides cache/fast-LLM/light-RAG/deep-RAG/ask-clarification. | **Bonsai-8B** on llama.cpp (port 8080) — ~200 ms per call; see [Worked example — connecting Bonsai](#worked-example--connecting-bonsai-1-bit-8b). |
 | **Doctor's Office Bot** | [`Doctors Office Bot.md`](./Doctors%20Office%20Bot.md) | Conversational front-of-house chatbot for a primary-care practice. FAQs + multi-turn appointment booking + red-flag symptom → 911 redirect + refill routing. Emits fenced JSON action blocks on action-triggering turns only. | `qwen3:8b` on Ollama. **Not Bonsai** — mixed-mode output (prose + conditional JSON) exceeds 1-bit instruction-following reliability; verified live. |
+| **Restaurant Reservations Bot** | [`Restaurant Reservations Bot.md`](./Restaurant%20Reservations%20Bot.md) | Conversational host-stand chatbot for a sit-down restaurant. FAQs + multi-turn reservation booking/modify/cancel + large-party (9+) → events team override + allergy flags for the kitchen. Same dual-mode output as Doctor's Office Bot, with hardened pre-confirmation checklist + explicit-affirmative-trigger rule + four negative-path few-shots. | `qwen3:8b` on Ollama. Same not-Bonsai rationale as Doctor's Office Bot. |
+| **Hotel Reservations Bot** | [`Hotel Reservations Bot.md`](./Hotel%20Reservations%20Bot.md) | Conversational reservations chatbot for a boutique hotel. FAQs + multi-turn booking/modify/cancel of any length + group-block (5+ rooms) → sales-team override + hard-refuse on card numbers in chat. Dual-mode output, hardened pre-confirmation checklist + explicit-affirmative-trigger rule + five negative-path few-shots (incl. a long-stay-books-normally example). Stay length is **not** a routing trigger. | `qwen3:8b` on Ollama. |
+| **Dentist Appointment Bot** | [`Dentist Appointment Bot.md`](./Dentist%20Appointment%20Bot.md) | Conversational front-of-house chatbot for a general-dentistry practice. FAQs + multi-turn booking/reschedule/cancel + two-tier emergency routing (911 for airway/spreading-infection signs vs. on-call dentist for time-critical dental emergencies). Dual-mode output, hardened pre-confirmation checklist + explicit-affirmative-trigger rule + three negative-path few-shots. | `qwen3:8b` on Ollama. |
 
-All four share the same archetype — *small structured decision (or action), driven by a focused system prompt, called as an HTTP microservice* — but differ in where they sit in the pipeline:
+All seven share the same archetype — *small structured decision (or action), driven by a focused system prompt, called as an HTTP microservice* — but differ in where they sit in the pipeline:
 
 - **End-state record** (Ticket Router, Lead Qualifier) — one-shot classification per call, same JSON schema every time.
 - **Intermediate orchestration decision** (RAG Query Router) — one-shot decision about where to route an incoming request; every output is JSON.
-- **Conversational agent with side-effecting actions** (Doctor's Office Bot) — multi-turn state, dual-mode output, fenced JSON action block on a subset of turns.
+- **Conversational agent with side-effecting actions** (Doctor's Office, Restaurant Reservations, Hotel Reservations, Dentist Appointment) — multi-turn state, dual-mode output, fenced JSON action block on a subset of turns. The four conversational recipes share a deliberately identical skeleton: a `=== BEGIN/END FACTS ===` block as the only source of truth for FAQs, hard-override branches (911 / events team / sales team / on-call), action-emission gates, and load-bearing few-shot examples at the bottom of the system prompt covering both the **happy path** (one example per action that fires) and the **negative path** (one example per common refusal — invalid provider/room/seating, time outside hours, missing required field). The Restaurant, Hotel, and Dentist recipes also include an explicit **pre-confirmation checklist** the model runs silently before any `create_*` action, with two failure modes worth calling out specifically:
 
-Study all four before authoring a new one; the similarities show you which patterns are reusable and the differences show you which knobs actually matter for your workload. **Rule of thumb for picking a model:** if output is always JSON (single-mode), Bonsai 1-bit is often the best pick for latency. If output is prose sometimes and JSON sometimes (multi-mode), use a full-precision 7–9B.
+  - **Hallucinated facts.** Without explicit "must match the facts block" rules, `qwen3:8b` at T=0.3 will accept a made-up provider name ("Dr. Kamata") or invented room type ("Presidential Suite") and confirm a booking against it. The checklist's first item in each recipe is a literal name/value match against the facts block.
+  - **Premature confirmation.** Without an **explicit affirmative trigger** rule (`yes` / `I confirm` / `book it` / `go ahead` / `lock it in` / `sounds good` / `do it` / `that works`), the model treats answers to its own follow-up questions ("no allergies", "no special requests", "no need for accessibility") as green lights and emits "you're set" prose without the JSON action block — a silent failure where downstream systems see no event to dispatch. The trigger rule + a "partial gather, no trigger" few-shot example fix this on all three patched recipes.
+
+  The Doctor's Office Bot pre-dates the hardening and uses the older three-example (booking / red-flag / FAQ-out-of-scope) form. Pick whichever recipe is closest to your domain and edit the facts block.
+
+Study all seven before authoring a new one; the similarities show you which patterns are reusable and the differences show you which knobs actually matter for your workload. **Rule of thumb for picking a model:** if output is always JSON (single-mode), Bonsai 1-bit is often the best pick for latency. If output is prose sometimes and JSON sometimes (multi-mode), use a full-precision 7–9B.
 
 ---
 
@@ -799,6 +807,9 @@ miniclosedai/
 ├── Inbound Lead Qualifier.md  # Recipe
 ├── RAG Query Router.md        # Recipe (Bonsai-paired)
 ├── Doctors Office Bot.md      # Recipe (conversational, qwen3:8b)
+├── Restaurant Reservations Bot.md  # Recipe (conversational, qwen3:8b)
+├── Hotel Reservations Bot.md       # Recipe (conversational, qwen3:8b)
+├── Dentist Appointment Bot.md      # Recipe (conversational, qwen3:8b)
 ├── CLAUDE.md                  # Notes for AI coding assistants
 └── miniclosedai.db            # (runtime-generated, gitignored; Docker: in named volume)
 ```

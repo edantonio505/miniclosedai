@@ -1029,6 +1029,70 @@ A front-of-house chatbot for a primary-care practice. Answers FAQs from an expli
 
 ---
 
+### 10. Restaurant reservations bot — [full walkthrough](./Restaurant%20Reservations%20Bot.md)
+
+Same dual-mode archetype as the Doctor's Office Bot, applied to a sit-down restaurant's host stand. Answers FAQs from an explicit `RESTAURANT FACTS` block (hours, dress code, dietary, corkage, parking, cancellation policy), books / modifies / cancels reservations across multiple turns, hard-overrides any party of 9+ or private-event request to the events team, attaches a `kitchen_allergy_flag` to the reservation when the guest mentions celiac / anaphylaxis / "deathly allergic," and offers a human host transfer on request.
+
+**Output — visible reply PLUS (on action turns) one of:**
+```json
+{"type": "create_reservation",   "guest": {...}, "reservation": {...}, "kitchen_allergy_flag": "...", "confirmation": {...}}
+{"type": "modify_reservation",   "lookup": {...}, "changes": {...}}
+{"type": "cancel_reservation",   "lookup": {...}, "reason": "..."}
+{"type": "route_to_events_team", "guest": {...}, "request": {"kind": "large_party | wedding | ...", ...}}
+{"type": "transfer_to_human",    "reason": "...", "short_summary": "..."}
+```
+
+**Settings:** `qwen3:8b` on Ollama, temperature `0.3`, Thinking `Off`, max_tokens `500`, `include_history: true`.
+
+**Archetype:** drop-in twin of the Doctor's Office Bot for hospitality. Same `=== BEGIN/END FACTS ===` source-of-truth pattern, same dual-mode output, same required-fields gate — plus a hardened **pre-confirmation checklist** (closed-day check, in-service-hours check, party-size 1–8, seating-bookable check, all-fields-present check, **explicit affirmative trigger**, JSON-or-no-confirmation) and four negative-path few-shot examples (Examples D/E/F/G — closed Monday with dog indoors, Sunday post-close, bar counter not bookable, partial gather with no trigger). The hardening was added after live testing showed `qwen3:8b` would otherwise sometimes confirm prematurely on a follow-up answer like "no allergies" instead of waiting for an explicit yes. Edit the facts block to point at your restaurant. Walkthrough in **[`Restaurant Reservations Bot.md`](./Restaurant%20Reservations%20Bot.md)**.
+
+---
+
+### 11. Hotel reservations bot — [full walkthrough](./Hotel%20Reservations%20Bot.md)
+
+Same dual-mode archetype, applied to a boutique hotel's reservations chat. Answers FAQs from an explicit `HOTEL FACTS` block (check-in/out, room types, rates, pet policy, parking, cancellation), books / modifies / cancels stays of any length, hard-overrides group blocks of 5+ rooms / weddings / conferences / buyouts / negotiated corporate rates to the sales team, and refuses to accept a credit-card number in chat — payment happens on the secure confirmation page after the inquiry is saved. (Stay length is intentionally NOT a routing trigger — a single guest booking 17 nights goes through the normal flow.)
+
+**Output — visible reply PLUS (on action turns) one of:**
+```json
+{"type": "create_booking",      "guest": {...}, "stay": {...}, "add_ons": {...}, "confirmation": {...}}
+{"type": "modify_booking",      "lookup": {...}, "changes": {...}}
+{"type": "cancel_booking",      "lookup": {...}, "fee_acknowledged": true}
+{"type": "route_to_sales_team", "guest": {...}, "request": {"kind": "group_block | wedding | ...", ...}}
+{"type": "transfer_to_human",   "reason": "...", "short_summary": "..."}
+{"type": "request_callback",    "guest": {...}, "topic": "...", "preferred_window": "..."}
+```
+
+**Settings:** `qwen3:8b` on Ollama, temperature `0.3`, Thinking `Off`, max_tokens `600`, `include_history: true`.
+
+**Archetype:** same skeleton as the other conversational recipes, with one extra hard rule worth noting: **never accept card details in chat.** A real PMS hands payment off to a tokenized confirmation page — the bot's job is to capture the inquiry and refuse the card. The bot also runs a hardened **pre-confirmation checklist** (room-type-in-rate-card, occupancy-fits, pet/smoking, group-block routing, no-card-in-chat, all-fields-present, **explicit affirmative trigger**, JSON-or-no-confirmation) and ships with five negative-path few-shot examples (D/E/F/G/H — invalid room + over-occupancy, card refusal, group-block routing, long-stay-books-normally, partial gather with no trigger). Stay length is **not** a routing trigger — a single guest booking 17 nights books normally. Walkthrough in **[`Hotel Reservations Bot.md`](./Hotel%20Reservations%20Bot.md)**.
+
+---
+
+### 12. Dentist appointment bot — [full walkthrough](./Dentist%20Appointment%20Bot.md)
+
+Closest sibling to the Doctor's Office Bot — primary-care archetype, dental-specific facts and red flags. Answers FAQs from an explicit `PRACTICE FACTS` block (services offered, services NOT offered → ortho/wisdom teeth/oral surgery referred out, insurance, sedation/nitrous availability), books / reschedules / cancels appointments, and routes emergencies on **two tiers**:
+
+- **911** — airway involvement, severe facial swelling with fever, suspected jaw fracture, anaphylaxis. Same urgent-redirect pattern as the Doctor's Office Bot.
+- **On-call dentist or in-hours emergency slot** — knocked-out tooth (avulsion, time-critical), severe toothache unresponsive to OTC, displaced tooth from trauma, abscess without systemic signs.
+
+**Output — visible reply PLUS (on action turns) one of:**
+```json
+{"type": "create_appointment",        "patient": {...}, "visit": {...}, "insurance": {...}, "confirmation": {...}}
+{"type": "route_to_emergency_slot",   "patient": {...}, "issue_summary": "...", "time_first_mentioned": null}
+{"type": "route_to_on_call",          "issue_summary": "...", "guidance_given": "..."}
+{"type": "urgent_redirect_911",       "trigger_signs": [...], "time_first_mentioned": null}
+{"type": "reschedule_appointment",    "lookup": {...}, "changes": {...}}
+{"type": "cancel_appointment",        "lookup": {...}, "reason": "..."}
+{"type": "transfer_to_human",         "reason": "...", "short_summary": "..."}
+{"type": "request_callback",          "patient": {...}, "topic": "...", "preferred_window": "..."}
+```
+
+**Settings:** `qwen3:8b` on Ollama, temperature `0.3`, Thinking `Off`, max_tokens `600`, `include_history: true`.
+
+**Archetype:** same conversational dual-mode pattern as the Doctor's Office Bot, with the practical addition of an explicit "services NOT offered" line in the facts block — the bot proactively refers Invisalign, wisdom-tooth extraction, full-arch implants, and IV sedation out, instead of inventing a plausible-sounding answer. Also runs a hardened **pre-confirmation checklist** (provider-in-facts, all-fields-present including insurance, time-in-office-hours, **explicit affirmative trigger**, JSON-or-no-confirmation) and three negative-path few-shot examples (D/E/F — unknown provider + missing insurance, time before opening, partial gather with no trigger). Added after live testing showed the bot would otherwise hallucinate a "Dr. Kamata" provider name when asked, and confirm without an explicit yes. Walkthrough in **[`Dentist Appointment Bot.md`](./Dentist%20Appointment%20Bot.md)**.
+
+---
+
 ## Getting good responses from small models
 
 Small local models are *capable* but *literal*. A few rules of thumb:
@@ -1284,6 +1348,9 @@ miniclosedai/
 ├── Inbound Lead Qualifier.md  # Standalone bot recipe
 ├── RAG Query Router.md        # Standalone bot recipe (Bonsai-paired)
 ├── Doctors Office Bot.md      # Standalone bot recipe (conversational, qwen3:8b)
+├── Restaurant Reservations Bot.md  # Standalone bot recipe (conversational, qwen3:8b)
+├── Hotel Reservations Bot.md       # Standalone bot recipe (conversational, qwen3:8b)
+├── Dentist Appointment Bot.md      # Standalone bot recipe (conversational, qwen3:8b)
 ├── test_e2e.py                # Single-file end-to-end regression suite (39 tests)
 └── miniclosedai.db            # SQLite file (gitignored; Docker: in named volume)
 ```

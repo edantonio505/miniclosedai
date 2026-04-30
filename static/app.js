@@ -285,7 +285,6 @@ function bindParamDisplay() {
 
 function _usableOllamaModels(models) {
   return models.filter(m => {
-    if (m.name.includes(":cloud") || m.remote_model) return false;
     const fam = (m.details && (m.details.family || "")) + " "
               + ((m.details && m.details.families) || []).join(" ");
     if (/bert|embed/i.test(fam) || /embed/i.test(m.name)) return false;
