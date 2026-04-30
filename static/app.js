@@ -1555,10 +1555,25 @@ function _renderBackendCard(b) {
   top.appendChild(actions);
   card.appendChild(top);
 
-  if (b.kind === "ollama" && b.enabled) {
+  if (b.kind === "ollama" && b.enabled && _ollamaAllowsPull(b)) {
     card.appendChild(_renderPullSection(b));
   }
   return card;
+}
+
+// Pull only makes sense on Ollama instances you control — typically localhost
+// or a machine on your LAN. Public-hostname Ollama backends (e.g. an
+// authenticating relay like app.interdataresearch.com) generally forward
+// `/api/chat` but reject `/api/pull`, since they don't let you write models
+// onto someone else's disk. Hide the download UI in that case.
+function _ollamaAllowsPull(b) {
+  let host;
+  try { host = new URL(b.base_url).hostname; } catch { return false; }
+  if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0") return true;
+  if (/^10\./.test(host)) return true;                               // 10.0.0.0/8
+  if (/^192\.168\./.test(host)) return true;                         // 192.168.0.0/16
+  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) return true;         // 172.16.0.0/12
+  return false;  // public hostname / IP — assume no pull capability
 }
 
 function _renderPullSection(b) {
