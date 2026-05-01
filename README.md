@@ -772,6 +772,108 @@ curl -N -X POST http://localhost:8095/api/conversations/3/chat/stream \
   -d '{"message": "Hello!"}'
 ```
 
+### Sending file attachments
+
+Multimodal turn — same streaming endpoint, same single-`message` form, plus an `attachments` array described in the request-body table above. The server combines `message` + each entry into one user turn (text/PDF bodies prepended as `[Attached: <name>]\n…`, images become `image_url` parts). All three snippets below use a vision-capable conversation (e.g. one pinned to `llava:7b`, `gemma4:31b`, or `qwen3.6:35b`). Replace the conversation ID and image path; everything else is verbatim.
+
+**cURL** — inline base64-encodes a local image into a `data:` URL so the call is one paste:
+
+```bash
+# Chat #3. Config (model/prompt/params) is set in the GUI —
+# this call only supplies the message + attachments.
+B64=$(base64 -w0 ./photo.png)             # macOS: base64 -i ./photo.png | tr -d '\n'
+curl -N -X POST http://localhost:8095/api/conversations/3/chat/stream \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"message\": \"What's in this image?\",
+    \"attachments\": [{
+      \"name\": \"photo.png\",
+      \"kind\": \"image\",
+      \"mime\": \"image/png\",
+      \"data_url\": \"data:image/png;base64,$B64\"
+    }]
+  }"
+```
+
+**Python** — `httpx.stream` shape, mirrors the GUI's "API Code" modal output:
+
+```python
+import base64, httpx, json, mimetypes, pathlib
+
+# Config (model/prompt/params) is set in the GUI — this call only supplies the message + attachments.
+path = pathlib.Path("photo.png")
+mime = mimetypes.guess_type(path)[0] or "image/png"
+data_url = f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+
+URL = "http://localhost:8095/api/conversations/3/chat/stream"
+payload = {
+    "message": "What's in this image?",
+    "attachments": [{
+        "name": path.name,
+        "kind": "image",
+        "mime": mime,
+        "data_url": data_url,
+    }],
+}
+with httpx.stream("POST", URL, json=payload, timeout=None) as r:
+    for line in r.iter_lines():
+        if not line.startswith("data:"):
+            continue
+        data = json.loads(line[5:].strip())
+        if "chunk" in data:
+            print(data["chunk"], end="", flush=True)
+        if data.get("end"):
+            break
+```
+
+**JavaScript (Node 18+, native fetch):**
+
+```js
+import { readFile } from "node:fs/promises";
+
+// Config (model/prompt/params) is set in the GUI — this call only supplies the message + attachments.
+const buf = await readFile("./photo.png");
+const dataUrl = `data:image/png;base64,${buf.toString("base64")}`;
+
+const res = await fetch("http://localhost:8095/api/conversations/3/chat/stream", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    message: "What's in this image?",
+    attachments: [{
+      name: "photo.png",
+      kind: "image",
+      mime: "image/png",
+      data_url: dataUrl,
+    }],
+  }),
+});
+
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+let buffer = "";
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  buffer += decoder.decode(value, { stream: true });
+  const parts = buffer.split("\n\n");
+  buffer = parts.pop();
+  for (const part of parts) {
+    if (!part.startsWith("data:")) continue;
+    const data = JSON.parse(part.slice(5).trim());
+    if (data.chunk) process.stdout.write(data.chunk);
+    if (data.end) process.exit(0);
+  }
+}
+```
+
+**Other file kinds.** Swap the entry shape — no base64 needed for plain text:
+
+- **`.txt` / `.md` / `.csv` / source code** → `{"name": "todo.txt", "kind": "text", "text": "<file body as a string>"}`. Read the file as UTF-8 (Python: `path.read_text()`, JS: `fs.readFile(path, "utf-8")`) and drop the contents straight into `text`.
+- **PDF** → first call `POST /api/extract-pdf` (curl example just below) and pass its returned fields through: `{"name": "doc.pdf", "kind": "pdf", "text": <returned text>, "page_count": <returned page_count>, "truncated": <returned truncated>}`.
+
+Multiple attachments per message are allowed and may freely mix the three kinds — append more entries to the same `attachments` array.
+
 ### PDF text extraction
 
 ```

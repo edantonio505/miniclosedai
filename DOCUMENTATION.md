@@ -694,6 +694,8 @@ Outbound translation per backend kind happens inside `llm.py`:
 
 `display_text` and `attachments` are UI-only metadata: stripped from outbound LLM requests by `_resolve_conversation_chat`, then re-attached on persistence so reloading a conversation reconstructs the original chat-bubble layout.
 
+For copy-paste curl / Python / JavaScript callers, see [README — Sending file attachments](./README.md#sending-file-attachments).
+
 ### Vision-model heuristic
 
 Neither Ollama's `/api/tags` nor OpenAI's `/v1/models` exposes a clean "is multimodal" flag. The frontend matches model names against this regex set to decide whether to soft-warn on image attachments:
