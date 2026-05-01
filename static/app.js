@@ -38,6 +38,10 @@ const els = {
   form: document.getElementById("chat-form"),
   input: document.getElementById("input"),
   sendBtn: document.getElementById("send-btn"),
+  attachBtn: document.getElementById("attach-btn"),
+  attachInput: document.getElementById("attach-input"),
+  attachmentList: document.getElementById("attachment-list"),
+  attachmentWarning: document.getElementById("attachment-warning"),
   modalBackdrop: document.getElementById("modal-backdrop"),
   modalClose: document.getElementById("modal-close"),
   codeSnippet: document.getElementById("code-snippet"),
@@ -66,6 +70,10 @@ let state = {
   activeMode: "stream",    // "stream" | "sync"
   activeStyle: "native",   // "native" | "openai"
   abortController: null,
+  // Pending attachments for the next outgoing user message. Cleared after
+  // each successful send. See ATTACH_* constants and _ingestFile() below
+  // for the entry shape.
+  attachments: [],
 };
 
 // ---------- Utilities ----------
@@ -546,13 +554,19 @@ function renderMessage(m, index) {
   if (m.role === "user") {
     body = document.createElement("div");
     body.className = "msg-body";
-    body.textContent = m.content;
+    // Multimodal-aware: when content is a list of parts, show only the
+    // user's typed text (display_text if present, else extracted from the
+    // text part) so the bubble doesn't dump full PDF/text bodies. Inline
+    // images and doc chips render below the text.
+    const visibleText = _userVisibleText(m);
+    if (visibleText) body.textContent = visibleText;
+    _appendUserAttachments(body, m);
     div.appendChild(body);
   } else {
     // Wrap assistant content in a single child so the flex avatar lays out correctly.
     body = document.createElement("div");
     body.className = "msg-body";
-    body.innerHTML = render(m.content);
+    body.innerHTML = render(typeof m.content === "string" ? m.content : "");
     div.appendChild(body);
     highlightCodeBlocks(body);
     if (m.params) appendParamsBadge(body, m.params);
@@ -719,12 +733,14 @@ function _rerenderMessageInPlace(msgEl, m, index) {
   if (m.role === "user") {
     body = document.createElement("div");
     body.className = "msg-body";
-    body.textContent = m.content;
+    const visibleText = _userVisibleText(m);
+    if (visibleText) body.textContent = visibleText;
+    _appendUserAttachments(body, m);
     msgEl.appendChild(body);
   } else {
     body = document.createElement("div");
     body.className = "msg-body";
-    body.innerHTML = render(m.content);
+    body.innerHTML = render(typeof m.content === "string" ? m.content : "");
     msgEl.appendChild(body);
     highlightCodeBlocks(body);
     if (m.params) appendParamsBadge(body, m.params);
@@ -733,11 +749,329 @@ function _rerenderMessageInPlace(msgEl, m, index) {
   if (m.role === "assistant") _appendEditButton(msgEl, index);
 }
 
+// ---------- Attachments ----------
+//
+// Pending attachments live in `state.attachments` until the user hits send.
+// Each entry is one of:
+//   {kind:"image", name, mime, size, data_url}        // FileReader.readAsDataURL
+//   {kind:"text",  name, mime, size, text}            // FileReader.readAsText
+//   {kind:"pdf",   name, mime, size, text, page_count, char_count, truncated}
+// The shape mirrors AttachmentSpec on the server so we can `JSON.stringify`
+// straight into the chat request body.
+
+const ATTACH_MAX_BYTES = 10 * 1024 * 1024;          // per-file cap, before base64 inflation
+const ATTACH_IMAGE_MAX_DIM = 2048;                  // longest-edge cap; we downscale in-browser
+const ATTACH_TEXT_MAX_CHARS = 30_000;               // matches the PDF cap on the server
+const VISION_MODEL_PATTERNS = [
+  /^llava/i, /-vision/i, /vl[:-]/i, /qwen.*vl/i, /qwen3\.6/i,
+  /^gemma4/i, /llama3\.2-vision/i, /minicpm-?v/i, /pixtral/i, /moondream/i,
+];
+
+function _looksLikeVisionModel(name) {
+  if (!name) return false;
+  return VISION_MODEL_PATTERNS.some(re => re.test(name));
+}
+
+function _readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result);
+    fr.onerror = () => reject(fr.error || new Error("read failed"));
+    fr.readAsDataURL(file);
+  });
+}
+
+function _readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result);
+    fr.onerror = () => reject(fr.error || new Error("read failed"));
+    fr.readAsText(file);
+  });
+}
+
+// Downscale large images via canvas to keep base64 payloads sane. Called only
+// when an image's longest edge exceeds ATTACH_IMAGE_MAX_DIM. Output is JPEG
+// at quality 0.92 (good enough for vision models, 5–10× smaller than PNG).
+async function _downscaleImage(dataUrl) {
+  const img = new Image();
+  await new Promise((resolve, reject) => {
+    img.onload = resolve;
+    img.onerror = reject;
+    img.src = dataUrl;
+  });
+  const longest = Math.max(img.width, img.height);
+  if (longest <= ATTACH_IMAGE_MAX_DIM) return dataUrl;
+  const scale = ATTACH_IMAGE_MAX_DIM / longest;
+  const w = Math.round(img.width * scale);
+  const h = Math.round(img.height * scale);
+  const canvas = document.createElement("canvas");
+  canvas.width = w; canvas.height = h;
+  canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+  return canvas.toDataURL("image/jpeg", 0.92);
+}
+
+function _isImageMime(mime, name) {
+  if (mime && mime.startsWith("image/")) return true;
+  return /\.(png|jpe?g|webp|gif|bmp)$/i.test(name || "");
+}
+function _isPdfMime(mime, name) {
+  return mime === "application/pdf" || /\.pdf$/i.test(name || "");
+}
+function _isTextLike(file) {
+  if (file.type && file.type.startsWith("text/")) return true;
+  // file.type is empty for many code files; fall back to extension.
+  return /\.(txt|md|markdown|csv|tsv|json|jsonl|yaml|yml|toml|xml|html?|css|js|jsx|ts|tsx|py|go|rs|java|c|cpp|cc|h|hpp|sh|bash|zsh|sql|log|env|ini|conf|cfg)$/i.test(file.name || "");
+}
+
+async function _ingestFile(file) {
+  if (file.size > ATTACH_MAX_BYTES) {
+    throw new Error(`${file.name} is ${(file.size / 1024 / 1024).toFixed(1)} MB — over the 10 MB cap.`);
+  }
+  // --- Image ---
+  if (_isImageMime(file.type, file.name)) {
+    let dataUrl = await _readFileAsDataUrl(file);
+    dataUrl = await _downscaleImage(dataUrl);
+    return {
+      kind: "image",
+      name: file.name,
+      mime: file.type || "image/jpeg",
+      size: file.size,
+      data_url: dataUrl,
+    };
+  }
+  // --- PDF ---
+  if (_isPdfMime(file.type, file.name)) {
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+    const r = await fetch("/api/extract-pdf", { method: "POST", body: fd });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || `PDF extraction failed (HTTP ${r.status}).`);
+    }
+    const j = await r.json();
+    return {
+      kind: "pdf",
+      name: file.name,
+      mime: "application/pdf",
+      size: file.size,
+      text: j.text || "",
+      page_count: j.page_count,
+      char_count: j.char_count,
+      truncated: !!j.truncated,
+    };
+  }
+  // --- Plain text / source code ---
+  if (_isTextLike(file)) {
+    let text = await _readFileAsText(file);
+    let truncated = false;
+    if (text.length > ATTACH_TEXT_MAX_CHARS) {
+      text = text.slice(0, ATTACH_TEXT_MAX_CHARS);
+      truncated = true;
+    }
+    return {
+      kind: "text",
+      name: file.name,
+      mime: file.type || "text/plain",
+      size: text.length,
+      text,
+      char_count: text.length,
+      truncated,
+    };
+  }
+  throw new Error(`${file.name}: unsupported file type. Attach images, PDFs, or text/source files.`);
+}
+
+function _formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function _renderAttachmentChips() {
+  const list = els.attachmentList;
+  list.innerHTML = "";
+  const atts = state.attachments || [];
+  if (!atts.length) {
+    list.hidden = true;
+    return;
+  }
+  list.hidden = false;
+  atts.forEach((a, idx) => {
+    const chip = document.createElement("span");
+    chip.className = "attachment-chip";
+
+    if (a.kind === "image") {
+      const img = document.createElement("img");
+      img.className = "attachment-chip-thumb";
+      img.src = a.data_url;
+      img.alt = a.name;
+      chip.appendChild(img);
+    } else {
+      const ic = document.createElement("span");
+      ic.className = "attachment-chip-icon";
+      ic.innerHTML = a.kind === "pdf"
+        ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M10 13h.01M14 13h.01M10 17h4"/></svg>'
+        : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="15" y2="17"/></svg>';
+      chip.appendChild(ic);
+    }
+
+    const meta = document.createElement("span");
+    meta.className = "attachment-chip-meta";
+    const nameEl = document.createElement("span");
+    nameEl.className = "attachment-chip-name";
+    nameEl.textContent = a.name;
+    nameEl.title = a.name;
+    const subEl = document.createElement("span");
+    subEl.className = "attachment-chip-sub";
+    if (a.kind === "pdf") {
+      subEl.textContent = `${a.page_count || 0} pages${a.truncated ? " · truncated" : ""}`;
+    } else if (a.kind === "image") {
+      subEl.textContent = _formatBytes(a.size);
+    } else {
+      subEl.textContent = `${a.char_count || (a.text || "").length} chars${a.truncated ? " · truncated" : ""}`;
+    }
+    meta.appendChild(nameEl);
+    meta.appendChild(subEl);
+    chip.appendChild(meta);
+
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "attachment-chip-remove";
+    rm.textContent = "×";
+    rm.title = "Remove";
+    rm.addEventListener("click", () => {
+      state.attachments.splice(idx, 1);
+      _renderAttachmentChips();
+      _refreshAttachmentWarning();
+    });
+    chip.appendChild(rm);
+
+    list.appendChild(chip);
+  });
+}
+
+function _refreshAttachmentWarning() {
+  const w = els.attachmentWarning;
+  if (!w) return;
+  const hasImage = (state.attachments || []).some(a => a.kind === "image");
+  const model = els.modelSelect.value || "";
+  if (hasImage && !_looksLikeVisionModel(model)) {
+    w.hidden = false;
+    w.textContent = `⚠️ "${model}" doesn't look like a vision-capable model. The image will be sent anyway, but the reply may ignore it.`;
+  } else {
+    w.hidden = true;
+    w.textContent = "";
+  }
+}
+
+async function _addFiles(files) {
+  if (!files || !files.length) return;
+  const errors = [];
+  for (const f of files) {
+    try {
+      const att = await _ingestFile(f);
+      state.attachments.push(att);
+    } catch (e) {
+      errors.push(e.message || String(e));
+    }
+  }
+  _renderAttachmentChips();
+  _refreshAttachmentWarning();
+  if (errors.length) alert(errors.join("\n"));
+}
+
+function _clearAttachments() {
+  state.attachments = [];
+  _renderAttachmentChips();
+  _refreshAttachmentWarning();
+}
+
+// What to display inside a user bubble. Prefers `display_text` (the user's
+// actual typed text, no "[Attached: …]" prefixes). Falls back to the raw text
+// part of a multimodal content array, or to the plain string content.
+function _userVisibleText(m) {
+  if (typeof m.display_text === "string") return m.display_text;
+  if (typeof m.content === "string") return m.content;
+  if (Array.isArray(m.content)) {
+    return m.content
+      .filter(p => p && p.type === "text")
+      .map(p => p.text || "")
+      .join("\n");
+  }
+  return "";
+}
+
+// Append inline image previews + doc chips below the user's text inside a bubble.
+function _appendUserAttachments(bodyEl, m) {
+  const images = [];
+  if (Array.isArray(m.content)) {
+    for (const p of m.content) {
+      if (p && p.type === "image_url" && p.image_url && p.image_url.url) {
+        images.push(p.image_url.url);
+      }
+    }
+  }
+  const docs = (m.attachments || []).filter(a => a && a.kind !== "image");
+  if (!images.length && !docs.length) return;
+  const wrap = document.createElement("div");
+  wrap.className = "msg-attachments";
+  for (const url of images) {
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = "attached image";
+    wrap.appendChild(img);
+  }
+  for (const a of docs) {
+    const chip = document.createElement("span");
+    chip.className = "msg-doc-chip";
+    const label = a.kind === "pdf"
+      ? `${a.name} · ${a.page_count ?? "?"} pages${a.truncated ? " (truncated)" : ""}`
+      : `${a.name}`;
+    chip.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+    const span = document.createElement("span");
+    span.textContent = label;
+    chip.appendChild(span);
+    wrap.appendChild(chip);
+  }
+  bodyEl.appendChild(wrap);
+}
+
+// Wire the attach UI: button click opens picker, file input triggers ingestion,
+// pasted images are captured into state.attachments, and the model dropdown's
+// change event refreshes the soft-warn banner.
+function bindAttachments() {
+  if (!els.attachBtn || !els.attachInput) return;
+  els.attachBtn.addEventListener("click", () => els.attachInput.click());
+  els.attachInput.addEventListener("change", async (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = "";  // allow re-picking the same file later
+    await _addFiles(files);
+  });
+  // Clipboard paste — only fires when the textarea has focus.
+  els.input.addEventListener("paste", async (e) => {
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    const files = [];
+    for (const it of items) {
+      if (it.kind === "file") {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) {
+      e.preventDefault();
+      await _addFiles(files);
+    }
+  });
+  els.modelSelect.addEventListener("change", _refreshAttachmentWarning);
+}
+
 // ---------- Streaming chat ----------
 async function sendMessage(text) {
   const model = els.modelSelect.value;
   if (!model) { alert("Pick a model first."); return; }
-  if (!text.trim()) return;
+  // Allow attachment-only sends ("[image] please describe").
+  if (!text.trim() && !(state.attachments && state.attachments.length)) return;
 
   // Ensure a conversation exists
   if (!state.conversationId) {
@@ -745,7 +1079,48 @@ async function sendMessage(text) {
   }
 
   const params = getParams();
-  const userMsg = { role: "user", content: text };
+
+  // Snapshot attachments at send time so the chips clear immediately and
+  // a slow upload doesn't get re-sent if the user adds another file mid-flight.
+  const attachmentsForSend = (state.attachments || []).slice();
+  _clearAttachments();
+
+  // Build the user-side message for in-page rendering. If there are
+  // attachments, mirror the server's content-array shape so renderMessage
+  // can show inline images + doc chips. The server applies the same
+  // assembly on its side from {message, attachments}.
+  let userMsg;
+  if (attachmentsForSend.length) {
+    const textChunks = [];
+    const imageParts = [];
+    const meta = [];
+    for (const a of attachmentsForSend) {
+      if (a.kind === "image") {
+        imageParts.push({ type: "image_url", image_url: { url: a.data_url } });
+        meta.push({ name: a.name, kind: "image", mime: a.mime });
+      } else {
+        if (a.text) textChunks.push(`[Attached: ${a.name}]\n${a.text}`);
+        const m = { name: a.name, kind: a.kind };
+        if (a.page_count != null) m.page_count = a.page_count;
+        if (a.char_count != null) m.char_count = a.char_count;
+        if (a.truncated) m.truncated = true;
+        meta.push(m);
+      }
+    }
+    if (text.trim()) textChunks.push(text);
+    const combined = textChunks.join("\n\n");
+    const contentParts = [];
+    if (combined) contentParts.push({ type: "text", text: combined });
+    contentParts.push(...imageParts);
+    userMsg = {
+      role: "user",
+      content: contentParts,
+      display_text: text,
+      attachments: meta,
+    };
+  } else {
+    userMsg = { role: "user", content: text };
+  }
   state.messages.push(userMsg);
   renderMessage(userMsg);
   scrollToBottom();
@@ -786,6 +1161,9 @@ async function sendMessage(text) {
         // flag the server runs pure-function semantics (each turn stateless),
         // which is correct for classifier/router bots but breaks chat.
         include_history: true,
+        // Server combines `message` + `attachments` into a multimodal user
+        // turn (text bodies prepended, images become image_url parts).
+        attachments: attachmentsForSend.length ? attachmentsForSend : undefined,
       }),
     });
 
@@ -2097,6 +2475,7 @@ async function init() {
   loadSettings();
   bindParamDisplay();
   bindChat();
+  bindAttachments();
   bindModal();
   initSplitter();
   initHSplitter();

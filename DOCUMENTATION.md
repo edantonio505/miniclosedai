@@ -64,13 +64,17 @@ See [Docker deployment](#docker-deployment) for the full walkthrough. All three 
 | At least one pulled model | See [README.md](./README.md#recommended-models-1b10b) |
 | RAM | ~2 GB free for 1–3B models; 8+ GB for 7–9B |
 
-Python dependencies (three total, in `requirements.txt`):
+Python dependencies (five total, in `requirements.txt`):
 
 ```
 fastapi>=0.110
 uvicorn>=0.27
 httpx>=0.27
+python-multipart>=0.0.9   # multipart/form-data parsing for /api/extract-pdf
+pypdf>=4.0                # server-side PDF text extraction for chat attachments
 ```
+
+`pypdf` and `python-multipart` are pinned so file-attachment support (images, PDFs, text files in the chat composer) works out of the box — `pip install -r requirements.txt` is the full setup; users do not need to install anything else by hand.
 
 ---
 
@@ -583,6 +587,16 @@ POST /api/chat/stream                      → (legacy) streaming, no conversati
 
 The per-conversation variants use the saved config as defaults. The legacy ones require the full config in the request body.
 
+Optional fields on the per-conversation variants: `include_history: bool` (single-`message` form only — replays saved turns into context) and `attachments: [{name, kind, ...}]` (single-`message` form only — see [File attachments](#file-attachments-images-pdfs-text-files) for the full spec). The `messages=[…]` form must include any multimodal content arrays in-line itself.
+
+### File extraction
+
+```
+POST /api/extract-pdf       → multipart/form-data, field name `file`
+```
+
+Server-side wrapper around `pypdf` for PDF text extraction. Caps: 10 MB raw, 50 pages, 30 000 chars output. Returns `{filename, page_count, char_count, truncated, text}`. The frontend uses this transparently when a `.pdf` is dropped in the paperclip picker; external callers can use it directly to populate the `text` field of a `pdf`-kind attachment before chatting.
+
 ### SSE event format
 
 Every streamed frame is of the form `data: <json>\n\n`:
@@ -635,6 +649,69 @@ Newer reasoning-tuned models (qwen3 / qwen3.5 families, deepseek-r1, gpt-oss, gl
 Saved per conversation; overridable per call. Models that don't support the field ignore it.
 
 In the UI, "thinking" tokens stream into a separate collapsible block so you can see the reasoning without it polluting the final answer.
+
+---
+
+## File attachments (images, PDFs, text files)
+
+### Supported types
+
+The composer's paperclip button (and clipboard paste) accepts one mixed file picker covering three categories:
+
+| Category | File types | Where the bytes go |
+|---|---|---|
+| **Images** | `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp` | Base64-encoded in the browser. Auto-downscaled to 2048 px longest edge (JPEG quality 0.92) when larger. Sent to the model as native multimodal input. |
+| **PDFs** | `.pdf` | Uploaded to `POST /api/extract-pdf`; server runs `pypdf` to extract plain text. Caps: 10 MB raw, 50 pages, 30 000 chars. Output is prepended to the user's message. |
+| **Plain text & source code** | `.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.toml`, `.xml`, `.html`, `.css`, `.js`, `.ts`, `.tsx`, `.jsx`, `.py`, `.go`, `.rs`, `.java`, `.c`, `.cpp`, `.h`, `.sh`, `.sql`, `.log`, plus anything whose MIME starts with `text/` | Read in the browser via `FileReader.readAsText`, prepended to the user's message. |
+
+Per-file cap is 10 MB raw; multiple attachments per message are allowed and may freely mix the three kinds. Sending images while the selected model isn't pattern-recognized as vision-capable triggers a soft-warn banner — the request still goes through, the warning just flags that the reply may ignore the image.
+
+### Wire-format translation
+
+Internal storage uses the OpenAI content-array shape:
+
+```json
+{
+  "role": "user",
+  "content": [
+    {"type": "text", "text": "[Attached: notes.pdf]\n<extracted body>\n\nWhat does this say?"},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+  ],
+  "display_text": "What does this say?",
+  "attachments": [
+    {"name": "notes.pdf", "kind": "pdf", "page_count": 12, "char_count": 4218},
+    {"name": "diagram.png", "kind": "image", "mime": "image/png"}
+  ]
+}
+```
+
+Outbound translation per backend kind happens inside `llm.py`:
+
+| Backend kind | Endpoint | Translation |
+|---|---|---|
+| `ollama` | `POST /api/chat` | Each multimodal message is rewritten by `_to_ollama_message`: text parts get joined into `content`, every `image_url` part has its `data:` prefix stripped and the raw base64 collected into a top-level `images: [...]` array. String-content messages pass through unchanged. |
+| `openai` | `POST /v1/chat/completions` | Content arrays are forwarded as-is — LM Studio, vLLM, and Ollama's own `/v1` shim all accept the OpenAI multimodal shape. |
+
+`display_text` and `attachments` are UI-only metadata: stripped from outbound LLM requests by `_resolve_conversation_chat`, then re-attached on persistence so reloading a conversation reconstructs the original chat-bubble layout.
+
+### Vision-model heuristic
+
+Neither Ollama's `/api/tags` nor OpenAI's `/v1/models` exposes a clean "is multimodal" flag. The frontend matches model names against this regex set to decide whether to soft-warn on image attachments:
+
+```
+/^llava/i, /-vision/i, /vl[:-]/i, /qwen.*vl/i, /qwen3\.6/i,
+/^gemma4/i, /llama3\.2-vision/i, /minicpm-?v/i, /pixtral/i, /moondream/i
+```
+
+Edit `VISION_MODEL_PATTERNS` in `static/app.js` to extend it. The check is purely cosmetic — the request payload is identical either way.
+
+### Auth on remote/relayed Ollama backends
+
+Both backend kinds now thread `api_key` (sent as `Authorization: Bearer …`) and any custom `headers` dict through every HTTP call, including `/api/tags`, `/api/chat`, and `/api/pull`. This lets you register a public-IP Ollama (e.g. an authenticating relay sitting in front of `localhost:11434`) as `kind=ollama` and still hit the native `/api/chat` endpoint — which is the only one that honors `"think": false` properly for Qwen3-family models.
+
+### Dependencies
+
+`pypdf` and `python-multipart` are pinned in `requirements.txt`. A standard `pip install -r requirements.txt` is the full setup; users cloning the repo do not need any extra commands to enable file attachments. Image and text-file handling is browser-side and adds no runtime dependencies.
 
 ---
 

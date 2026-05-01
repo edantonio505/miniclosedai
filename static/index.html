@@ -196,7 +196,16 @@
 
       <div class="composer-wrap">
         <form id="chat-form" class="composer">
-          <textarea id="input" rows="1" placeholder="Message your model…"></textarea>
+          <button type="button" id="attach-btn" class="composer-attach-btn" title="Attach images, PDFs, or text files" aria-label="Attach file">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <input id="attach-input" type="file" multiple hidden
+                 accept="image/*,.txt,.md,.csv,.json,.yaml,.yml,.toml,.xml,.html,.css,.js,.ts,.tsx,.jsx,.py,.go,.rs,.java,.c,.cpp,.cc,.h,.hpp,.sh,.sql,.log,.pdf,text/*" />
+          <div class="composer-main">
+            <div id="attachment-list" class="attachment-list" hidden></div>
+            <div id="attachment-warning" class="attachment-warning" hidden></div>
+            <textarea id="input" rows="1" placeholder="Message your model…"></textarea>
+          </div>
           <button type="submit" id="send-btn" class="btn btn-primary" title="Send (Enter)" aria-label="Send">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
           </button>

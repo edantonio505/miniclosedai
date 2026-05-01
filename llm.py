@@ -49,6 +49,74 @@ def _clean(chunk: str) -> str:
     return chunk
 
 
+# ---------- Multimodal helpers ----------
+#
+# Internal storage uses the OpenAI content-array shape:
+#   {"role": "user", "content": [
+#     {"type": "text", "text": "what's in this?"},
+#     {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+#   ]}
+# Plain-string content is the legacy form and still works untouched.
+#
+# OpenAI-compat backends accept the array form natively. Ollama's native
+# /api/chat needs a different shape: {content: "<text>", images: [base64,...]}
+# where each entry is the raw base64 with NO `data:image/...;base64,` prefix.
+# `_to_ollama_message` performs that translation.
+
+def _is_multimodal_content(content) -> bool:
+    return isinstance(content, list)
+
+
+def _content_to_text_only(content) -> str:
+    """Concatenate just the text parts of a content array (or pass through a string)."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for p in content:
+        if isinstance(p, dict) and p.get("type") == "text":
+            parts.append(p.get("text", "") or "")
+    return "\n".join(parts)
+
+
+def _strip_data_url_prefix(url: str) -> str:
+    """Turn `data:image/png;base64,<b64>` into `<b64>`. Pass through anything else."""
+    if isinstance(url, str) and url.startswith("data:") and "," in url:
+        return url.split(",", 1)[1]
+    return url or ""
+
+
+def _to_ollama_message(m: dict) -> dict:
+    """Translate an OpenAI-style multimodal message into Ollama's native shape.
+
+    String-content messages are returned unchanged. Content-array messages get
+    their text parts joined into `content` and their image_url parts collected
+    into a top-level `images: [base64, ...]` array.
+    """
+    content = m.get("content")
+    if not _is_multimodal_content(content):
+        return m  # string content — Ollama already accepts it
+    text_parts: list[str] = []
+    images: list[str] = []
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        ptype = p.get("type")
+        if ptype == "text":
+            text_parts.append(p.get("text", "") or "")
+        elif ptype == "image_url":
+            url = ((p.get("image_url") or {}).get("url")) or ""
+            b64 = _strip_data_url_prefix(url)
+            if b64:
+                images.append(b64)
+    out = {k: v for k, v in m.items() if k not in ("content",)}
+    out["content"] = "\n".join(text_parts)
+    if images:
+        out["images"] = images
+    return out
+
+
 def _append_think_hint(messages: list[dict], hint: str) -> list[dict]:
     """Return a copy of `messages` with Qwen3's /think or /no_think hint appended.
 
@@ -56,6 +124,10 @@ def _append_think_hint(messages: list[dict], hint: str) -> list[dict]:
     for /no_think) for the magic token and toggles reasoning accordingly. This
     is the client-side fallback for servers that don't honor
     `chat_template_kwargs.enable_thinking`.
+
+    Handles both string-content messages and OpenAI-style content-array
+    messages — for the latter we append the hint to the last text part (or
+    add a new text part if the message is image-only).
     """
     if not messages:
         return messages
@@ -63,9 +135,26 @@ def _append_think_hint(messages: list[dict], hint: str) -> list[dict]:
     # Append to the last user message; that's the spot Qwen3 looks first.
     for m in reversed(out):
         if m.get("role") == "user":
-            content = m.get("content", "") or ""
-            if hint not in content:
-                m["content"] = content.rstrip() + "\n\n" + hint
+            content = m.get("content")
+            if isinstance(content, list):
+                # Find the last text part (or append one) and tack the hint on.
+                parts = [dict(p) if isinstance(p, dict) else p for p in content]
+                text_idx = next(
+                    (i for i in range(len(parts) - 1, -1, -1)
+                     if isinstance(parts[i], dict) and parts[i].get("type") == "text"),
+                    -1,
+                )
+                if text_idx >= 0:
+                    txt = parts[text_idx].get("text", "") or ""
+                    if hint not in txt:
+                        parts[text_idx]["text"] = txt.rstrip() + "\n\n" + hint
+                else:
+                    parts.append({"type": "text", "text": hint})
+                m["content"] = parts
+            else:
+                content = content or ""
+                if hint not in content:
+                    m["content"] = content.rstrip() + "\n\n" + hint
             return out
     # Fallback: no user message in the list — append to system.
     for m in out:
@@ -93,6 +182,25 @@ def _openai_headers(backend: dict) -> dict:
     return headers
 
 
+def _ollama_headers(backend: dict) -> dict:
+    """Same shape as `_openai_headers`, but for the Ollama-native path.
+
+    A bare local Ollama at localhost:11434 has no auth and `headers={}` is the
+    norm. When users register a remote/relayed Ollama (e.g. a public IP gated
+    by Bearer auth), this helper merges the backend's `api_key` (sent as
+    Bearer) and `headers` dict so /api/tags, /api/chat, and /api/pull all
+    carry the same credentials. Local-only setups are unaffected — without an
+    api_key, no Authorization header is added.
+    """
+    headers = {"Content-Type": "application/json"}
+    for k, v in (backend.get("headers") or {}).items():
+        headers[k] = v
+    headers["Content-Type"] = "application/json"
+    if backend.get("api_key"):
+        headers["Authorization"] = f"Bearer {backend['api_key']}"
+    return headers
+
+
 # =====================================================================
 # Ollama implementation
 # =====================================================================
@@ -100,8 +208,14 @@ def _openai_headers(backend: dict) -> dict:
 async def _ollama_is_running(backend: dict) -> bool:
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"{_base_url(backend)}/api/tags")
-            return r.status_code == 200
+            r = await client.get(
+                f"{_base_url(backend)}/api/tags",
+                headers=_ollama_headers(backend),
+            )
+            # 401/403 → server is alive, our auth was rejected. Still "running"
+            # so the UI can surface a meaningful error rather than a generic
+            # "backend offline" message.
+            return r.status_code in (200, 401, 403)
     except Exception:
         return False
 
@@ -109,7 +223,10 @@ async def _ollama_is_running(backend: dict) -> bool:
 async def _ollama_list_models(backend: dict) -> list[dict]:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(f"{_base_url(backend)}/api/tags")
+            r = await client.get(
+                f"{_base_url(backend)}/api/tags",
+                headers=_ollama_headers(backend),
+            )
             r.raise_for_status()
             return r.json().get("models", []) or []
     except Exception:
@@ -128,7 +245,9 @@ async def pull_ollama_model(backend: dict, name: str) -> AsyncIterator[dict]:
     payload = {"name": name, "stream": True}
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream(
-            "POST", f"{_base_url(backend)}/api/pull", json=payload
+            "POST", f"{_base_url(backend)}/api/pull",
+            json=payload,
+            headers=_ollama_headers(backend),
         ) as r:
             if r.status_code != 200:
                 body = (await r.aread()).decode("utf-8", errors="replace")
@@ -157,6 +276,10 @@ async def _ollama_chat_stream(
     top_k: int,
     think: bool | str | None,
 ) -> AsyncIterator[dict]:
+    # Translate any OpenAI-style content-array messages (multimodal) into
+    # Ollama's native {content, images:[base64,...]} shape. String-content
+    # messages pass through unchanged.
+    messages = [_to_ollama_message(m) for m in messages]
     payload = {
         "model": model,
         "messages": messages,
@@ -171,7 +294,12 @@ async def _ollama_chat_stream(
     if think is not None:
         payload["think"] = think
     async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", f"{_base_url(backend)}/api/chat", json=payload) as r:
+        async with client.stream(
+            "POST",
+            f"{_base_url(backend)}/api/chat",
+            json=payload,
+            headers=_ollama_headers(backend),
+        ) as r:
             if r.status_code != 200:
                 body = (await r.aread()).decode("utf-8", errors="replace")
                 raise RuntimeError(

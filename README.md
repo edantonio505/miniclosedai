@@ -92,6 +92,7 @@ MiniClosedAI is a single-user, single-process web app that wraps **local** LLMs 
 - 🎛️ **Live parameter sliders** — temperature, max tokens, top-p, top-k, thinking level, max thinking tokens. Every change auto-saves to the active conversation.
 - 🔁 **Per-chat microservice endpoints** — each saved conversation is an addressable URL that replays your GUI-configured bot. Callers just send `{"message": "..."}`.
 - 💭 **Reasoning-model aware** — `thinking` and `content` tokens from models like qwen3, deepseek-r1, and gpt-oss stream separately; "thoughts" appear in a collapsible block. `max_thinking_tokens` is a soft cap: visible reasoning is hidden but the model keeps running so the answer still arrives.
+- 📎 **File attachments — images, PDFs, and text files** — paperclip in the composer (and clipboard paste) attaches files to a chat turn. Vision models (`llava`, `gemma4`, `qwen3.6`, `*-vision`, `*-vl`, etc.) see images natively over both Ollama's `/api/chat` and OpenAI's `chat/completions` formats. PDFs are extracted to text server-side with `pypdf` (50-page / 30 000-char caps), and `.txt` / `.md` / `.csv` / source-code files are read inline. Attached file bodies get prepended to the user's message; the bubble shows just the user's question + thumbnails / doc chips. Soft-warns when an image is attached to a model that doesn't pattern-match a vision model. **No extra setup** — `pypdf` ships in `requirements.txt`.
 - ⏹ **Manual stop** — a Stop button in the composer aborts the stream cleanly.
 - 🔁 **OpenAI-SDK-compatible server** — drop MiniClosedAI in place of `api.openai.com` with a one-line `base_url` change. Every bot appears as a "model" to the SDK; calls route to whichever backend that bot is pinned to.
 - 🎨 **Polished UI** — left activity bar (Dashboard / Settings), Light / Dark / System theme, draggable splitters (sidebar width + system-prompt height), Gemini-style empty state, syntax-highlighted API-code modal with Streaming/Non-streaming and Native/OpenAI variants.
@@ -331,8 +332,27 @@ Also: a **vertical splitter** between sidebar and chat lets you widen the sideba
 - Reasoning models emit a collapsible `💭 Thinking` block; it auto-collapses when the actual response begins streaming.
 - Each assistant message shows a params badge (model · T · max · top_p · top_k) for reproducibility.
 - **Stop button** (square icon) replaces **Send** (paper-plane icon) while streaming — click to abort.
+- **Attach button** (paperclip icon, left of Send) — see [File attachments](#file-attachments) below.
 - **Edit pencil** (top-right of every assistant bubble) opens an in-place textarea so you can rewrite the response. Save commits the new text to storage and re-renders. `Esc` cancels, `Ctrl/⌘+Enter` saves. Disabled while a stream is in flight. The pristine original output is preserved the first time you edit (`original_content`); a small `edited` pill appears next to the params badge — click it to see the original.
 - **Download CSV** (tray icon in the header, between Clear and Delete) exports the current conversation as a two-column `input,output` CSV — one row per user→assistant pair, edited content as-is, leading/trailing whitespace stripped, proper CSV escaping for commas/quotes/newlines. Orphan user messages with no reply are skipped.
+
+### File attachments
+
+Click the paperclip in the composer (or paste from the clipboard) to attach files to the next message. Three kinds are supported, all from a single picker:
+
+| Kind | Extensions | How it reaches the model |
+|---|---|---|
+| **Images** | `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp` | Sent natively as multimodal input. Browser auto-downscales anything wider than 2048 px to JPEG quality 0.92 to keep base64 payloads sane. |
+| **PDFs** | `.pdf` | Server extracts text with `pypdf` (caps: 50 pages, 30 000 chars per file, 10 MB raw upload). Extracted text is prepended to the user message as `[Attached: filename.pdf]\n<text>`. Image-only / scanned PDFs may come back empty — that's a `pypdf` limitation, not a bug. |
+| **Plain text & source code** | `.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.toml`, `.xml`, `.html`, `.css`, `.js`, `.ts`, `.tsx`, `.jsx`, `.py`, `.go`, `.rs`, `.java`, `.c`, `.cpp`, `.h`, `.sh`, `.sql`, `.log`, etc. | Read as text in the browser, prepended like a PDF. |
+
+**Per-file cap:** 10 MB raw. **Multiple files per message:** yes — mix images + PDFs + text freely.
+
+**Wire-format translation** is handled automatically per backend kind. For Ollama-native (`/api/chat`), images go in the dedicated `images: [base64,...]` field and the prepended attachment text lives in `content`. For OpenAI-compatible (`/v1/chat/completions` — LM Studio, vLLM, llama.cpp, Bonsai, public-IP Ollama relays), images become `{type:"image_url", image_url:{url:"data:..."}}` parts and the attached text becomes a `{type:"text"}` part. The same uploaded file works against either backend kind without re-encoding.
+
+**Vision-model detection** is heuristic — the soft-warn banner appears when an image is attached but the selected model name doesn't match `llava*`, `gemma4*`, `qwen3.6`, `*-vision`, `*-vl*`, `pixtral`, `moondream`, `minicpm-v`, or `llama3.2-vision`. The image is still sent — the warning just flags that the reply may ignore it.
+
+**No extra setup.** `pypdf` and `python-multipart` are pinned in `requirements.txt`; `pip install -r requirements.txt` is still the full install.
 
 ### Empty state
 
@@ -694,10 +714,34 @@ POST /api/conversations/{id}/chat/stream   → SSE streaming
 | Field | Type | Default | Purpose |
 |---|---|---|---|
 | `message` | string | — | Single-turn content. Exactly one of `message` or `messages` must be set. |
-| `messages` | array of `{role, content}` | — | Multi-turn content. |
+| `messages` | array of `{role, content}` | — | Multi-turn content. `content` may be a string OR an OpenAI-style content array `[{type:"text", text:"…"}, {type:"image_url", image_url:{url:"data:image/png;base64,…"}}]` for multimodal turns. |
 | `persist` | bool | `false` | Save the turn to the bot's display history. |
+| `include_history` | bool | `false` | Single-message form only. Prepend the conversation's saved turns to the LLM context. |
+| `attachments` | array | — | Single-message form only. List of `{name, kind, ...}` attachments. See **File attachments** below. |
 
 Any other field — `model`, `system_prompt`, `temperature`, `max_tokens`, `top_p`, `top_k`, `think`, `max_thinking_tokens` — returns **422 Unprocessable Entity** with `extra_forbidden`. Config is locked to the GUI.
+
+**File attachments** (single-message form, optional):
+
+```json
+{
+  "message": "What's in this image?",
+  "attachments": [
+    {"name": "photo.png", "kind": "image", "mime": "image/png",
+     "data_url": "data:image/png;base64,iVBORw0KGgo..."},
+    {"name": "notes.pdf", "kind": "pdf",
+     "text": "...extracted text...", "page_count": 12, "truncated": false},
+    {"name": "todo.txt", "kind": "text", "text": "buy milk\nfeed the cat"}
+  ]
+}
+```
+
+The server combines `message` + each attachment into one multimodal user turn:
+text/PDF bodies are prepended as `[Attached: <name>]\n<text>`, images become
+`image_url` parts. The `kind` discriminator is one of `image | text | pdf`; for
+images, supply `data_url` (a `data:image/...;base64,...` URL); for text/PDF,
+supply the already-extracted `text`. Use `POST /api/extract-pdf` to convert a
+raw PDF upload into the `text` field — see below.
 
 **Non-streaming response:**
 
@@ -726,6 +770,33 @@ Any other field — `model`, `system_prompt`, `temperature`, `max_tokens`, `top_
 curl -N -X POST http://localhost:8095/api/conversations/3/chat/stream \
   -H "Content-Type: application/json" \
   -d '{"message": "Hello!"}'
+```
+
+### PDF text extraction
+
+```
+POST /api/extract-pdf      → multipart/form-data
+```
+
+**Request:** a single multipart field named `file`. Caps: 10 MB raw, 50 pages, 30 000 chars output.
+
+**Response:**
+
+```json
+{
+  "filename": "doc.pdf",
+  "page_count": 12,
+  "char_count": 4218,
+  "truncated": false,
+  "text": "--- Page 1 ---\n…\n\n--- Page 2 ---\n…"
+}
+```
+
+`truncated` is `true` if either the page cap or the char cap was hit. Use the returned `text` (and the rest of the metadata) to populate an `attachments[]` entry on the next chat call. The frontend does this automatically — it's only an explicit endpoint for callers that want to handle PDFs without re-implementing extraction.
+
+```bash
+curl -X POST http://localhost:8095/api/extract-pdf \
+  -F "file=@./report.pdf" | jq '.text' | head -c 200
 ```
 
 ### Legacy generic chat

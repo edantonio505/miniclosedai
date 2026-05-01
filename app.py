@@ -15,10 +15,12 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+
+import pypdf
 
 import db
 import llm
@@ -38,8 +40,50 @@ app = FastAPI(title="MiniClosedAI", version="0.2.0", lifespan=lifespan)
 # ---------- Schemas ----------
 
 class Message(BaseModel):
+    """A single chat turn.
+
+    `content` is either a plain string (legacy / text-only) or an OpenAI-style
+    list of typed parts (multimodal):
+
+        [{"type": "text", "text": "what's this?"},
+         {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]
+
+    The two extra display fields are persisted alongside the LLM-visible
+    `content` so the UI can reconstruct the original look of a past turn:
+
+      - `display_text`  — the user's typed text only, with no `[Attached: …]`
+                          file-body prefixes. Used for rendering the chat
+                          bubble so the user doesn't see a wall of extracted
+                          PDF text in their own message.
+      - `attachments`   — lightweight metadata for each file attached to this
+                          turn (name, kind, page count, etc.). Used to render
+                          document chips in the bubble.
+    """
+    model_config = ConfigDict(extra="allow")  # tolerate `params`, future fields
+
     role: str
-    content: str
+    content: str | list[dict]
+    display_text: str | None = None
+    attachments: list[dict] | None = None
+
+
+class AttachmentSpec(BaseModel):
+    """Single attachment carried by a chat request.
+
+    Frontend builds these per file before sending. For images, `data_url`
+    holds the full `data:image/...;base64,...` URL. For text/PDF, `text`
+    holds the extracted content.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    name: str = Field(..., min_length=1, max_length=400)
+    kind: Literal["image", "text", "pdf"]
+    mime: str | None = None
+    data_url: str | None = None
+    text: str | None = None
+    page_count: int | None = None
+    char_count: int | None = None
+    truncated: bool = False
 
 
 ThinkValue = bool | str | None  # None = unset, True/False, or "low"/"medium"/"high"
@@ -102,6 +146,13 @@ class ConversationChatRequest(BaseModel):
     # turns. Default false preserves the one-shot microservice pattern callers
     # rely on (classifiers, routers, extractors).
     include_history: bool = False
+    # Optional file attachments to merge into the user's turn. Server combines
+    # `message` (the user's typed text) + each attachment into a multimodal
+    # content array — text/PDF bodies are prepended with a "[Attached: name]"
+    # header, images become {type:"image_url"} parts. Only valid with the
+    # single-`message` form; the `messages=[…]` form must include any
+    # multimodal content arrays in-line itself.
+    attachments: list[AttachmentSpec] | None = None
 
 
 class BackendCreate(BaseModel):
@@ -454,6 +505,75 @@ async def api_cancel_pull(backend_id: int, name: str):
     return {"ok": True}
 
 
+# ---------- File attachments (PDF text extraction) ----------
+#
+# Images and plain-text files are handled entirely in the browser — no need
+# for a server round-trip. PDFs are the one attachment type that requires
+# Python-side processing because no local LLM runtime accepts a raw PDF
+# document and pdf.js would balloon the frontend bundle by ~3 MB. We extract
+# text with pypdf, cap the work at 50 pages and 30 000 chars, and return
+# plain text the frontend can prepend to the user message just like any
+# other attached document.
+#
+# This endpoint is the only file-upload path; everything else (.txt, .md,
+# .csv, .json, source code, images) is read in JS via FileReader.
+
+PDF_MAX_BYTES = 10 * 1024 * 1024     # 10 MB raw upload cap
+PDF_MAX_PAGES = 50                   # only the first 50 pages are scanned
+PDF_MAX_CHARS = 30_000               # output truncated past this many chars
+
+
+@app.post("/api/extract-pdf")
+async def api_extract_pdf(file: UploadFile = File(...)):
+    """Extract plain text from an uploaded PDF.
+
+    Returns ``{filename, page_count, char_count, truncated, text}``. ``truncated``
+    is true if either the page cap or the character cap was hit; the caller
+    can surface that to the user. Image-only / scanned PDFs come back with
+    short or empty ``text`` — that's a pypdf limitation, not a bug here.
+    """
+    raw = await file.read()
+    if len(raw) > PDF_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"PDF too large ({len(raw) / 1024 / 1024:.1f} MB > {PDF_MAX_BYTES // 1024 // 1024} MB cap)",
+        )
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(raw))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
+
+    total_pages = len(reader.pages)
+    pages_scanned = min(total_pages, PDF_MAX_PAGES)
+    chunks: list[str] = []
+    chars = 0
+    truncated = total_pages > PDF_MAX_PAGES
+    for i in range(pages_scanned):
+        try:
+            page_text = reader.pages[i].extract_text() or ""
+        except Exception:
+            page_text = ""
+        # Header lets the model see page boundaries when scanning multi-page docs.
+        chunks.append(f"--- Page {i + 1} ---\n{page_text.strip()}")
+        chars += len(page_text)
+        if chars >= PDF_MAX_CHARS:
+            truncated = True
+            break
+
+    text = "\n\n".join(chunks)
+    if len(text) > PDF_MAX_CHARS:
+        text = text[:PDF_MAX_CHARS]
+        truncated = True
+
+    return {
+        "filename": file.filename,
+        "page_count": total_pages,
+        "char_count": len(text),
+        "truncated": truncated,
+        "text": text,
+    }
+
+
 # ---------- Models (aggregated across all backends) ----------
 
 @app.get("/api/models")
@@ -784,6 +904,71 @@ async def api_chat(req: ChatRequest):
 
 # ---------- Chat (per-conversation microservice endpoint) ----------
 
+def _build_user_message(text: str | None, attachments: list[dict] | None) -> dict:
+    """Combine the user's typed text + uploaded attachments into one user turn.
+
+    The returned dict carries three pieces:
+
+      - ``content``       — what the LLM sees: a content-array starting with a
+                            single text part (extracted file bodies prepended,
+                            then the user's typed text) followed by one
+                            ``image_url`` part per attached image. If there
+                            are no attachments at all, falls back to a plain
+                            string ``content`` for legacy compatibility.
+      - ``display_text``  — the user's typed text only, no extracted-file
+                            preambles. Used by the UI to render the chat
+                            bubble so the user doesn't see a wall of PDF
+                            text in their own message.
+      - ``attachments``   — lightweight metadata (name, kind, page_count,
+                            char_count, truncated, mime). The actual base64
+                            image data lives in ``content``; metadata avoids
+                            duplicating it.
+    """
+    text = (text or "").strip()
+    atts = list(attachments or [])
+    if not atts:
+        return {"role": "user", "content": text}
+
+    text_chunks: list[str] = []
+    image_parts: list[dict] = []
+    meta: list[dict] = []
+    for a in atts:
+        kind = a.get("kind")
+        name = a.get("name") or "attachment"
+        if kind == "image":
+            url = a.get("data_url")
+            if url:
+                image_parts.append({"type": "image_url", "image_url": {"url": url}})
+            meta.append({"name": name, "kind": "image", "mime": a.get("mime")})
+        elif kind in ("text", "pdf"):
+            body = a.get("text") or ""
+            if body.strip():
+                text_chunks.append(f"[Attached: {name}]\n{body.rstrip()}")
+            entry = {"name": name, "kind": kind}
+            if a.get("page_count") is not None:
+                entry["page_count"] = a["page_count"]
+            if a.get("char_count") is not None:
+                entry["char_count"] = a["char_count"]
+            if a.get("truncated"):
+                entry["truncated"] = True
+            meta.append(entry)
+    if text:
+        text_chunks.append(text)
+    combined = "\n\n".join(text_chunks)
+
+    content_parts: list[dict] = []
+    if combined:
+        content_parts.append({"type": "text", "text": combined})
+    content_parts.extend(image_parts)
+
+    msg: dict = {"role": "user", "content": content_parts}
+    if text:
+        msg["display_text"] = text
+    if meta:
+        msg["attachments"] = meta
+    return msg
+
+
 def _resolve_conversation_chat(
     conv_id: int, req: ConversationChatRequest
 ) -> tuple[dict, list[dict], dict, dict]:
@@ -817,8 +1002,17 @@ def _resolve_conversation_chat(
     }
 
     if req.message is not None:
-        user_msgs = [{"role": "user", "content": req.message}]
+        attachments_raw = (
+            [a.model_dump() for a in req.attachments] if req.attachments else None
+        )
+        user_msgs = [_build_user_message(req.message, attachments_raw)]
     else:
+        if req.attachments:
+            raise HTTPException(
+                400,
+                "`attachments` is only valid with the single-`message` form. "
+                "When using `messages=[…]`, embed multimodal content arrays in-line.",
+            )
         user_msgs = [m.model_dump() for m in req.messages]
 
     # Default: pure-function semantic — model sees only (system + request msgs).
@@ -831,9 +1025,20 @@ def _resolve_conversation_chat(
         for m in (conv.get("messages") or []):
             role = m.get("role")
             content = m.get("content", "")
-            if role in ("user", "assistant") and content:
+            # `content` may be a string (legacy/text-only) or an OpenAI-style
+            # content array (multimodal). Both pass through; llm.py handles
+            # per-backend translation.
+            has_payload = (
+                bool(content) if isinstance(content, str) else bool(content)
+            )
+            if role in ("user", "assistant") and has_payload:
                 ollama_messages.append({"role": role, "content": content})
-    ollama_messages.extend(user_msgs)
+    ollama_messages.extend(
+        # Strip UI-only metadata (`display_text`, `attachments`) before
+        # forwarding to the LLM — those are persistence-only fields.
+        {k: v for k, v in m.items() if k in ("role", "content")}
+        for m in user_msgs
+    )
 
     return conv, ollama_messages, effective, backend
 
@@ -856,7 +1061,16 @@ def _persist_conv_chat_turn(
             return
         existing = json.loads(row["messages"] or "[]")
         for m in user_msgs:
-            existing.append({"role": m["role"], "content": m["content"], "params": snapshot})
+            entry = {"role": m["role"], "content": m["content"], "params": snapshot}
+            # Preserve UI-only metadata so the bubble can be reconstructed on
+            # reload. `display_text` is the user's typed text without the
+            # "[Attached: …]" file-body prefixes; `attachments` is per-file
+            # metadata used for rendering chips.
+            if m.get("display_text") is not None:
+                entry["display_text"] = m["display_text"]
+            if m.get("attachments"):
+                entry["attachments"] = m["attachments"]
+            existing.append(entry)
         existing.append({"role": "assistant", "content": assistant_text.strip(), "params": snapshot})
         conn.execute(
             "UPDATE conversations SET messages = ?, updated_at = datetime('now') WHERE id = ?",
@@ -883,7 +1097,13 @@ async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
         raise HTTPException(502, str(e))
 
     if req.persist:
-        user_msgs = [{"role": "user", "content": req.message}] if req.message is not None else [m.model_dump() for m in req.messages]
+        if req.message is not None:
+            attachments_raw = (
+                [a.model_dump() for a in req.attachments] if req.attachments else None
+            )
+            user_msgs = [_build_user_message(req.message, attachments_raw)]
+        else:
+            user_msgs = [m.model_dump() for m in req.messages]
         _persist_conv_chat_turn(conv_id, user_msgs, text, eff, backend)
 
     return {
@@ -938,7 +1158,13 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
         # Persist whenever we actually produced a response. Truncated-thinking
         # is no longer a persistence-blocker because generation completed.
         if req.persist:
-            user_msgs = [{"role": "user", "content": req.message}] if req.message is not None else [m.model_dump() for m in req.messages]
+            if req.message is not None:
+                attachments_raw = (
+                    [a.model_dump() for a in req.attachments] if req.attachments else None
+                )
+                user_msgs = [_build_user_message(req.message, attachments_raw)]
+            else:
+                user_msgs = [m.model_dump() for m in req.messages]
             _persist_conv_chat_turn(conv_id, user_msgs, "".join(collected), eff, backend)
 
         yield f"data: {json.dumps({'end': True, 'truncated': truncated})}\n\n"
