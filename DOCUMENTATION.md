@@ -118,7 +118,7 @@ Drops every system requirement except Python and the five pip packages.
 Setup:
 
 ```bash
-git clone <this repo> && cd miniclosedai
+git clone https://github.com/edantonio505/miniclosedai.git && cd miniclosedai
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 MINICLOSEDAI_NO_OLLAMA=1 python -m uvicorn app:app --host 0.0.0.0 --port 8095

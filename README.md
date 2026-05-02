@@ -147,7 +147,7 @@ One-command setup that boots MiniClosedAI **and** Ollama with three small-but-ca
 #### Bring it up
 
 ```bash
-git clone <this repo> && cd miniclosedai
+git clone https://github.com/edantonio505/miniclosedai.git && cd miniclosedai
 docker compose up -d --build
 ```
 
@@ -207,7 +207,7 @@ The compose file binds MiniClosedAI to `127.0.0.1:8095:8095` — **accessible on
 Single-service compose file. Brings up **only** the MiniClosedAI web app (~160 MB image) — no Ollama container, no GPU passthrough, no `nvidia-container-toolkit` requirement, no model layers. The dashboard starts empty; you register your external endpoint(s) through the Settings page and the dropdown lights up.
 
 ```bash
-git clone <this repo> && cd miniclosedai
+git clone https://github.com/edantonio505/miniclosedai.git && cd miniclosedai
 docker compose -f docker-compose.lite.yml up -d --build
 # → open http://127.0.0.1:8095
 # → click ⚙️ Settings → Add endpoint
@@ -284,7 +284,7 @@ pip install -r requirements.txt
 If you don't want to install Ollama on this machine — for example, you'll point at a remote Ollama, an LM Studio on your LAN, or any OpenAI-compatible endpoint — **skip steps 1 and 2 above and run just step 3**, then start the app with the `MINICLOSEDAI_NO_OLLAMA=1` env var:
 
 ```bash
-git clone <this repo> && cd miniclosedai
+git clone https://github.com/edantonio505/miniclosedai.git && cd miniclosedai
 python -m venv .venv
 source .venv/bin/activate             # Windows: .venv\Scripts\activate
 pip install -r requirements.txt       # 5 deps total, no system packages
