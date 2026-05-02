@@ -359,8 +359,11 @@ async function loadModels() {
     opt.disabled = true;
     els.modelSelect.add(opt);
     setStatus("err", "No endpoints configured. Open Settings → Add endpoint.");
+    _showNoBackendsEmptyState();
     return [];
   }
+  // We DO have backends now — restore the regular empty state if it was swapped.
+  _restoreDefaultEmptyState();
 
   // Restore last-used (model, backend_id) pair from localStorage.
   try {
@@ -531,10 +534,41 @@ const EMPTY_STATE_HTML = `
   </div>
 `;
 
+// Shown when zero backends are registered (typically lite-mode first run).
+// The suggestion chips wouldn't fire — no model selected — so we replace
+// them with a clear CTA that flips to the Settings tab.
+const EMPTY_STATE_NO_BACKENDS_HTML = `
+  <div class="empty-state empty-state-no-backends">
+    <h2>Welcome — let's add your first endpoint</h2>
+    <p>This MiniClosedAI install isn't shipping a built-in Ollama. Point it at any external compute source — a remote Ollama, an LM Studio, vLLM, llama.cpp server, or any OpenAI-compatible URL — through the Settings page. The endpoint's models will appear in the dropdown above.</p>
+    <button class="btn btn-primary" data-action="open-settings">Open Settings → Add endpoint</button>
+  </div>
+`;
+
+// Tracks whether the "no endpoints registered" empty-state should show
+// instead of the default suggestion-chips one. Flipped from loadModels()
+// based on the live backends list — so adding an endpoint and refreshing
+// flips us back to the regular onboarding state automatically.
+let _noBackendsEmptyState = false;
+
+function _showNoBackendsEmptyState() {
+  _noBackendsEmptyState = true;
+  if (!state.messages.length) renderMessages();
+}
+
+function _restoreDefaultEmptyState() {
+  if (!_noBackendsEmptyState) return;
+  _noBackendsEmptyState = false;
+  if (!state.messages.length) renderMessages();
+}
+
 function renderMessages() {
   els.messages.innerHTML = "";
   if (!state.messages.length) {
-    els.messages.insertAdjacentHTML("beforeend", EMPTY_STATE_HTML);
+    els.messages.insertAdjacentHTML(
+      "beforeend",
+      _noBackendsEmptyState ? EMPTY_STATE_NO_BACKENDS_HTML : EMPTY_STATE_HTML
+    );
     return;
   }
   state.messages.forEach((m, i) => renderMessage(m, i));
@@ -1808,6 +1842,13 @@ function initSidebarToggle() {
 // ---------- Suggestion chips (empty state) — delegated so re-renders work ----------
 function initSuggestionChips() {
   els.messages.addEventListener("click", e => {
+    // The lite-mode no-backends empty state has a CTA that flips to Settings.
+    const cta = e.target.closest('[data-action="open-settings"]');
+    if (cta) {
+      e.preventDefault();
+      applyActivePage("settings");
+      return;
+    }
     const chip = e.target.closest(".chip[data-prompt]");
     if (!chip) return;
     els.input.value = chip.dataset.prompt;

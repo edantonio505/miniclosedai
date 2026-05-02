@@ -108,20 +108,29 @@ MiniClosedAI is a single-user, single-process web app that wraps **local** LLMs 
 | Requirement | Version | Notes |
 |---|---|---|
 | Python | 3.10 or newer | `python3 --version` |
-| At least one LLM backend | Ollama *or* LM Studio *or* any OpenAI-compatible server | Ollama is the built-in default |
-| Ollama | any recent release | Optional if you only use OpenAI-compat backends. Default URL `http://localhost:11434` |
+| At least one LLM backend | Ollama *or* LM Studio *or* any OpenAI-compatible server | Ollama is the built-in default. **Optional in lite mode** — see below. |
+| Ollama | any recent release | Optional if you only use OpenAI-compat backends or run in [lite mode](#lite-install-no-local-ollama). Default URL `http://localhost:11434` |
 | LM Studio | any recent release with the *Local Server* feature | Optional. Serves `/v1` at (typically) `http://host:1234/v1` |
-| At least one model | pulled (Ollama) or loaded (LM Studio) | see [recommended models](#recommended-models-1b10b) |
-| RAM | ~2 GB for 1–3B models; 8+ GB for 7–9B | More for 20B+ |
-| Disk | ~1–10 GB per model | Plus 200 MB for the app itself |
+| At least one model | pulled (Ollama) or loaded (LM Studio) | see [recommended models](#recommended-models-1b10b). In lite mode the model lives on the *remote* endpoint, not this machine. |
+| RAM | ~2 GB for 1–3B models; 8+ GB for 7–9B | More for 20B+. **Lite mode needs only ~150 MB** — inference runs elsewhere. |
+| Disk | ~1–10 GB per model | Plus 200 MB for the app itself. **Lite mode**: ~50 MB total — no model storage needed. |
 
-Three Python dependencies — `fastapi`, `uvicorn`, `httpx`. That's it.
+Five Python dependencies — `fastapi`, `uvicorn`, `httpx`, `pypdf`, `python-multipart`. That's it. The same five whether you run heavy or lite.
+
+**Lite mode** (no local Ollama) drops every requirement except Python + the five pip packages. See [Lite install](#lite-install-no-local-ollama) below.
 
 ---
 
 ## Install
 
-Two paths. **Docker is the fast way** — three models already inside the image, one command to `up`. Manual install (Ollama + Python venv) is the traditional way and is documented directly after.
+Two methods (**Docker** or **bare-metal**), each with two modes — **heavy** (Ollama + baked models, ~10 GB image) or **lite** (no local Ollama; you point at any external Ollama / OpenAI-compatible endpoint via the Settings page, ~160 MB image, runs on any laptop). Pick whichever combination fits your hardware and use case:
+
+| | Heavy (with built-in Ollama) | Lite (no Ollama, BYO endpoint) |
+|---|---|---|
+| **Docker** | [Docker quick start](#docker-quick-start-with-baked-models) — full stack, three baked models, GPU recommended. | [Docker — lite](#docker--lite-no-built-in-ollama) — single ~160 MB container, zero GPU. |
+| **Bare-metal** | [Manual install](#1-ollama) — install Ollama + Python venv. | [Lite install](#lite-install-no-local-ollama) — `pip install -r requirements.txt` and you're done. |
+
+Lite mode is the right pick when you have an inference server *somewhere else* — another machine on your LAN, a cloud Ollama relay, an LM Studio, vLLM, or any OpenAI-compatible URL — and you just want the playground UI on this machine.
 
 ### Docker quick start (with baked models)
 
@@ -193,6 +202,35 @@ The compose file binds MiniClosedAI to `127.0.0.1:8095:8095` — **accessible on
 | `miniclosedai` can't reach `ollama` | Verify the env var: `docker compose exec miniclosedai env \| grep OLLAMA_URL` — must be `http://ollama:11434`. If it's `http://localhost:...`, the container isn't inheriting the compose env. |
 | Switching GPUs ↔ CPU doesn't take effect | Docker caches a lot. `docker compose down && docker compose up -d --build` to force. |
 
+### Docker — lite (no built-in Ollama)
+
+Single-service compose file. Brings up **only** the MiniClosedAI web app (~160 MB image) — no Ollama container, no GPU passthrough, no `nvidia-container-toolkit` requirement, no model layers. The dashboard starts empty; you register your external endpoint(s) through the Settings page and the dropdown lights up.
+
+```bash
+git clone <this repo> && cd miniclosedai
+docker compose -f docker-compose.lite.yml up -d --build
+# → open http://127.0.0.1:8095
+# → click ⚙️ Settings → Add endpoint
+```
+
+Build is ~30 seconds (one Python deps layer, no model pulls). The compose file sets `MINICLOSEDAI_NO_OLLAMA=1` in the container env so the built-in Ollama backend isn't seeded — the dashboard's empty state shows a "Welcome — let's add your first endpoint" CTA that flips to the Settings tab in one click.
+
+| When to pick this | When to pick the heavy default |
+|---|---|
+| You have an Ollama (or OpenAI-compat server) on another machine, in a VPS, or behind a relay. | You want everything on one host. |
+| Laptop with no GPU, or with limited disk. | Workstation or server with NVIDIA GPU + ≥20 GB free disk. |
+| You don't want a 10 GB image to build/store. | You want zero external dependencies. |
+| Your hardware can't run a 7–9B model locally. | Your hardware can. |
+
+To switch back to the heavy default later, just bring the lite stack down and start the standard one — the SQLite DB lives in the same `miniclosedai_db` volume, so your conversations persist:
+
+```bash
+docker compose -f docker-compose.lite.yml down
+docker compose up -d --build
+```
+
+The auto-disable on the built-in row is reversible — running the standard compose without `MINICLOSEDAI_NO_OLLAMA` won't re-flip the row's `enabled` flag automatically. If you've previously been in lite mode and the built-in row is disabled, re-enable it once via the Settings page (or set its `enabled = 1` in the DB).
+
 To run without Docker — keep reading.
 
 ### 1. Ollama
@@ -240,6 +278,45 @@ python -m venv .venv
 source .venv/bin/activate             # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+### Lite install (no local Ollama)
+
+If you don't want to install Ollama on this machine — for example, you'll point at a remote Ollama, an LM Studio on your LAN, or any OpenAI-compatible endpoint — **skip steps 1 and 2 above and run just step 3**, then start the app with the `MINICLOSEDAI_NO_OLLAMA=1` env var:
+
+```bash
+git clone <this repo> && cd miniclosedai
+python -m venv .venv
+source .venv/bin/activate             # Windows: .venv\Scripts\activate
+pip install -r requirements.txt       # 5 deps total, no system packages
+
+MINICLOSEDAI_NO_OLLAMA=1 \
+  python -m uvicorn app:app --host 0.0.0.0 --port 8095
+```
+
+(On Windows PowerShell: `$env:MINICLOSEDAI_NO_OLLAMA=1; python -m uvicorn app:app --host 0.0.0.0 --port 8095`)
+
+Open <http://localhost:8095>. The dashboard's empty state shows **"Welcome — let's add your first endpoint"** with a button that takes you straight to **Settings → Add endpoint**. Fill in:
+
+- **Name** — anything you like (e.g. *Home server Ollama*).
+- **Kind** — `ollama` for native Ollama servers (recommended; supports `think: false` properly), `openai` for LM Studio / vLLM / llama.cpp / Bonsai / any OpenAI-compatible URL.
+- **Base URL** — the full URL of your server. For native-Ollama use the host root (e.g. `https://my-server.example.com` — no `/v1` suffix). For OpenAI-compat include `/v1` (e.g. `http://192.168.1.50:1234/v1`).
+- **API key** *(optional)* — sent as `Authorization: Bearer <key>` on every request. Use this if your endpoint is gated by a Bearer token.
+- **Custom headers** *(optional)* — any extra headers your endpoint requires.
+
+Save. The endpoint's models appear in the dashboard's model dropdown immediately. From there everything else (chat, attachments, API Code modal, fine-tuning data export) works exactly the same as the heavy install — only the inference happens elsewhere.
+
+**What `MINICLOSEDAI_NO_OLLAMA=1` does:**
+
+- On a fresh database, **the built-in Ollama backend isn't seeded**. The dashboard starts with zero endpoints registered.
+- On an existing database that previously ran in heavy mode, **the built-in row is auto-disabled** at startup (its `enabled` flag is set to `0`) so it doesn't show as a permanently-broken endpoint in the dropdown.
+- Without the env var, behavior is identical to the heavy default — no breaking changes for existing users.
+
+Other env vars you may want for the lite setup:
+
+| Var | Purpose |
+|---|---|
+| `MINICLOSEDAI_DB_PATH` | Override where the SQLite DB lives. Default: `./miniclosedai.db` next to `app.py`. |
+| `OLLAMA_URL` | The default seeded URL for the built-in Ollama row when it *does* get seeded. Irrelevant in lite mode. |
 
 ---
 
@@ -1513,6 +1590,7 @@ miniclosedai/
 ├── Dockerfile.ollama          # Ollama image with 3 models baked in, ~10.3 GB
 ├── docker-compose.yml         # Two-service orchestration, GPU, healthchecks
 ├── docker-compose.cpu.yml     # Override for CPU-only hosts (`devices: !reset []`)
+├── docker-compose.lite.yml    # Lite mode: single-service, no Ollama container, MINICLOSEDAI_NO_OLLAMA=1
 ├── .dockerignore              # Build-context exclusions
 ├── README.md                  # This document
 ├── DOCUMENTATION.md           # Extra architecture detail (covers Docker in depth)

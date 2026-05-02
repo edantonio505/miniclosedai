@@ -42,7 +42,14 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 
 ## Requirements
 
-Two supported deployment paths. Pick one — the rest of this document applies to both.
+Four supported deployment paths — two methods (Docker / bare-metal) crossed with two modes (heavy / lite). Pick the combination that matches your hardware and use case; the rest of this document applies to all four.
+
+| | Heavy (with built-in Ollama) | Lite (no Ollama, BYO endpoint) |
+|---|---|---|
+| **Docker** | [Path A](#path-a--docker-recommended-zero-manual-ollama-install) — compose stack, three baked models, ~10.3 GB image, GPU recommended. | [Path C](#path-c--docker-lite-no-built-in-ollama) — single ~160 MB container, zero GPU, no model layers. |
+| **Bare-metal** | [Path B](#path-b--manual-python-venv--host-ollama) — Python venv + host Ollama. | [Path D](#path-d--manual-lite-no-local-ollama) — Python venv only. `MINICLOSEDAI_NO_OLLAMA=1` env var skips the built-in Ollama backend; you register an external endpoint via the Settings page. |
+
+Lite mode (paths C and D) is the right pick when inference happens on a *different* machine — a remote Ollama relay, an LM Studio on your LAN, vLLM on a GPU box, etc. The local install is just the FastAPI app + SQLite + static frontend.
 
 ### Path A — Docker (recommended, zero manual Ollama install)
 
@@ -75,6 +82,58 @@ pypdf>=4.0                # server-side PDF text extraction for chat attachments
 ```
 
 `pypdf` and `python-multipart` are pinned so file-attachment support (images, PDFs, text files in the chat composer) works out of the box — `pip install -r requirements.txt` is the full setup; users do not need to install anything else by hand.
+
+### Path C — Docker lite (no built-in Ollama)
+
+Single-service compose file. Brings up only the MiniClosedAI web app — no Ollama container, no GPU passthrough, no model layers.
+
+| Requirement | Version |
+|---|---|
+| Docker Engine | 20.10+ with Compose v2 bundled |
+| Free disk | ~250 MB total (image is ~160 MB; the rest is the SQLite volume) |
+| RAM | ~150 MB |
+| GPU / VRAM | none — inference happens on the external endpoint you'll register |
+
+Bring it up:
+
+```bash
+docker compose -f docker-compose.lite.yml up -d --build
+# → http://127.0.0.1:8095
+# → ⚙️ Settings → Add endpoint
+```
+
+The compose file (`/home/edgar/Desktop/miniclosedai/docker-compose.lite.yml`) sets `MINICLOSEDAI_NO_OLLAMA=1` in the container env. See [Lite mode internals](#lite-mode-internals-mini-closed-ai_no_ollama) below for what that env var does.
+
+### Path D — Manual lite (no local Ollama)
+
+Drops every system requirement except Python and the five pip packages.
+
+| Requirement | Version |
+|---|---|
+| Python | 3.10 or newer |
+| pip packages | the same five as Path B (`fastapi`, `uvicorn`, `httpx`, `python-multipart`, `pypdf`) |
+| RAM | ~150 MB |
+| At least one **external** LLM endpoint | reachable at runtime; configured via the Settings page after first boot |
+
+Setup:
+
+```bash
+git clone <this repo> && cd miniclosedai
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+MINICLOSEDAI_NO_OLLAMA=1 python -m uvicorn app:app --host 0.0.0.0 --port 8095
+```
+
+Open the UI, click **⚙️ Settings → Add endpoint**, paste your endpoint URL + (optional) Bearer token, save. Done.
+
+### Lite mode internals (`MINICLOSEDAI_NO_OLLAMA`)
+
+When `MINICLOSEDAI_NO_OLLAMA` is set to `1` / `true` / `yes` / `on` (case-insensitive), `db.init_db()` behaves differently in two ways:
+
+1. **On a fresh database** — the `INSERT OR IGNORE` that normally seeds the `Ollama (built-in)` row at id=1 is skipped. The backends table starts empty; the dashboard model dropdown shows a "Welcome — let's add your first endpoint" CTA that flips to the Settings tab.
+2. **On an existing database** — any pre-existing built-in Ollama row (`is_builtin = 1 AND kind = 'ollama'`) gets `enabled = 0` set on it at startup. The row stays in place (it's the FK target for any `conversation.backend_id = 1`), but it's hidden from the dashboard dropdown and the model-aggregation endpoint, and probes don't run against it.
+
+The flag is honored by `db._no_ollama_mode()` in [`/home/edgar/Desktop/miniclosedai/db.py`](./db.py). All four deployment paths share the same SQLite schema, so flipping between heavy and lite is just a matter of toggling the env var (no migrations to run, no DB to drop) — though re-enabling the built-in row after a lite-mode auto-disable currently requires a one-time manual step (Settings page, or `UPDATE backends SET enabled = 1 WHERE is_builtin = 1`).
 
 ---
 
@@ -166,6 +225,7 @@ The repo ships a production-shaped Docker setup: two images orchestrated by Comp
 | **`scripts/bake-models.sh`** | The background-daemon trick — `ollama serve &` in foreground-only base image, poll `/api/tags` up to 60 s (not a blind `sleep`), `ollama pull` with 3 retries, clean SIGTERM + `wait` before the `RUN` exits, and sanity-check via `ollama list` so a silently-failed pull fails the layer. One script per model per layer. |
 | **`docker-compose.yml`** | Two services (`miniclosedai`, `ollama`). Internal compose network. Two named volumes (`miniclosedai_db`, `ollama_models`). NVIDIA GPU device reservation. Healthchecks on both services. `depends_on: ollama: condition: service_healthy`. Loopback-only host port bind. |
 | **`docker-compose.cpu.yml`** | Override that strips the GPU reservation via `devices: !reset []` (Compose v2.24+). Use with `-f docker-compose.yml -f docker-compose.cpu.yml`. |
+| **`docker-compose.lite.yml`** | Single-service compose — only the MiniClosedAI app, no Ollama container, no GPU, no model layers. Sets `MINICLOSEDAI_NO_OLLAMA=1` in the container env. Run with `docker compose -f docker-compose.lite.yml up -d --build`. ~30 s build, ~160 MB image, runs on any laptop. |
 | **`.dockerignore`** | Defense-in-depth — excludes `.venv/`, `.git/`, `__pycache__/`, `test_e2e.py`, `miniclosedai.db`, docs, screenshots, scratch notes, editor files, and the Docker files themselves from the build context. |
 
 ### Baked models
@@ -878,6 +938,7 @@ miniclosedai/
 ├── Dockerfile.ollama          # Ollama image with 3 models baked in, ~10.3 GB
 ├── docker-compose.yml         # Two services, GPU reservation, healthchecks, volumes
 ├── docker-compose.cpu.yml     # Override: strip GPU via `devices: !reset []`
+├── docker-compose.lite.yml    # Single-service: app only, MINICLOSEDAI_NO_OLLAMA=1, no GPU/models
 ├── .dockerignore              # Build-context exclusions
 ├── README.md                  # Quick start + recipes
 ├── DOCUMENTATION.md           # This file

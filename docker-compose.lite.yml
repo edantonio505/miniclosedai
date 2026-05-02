@@ -1,0 +1,53 @@
+# MiniClosedAI — lite deployment (no Ollama, no GPU, no model layers).
+#
+# Use this when you want to run JUST the web app and point it at an external
+# inference endpoint (a remote Ollama, an LM Studio, vLLM, llama.cpp server,
+# a relay, etc.) via the Settings page. The image is ~160 MB versus ~10.3 GB
+# for the heavy default — no `ollama pull`, no GPU passthrough, no NVIDIA
+# container toolkit required, no minimum RAM beyond what the FastAPI app
+# itself needs.
+#
+# Usage:
+#   docker compose -f docker-compose.lite.yml up -d --build
+#
+# After boot:
+#   http://127.0.0.1:8095      MiniClosedAI UI
+#   → click ⚙️ Settings → Add endpoint → enter your URL + (optional) Bearer
+#     token. Models from that endpoint appear in the dashboard dropdown.
+#
+# Security: `ports: ["127.0.0.1:8095:8095"]` binds to loopback only.
+# MiniClosedAI has zero authentication — changing to `"8095:8095"` exposes
+# the full chat/bot/backend-config UI to your LAN. Do it consciously.
+#
+# To switch back to the heavy default later, run the standard compose file
+# instead:  docker compose -f docker-compose.yml up -d --build
+
+services:
+  miniclosedai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: miniclosedai/app:latest
+    environment:
+      # Lite mode: skip seeding the built-in Ollama backend on a fresh DB,
+      # and auto-disable any pre-existing built-in row on an upgraded DB so
+      # the dashboard dropdown isn't permanently broken.
+      MINICLOSEDAI_NO_OLLAMA: "1"
+      MINICLOSEDAI_DB_PATH: "/app/data/miniclosedai.db"
+    volumes:
+      - miniclosedai_db:/app/data
+    # 127.0.0.1 prefix = loopback only. Remove it to expose on LAN (no auth!).
+    ports:
+      - "127.0.0.1:8095:8095"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/', timeout=2)\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  # Named volume — persists across `docker compose down`, destroyed by
+  # `docker compose down -v`. Empty declaration so compose manages it.
+  miniclosedai_db:

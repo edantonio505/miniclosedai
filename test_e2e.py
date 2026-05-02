@@ -1462,6 +1462,142 @@ def _():
 
 
 # ==================================================================
+# Lite mode — MINICLOSEDAI_NO_OLLAMA env var
+# ==================================================================
+#
+# Each test uses an isolated temp DB so the main test client's DB stays
+# intact. Pattern: swap _db_mod.DB_PATH → temp file, set/clear the env
+# var, run init_db(), inspect, restore.
+
+import contextlib  # noqa: E402
+
+@contextlib.contextmanager
+def _isolated_db(no_ollama_env: str | None):
+    """Run init_db() against a throwaway DB with the env var configured.
+
+    Yields the temporary DB path so tests can inspect its contents directly
+    (via sqlite3) — this avoids tripping the main TestClient, which is bound
+    to the suite-wide DB.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="mca-lite-"))
+    tmp_db = tmp / "lite.db"
+    saved_path = _db_mod.DB_PATH
+    saved_env = os.environ.get("MINICLOSEDAI_NO_OLLAMA")
+    try:
+        _db_mod.DB_PATH = tmp_db
+        if no_ollama_env is None:
+            os.environ.pop("MINICLOSEDAI_NO_OLLAMA", None)
+        else:
+            os.environ["MINICLOSEDAI_NO_OLLAMA"] = no_ollama_env
+        yield tmp_db
+    finally:
+        _db_mod.DB_PATH = saved_path
+        if saved_env is None:
+            os.environ.pop("MINICLOSEDAI_NO_OLLAMA", None)
+        else:
+            os.environ["MINICLOSEDAI_NO_OLLAMA"] = saved_env
+        try:
+            tmp_db.unlink(missing_ok=True)
+            tmp.rmdir()
+        except Exception:
+            pass
+
+
+@test("lite mode: env var truthy values are recognized")
+def _():
+    # The exact value strings the docs promise: 1, true, yes, on
+    # (case-insensitive). Anything else (incl. unset, empty, 0, false)
+    # must read as heavy mode.
+    truthy = ["1", "true", "yes", "on", "TRUE", "Yes", " 1 "]
+    falsey = [None, "", "0", "false", "no", "off", "tru"]
+    saved = os.environ.get("MINICLOSEDAI_NO_OLLAMA")
+    try:
+        for v in truthy:
+            os.environ["MINICLOSEDAI_NO_OLLAMA"] = v
+            assert _db_mod._no_ollama_mode() is True, f"truthy value {v!r} not recognized"
+        for v in falsey:
+            if v is None:
+                os.environ.pop("MINICLOSEDAI_NO_OLLAMA", None)
+            else:
+                os.environ["MINICLOSEDAI_NO_OLLAMA"] = v
+            assert _db_mod._no_ollama_mode() is False, f"falsey value {v!r} read as truthy"
+    finally:
+        if saved is None:
+            os.environ.pop("MINICLOSEDAI_NO_OLLAMA", None)
+        else:
+            os.environ["MINICLOSEDAI_NO_OLLAMA"] = saved
+
+
+@test("lite mode: fresh DB → built-in Ollama row is NOT seeded")
+def _():
+    import sqlite3
+    with _isolated_db("1") as tmp_db:
+        _db_mod.init_db()
+        conn = sqlite3.connect(tmp_db)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT id, name, kind, is_builtin, enabled FROM backends").fetchall()
+        conn.close()
+    assert len(rows) == 0, \
+        f"lite mode seeded {len(rows)} backends; expected zero. Rows: {[dict(r) for r in rows]}"
+
+
+@test("lite mode: heavy → lite migration auto-disables existing built-in row")
+def _():
+    import sqlite3
+    with _isolated_db(None) as tmp_db:
+        # Phase 1: heavy init seeds the row enabled=1.
+        _db_mod.init_db()
+        conn = sqlite3.connect(tmp_db); conn.row_factory = sqlite3.Row
+        before = conn.execute(
+            "SELECT id, is_builtin, enabled FROM backends WHERE is_builtin = 1"
+        ).fetchone()
+        conn.close()
+        assert before is not None, "heavy init didn't seed the built-in row"
+        assert before["enabled"] == 1, f"built-in row started disabled: {dict(before)}"
+
+        # Phase 2: flip env var on, re-run init_db (simulates upgrade-to-lite restart).
+        os.environ["MINICLOSEDAI_NO_OLLAMA"] = "1"
+        _db_mod.init_db()
+        conn = sqlite3.connect(tmp_db); conn.row_factory = sqlite3.Row
+        after = conn.execute(
+            "SELECT id, is_builtin, enabled FROM backends WHERE is_builtin = 1"
+        ).fetchone()
+        conn.close()
+
+    assert after is not None, "lite mode deleted the row instead of disabling it"
+    assert after["id"] == before["id"], "row id changed (lite shouldn't move FK targets)"
+    assert after["enabled"] == 0, f"lite mode failed to flip enabled=0: {dict(after)}"
+
+
+@test("lite mode: re-running init_db in lite is idempotent (still empty / still disabled)")
+def _():
+    import sqlite3
+    with _isolated_db("1") as tmp_db:
+        _db_mod.init_db()
+        _db_mod.init_db()   # second call must not seed retroactively
+        _db_mod.init_db()
+        conn = sqlite3.connect(tmp_db)
+        n = conn.execute("SELECT COUNT(*) FROM backends").fetchone()[0]
+        conn.close()
+    assert n == 0, f"idempotent re-init in lite mode added rows: {n}"
+
+
+@test("lite mode: heavy default still works (env var unset → row seeded)")
+def _():
+    import sqlite3
+    with _isolated_db(None) as tmp_db:
+        _db_mod.init_db()
+        conn = sqlite3.connect(tmp_db); conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, name, kind, is_builtin, enabled FROM backends WHERE is_builtin = 1"
+        ).fetchone()
+        conn.close()
+    assert row is not None, "heavy mode failed to seed the built-in row"
+    assert row["enabled"] == 1 and row["kind"] == "ollama" and row["is_builtin"] == 1, \
+        f"heavy seed shape unexpected: {dict(row)}"
+
+
+# ==================================================================
 # Main
 # ==================================================================
 

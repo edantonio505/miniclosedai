@@ -22,6 +22,21 @@ DB_PATH = Path(os.environ.get("MINICLOSEDAI_DB_PATH") or (Path(__file__).parent 
 
 _DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
+
+def _no_ollama_mode() -> bool:
+    """Lite install — skip seeding the built-in Ollama backend.
+
+    Set ``MINICLOSEDAI_NO_OLLAMA=1`` (also accepts ``true`` / ``yes``) when
+    running the web app on a machine that does not have Ollama installed.
+    The user registers their own external endpoint via the Settings page
+    instead. Existing built-in row (if any) is auto-disabled at startup so
+    upgrading from a heavy install to lite doesn't leave a permanently-
+    unreachable endpoint cluttering the dropdown.
+    """
+    return (os.environ.get("MINICLOSEDAI_NO_OLLAMA") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,11 +91,22 @@ def init_db() -> None:
         # Seed the built-in Ollama backend at id=1 exactly once. `INSERT OR IGNORE`
         # means running init_db() multiple times (or on a DB where id=1 already
         # exists) is harmless.
-        conn.execute(
-            """INSERT OR IGNORE INTO backends (id, name, kind, base_url, is_builtin, enabled)
-               VALUES (1, 'Ollama (built-in)', 'ollama', ?, 1, 1)""",
-            (_DEFAULT_OLLAMA_URL,),
-        )
+        #
+        # Lite mode: when MINICLOSEDAI_NO_OLLAMA is set, skip the seed entirely
+        # on a fresh DB (so the user registers their own external endpoint via
+        # Settings) and auto-disable any pre-existing built-in row on a DB that
+        # was created in heavy mode (so upgrading doesn't leave a permanently-
+        # unreachable backend in the dropdown).
+        if _no_ollama_mode():
+            conn.execute(
+                "UPDATE backends SET enabled = 0 WHERE is_builtin = 1 AND kind = 'ollama'"
+            )
+        else:
+            conn.execute(
+                """INSERT OR IGNORE INTO backends (id, name, kind, base_url, is_builtin, enabled)
+                   VALUES (1, 'Ollama (built-in)', 'ollama', ?, 1, 1)""",
+                (_DEFAULT_OLLAMA_URL,),
+            )
 
         conn.commit()
 
