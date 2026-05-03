@@ -6,10 +6,13 @@ server (LM Studio, vLLM, llama.cpp's `server`, etc.). All backend handling
 lives in llm.py — this module is HTTP routing + persistence.
 """
 import asyncio
+import base64
 import csv
 import io
 import json
+import re
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -791,15 +794,69 @@ def api_edit_message(conv_id: int, index: int, data: MessageEditRequest):
     return db.row_to_dict(updated)
 
 
+# ---------- Dataset-export helpers ----------
+#
+# Both export paths (CSV and ZIP) share these two utilities. The CSV path
+# wants the user-visible text only (text-only training data); the ZIP path
+# wants the full multimodal content array with images extracted to files.
+
+_IMAGE_MIME_TO_EXT = {
+    "image/png":  "png",
+    "image/jpeg": "jpg",
+    "image/jpg":  "jpg",
+    "image/webp": "webp",
+    "image/gif":  "gif",
+    "image/bmp":  "bmp",
+}
+
+
+def _content_text_for_export(content) -> str:
+    """Pull the text the user / model actually saw from a possibly-multimodal
+    `content` field. String → returned as-is. List → text parts joined.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        p.get("text", "") or ""
+        for p in content
+        if isinstance(p, dict) and p.get("type") == "text"
+    )
+
+
+def _safe_filename(title: str | None, conv_id: int) -> str:
+    """Filesystem- and URL-safe filename derived from the conversation title."""
+    raw = title or f"conv{conv_id}"
+    out = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in raw)
+    return out.strip("_") or f"conv{conv_id}"
+
+
+def _iter_pairs(messages: list[dict]):
+    """Yield (user_msg, assistant_msg) tuples in order. Orphan user messages
+    with no reply (partial turns) are skipped — they aren't useful SFT data.
+    """
+    i = 0
+    while i < len(messages) - 1:
+        a, b = messages[i], messages[i + 1]
+        if a.get("role") == "user" and b.get("role") == "assistant":
+            yield a, b
+            i += 2
+        else:
+            i += 1
+
+
 @app.get("/api/conversations/{conv_id}/export.csv")
 def api_export_conversation_csv(conv_id: int):
-    """Download this conversation as a fine-tuning CSV.
+    """Download this conversation as a text-only fine-tuning CSV.
 
-    Columns: `input` (user turn) and `output` (assistant reply). We walk the
-    messages list and emit one row per adjacent user→assistant pair. Orphan
-    user messages with no reply yet are skipped — partial turns aren't useful
-    SFT data. Edited content is exported as-is (that's the whole point of the
-    edit feature).
+    Columns: `input` (user turn, text only) and `output` (assistant reply).
+    For multimodal turns, the user-side text is the typed text — `display_text`
+    if present (no `[Attached: ...]` preambles), else the joined text parts.
+    Image data is **not** preserved; use the ZIP export for that.
+
+    Orphan user messages with no reply yet are skipped — partial turns aren't
+    useful SFT data. Edited content is exported as-is.
     """
     with db.get_conn() as conn:
         row = conn.execute(
@@ -812,28 +869,140 @@ def api_export_conversation_csv(conv_id: int):
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["input", "output"])
-    i = 0
-    while i < len(messages) - 1:
-        a, b = messages[i], messages[i + 1]
-        if a.get("role") == "user" and b.get("role") == "assistant":
-            # rstrip both sides — trailing whitespace in training data teaches
-            # the fine-tuned model to emit trailing whitespace too.
-            writer.writerow([
-                (a.get("content", "") or "").strip(),
-                (b.get("content", "") or "").strip(),
-            ])
-            i += 2
-        else:
-            i += 1
+    for user_msg, assistant_msg in _iter_pairs(messages):
+        # Prefer display_text (the user's typed text without prepended file
+        # bodies). Falls back to the raw text-extracted content for legacy
+        # rows that pre-date the display_text field.
+        user_text = user_msg.get("display_text")
+        if not user_text:
+            user_text = _content_text_for_export(user_msg.get("content", ""))
+        writer.writerow([
+            user_text.strip(),
+            _content_text_for_export(assistant_msg.get("content", "")).strip(),
+        ])
 
-    safe_title = "".join(
-        c if c.isalnum() or c in ("-", "_") else "_" for c in (row["title"] or f"conv{conv_id}")
-    ).strip("_") or f"conv{conv_id}"
+    safe_title = _safe_filename(row["title"], conv_id)
     return Response(
         content=buf.getvalue(),
         media_type="text/csv; charset=utf-8",
         headers={
             "Content-Disposition": f'attachment; filename="{safe_title}.csv"',
+        },
+    )
+
+
+@app.get("/api/conversations/{conv_id}/export.zip")
+def api_export_conversation_zip(conv_id: int):
+    """Download this conversation as a multimodal SFT bundle (JSONL + images).
+
+    The ZIP layout::
+
+        <title>.jsonl              one chat-turn pair per line, OpenAI shape
+        images/<i>_user_<j>.<ext>  any base64 images attached to user turns
+
+    Each JSONL line carries an OpenAI-compatible `messages` array — the same
+    shape consumed by HuggingFace's `datasets.load_dataset`, OpenAI's
+    fine-tuning API, axolotl, unsloth, and most modern training libraries::
+
+        {"messages": [
+          {"role": "user", "content": [
+            {"type": "text", "text": "what's in this?"},
+            {"type": "image_url", "image_url": {"url": "images/0_user_0.png"}}
+          ]},
+          {"role": "assistant", "content": "A red square."}
+        ]}
+
+    Text-only turns serialize with a string `content` (no array wrapper) for
+    cleaner JSONL. Text- and PDF-attachment bodies are inlined into the user
+    turn's text — that's what the model actually saw at training time, so
+    that's what demonstration data should preserve. Skips orphan user
+    messages with no reply.
+    """
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT title, messages FROM conversations WHERE id = ?", (conv_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Conversation not found")
+
+    messages = json.loads(row["messages"] or "[]")
+    safe_title = _safe_filename(row["title"], conv_id)
+
+    zip_buf = io.BytesIO()
+    jsonl_lines: list[str] = []
+
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for pair_idx, (user_msg, assistant_msg) in enumerate(_iter_pairs(messages)):
+            # ----- User content: extract images, rewrite urls to relative paths -----
+            user_content_in = user_msg.get("content", "")
+            user_text_parts: list[str] = []
+            user_image_parts: list[dict] = []
+            img_idx = 0
+
+            if isinstance(user_content_in, str):
+                if user_content_in:
+                    user_text_parts.append(user_content_in)
+            elif isinstance(user_content_in, list):
+                for p in user_content_in:
+                    if not isinstance(p, dict):
+                        continue
+                    ptype = p.get("type")
+                    if ptype == "text":
+                        txt = p.get("text", "") or ""
+                        if txt:
+                            user_text_parts.append(txt)
+                    elif ptype == "image_url":
+                        url = ((p.get("image_url") or {}).get("url")) or ""
+                        m = re.match(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$", url, re.DOTALL)
+                        if not m:
+                            # Already a relative path, or a non-data url — pass through.
+                            user_image_parts.append(p)
+                            continue
+                        mime, b64 = m.group(1).lower(), m.group(2)
+                        ext = _IMAGE_MIME_TO_EXT.get(mime, "bin")
+                        try:
+                            raw = base64.b64decode(b64)
+                        except Exception:
+                            continue
+                        rel_path = f"images/{pair_idx}_user_{img_idx}.{ext}"
+                        zf.writestr(rel_path, raw)
+                        user_image_parts.append(
+                            {"type": "image_url", "image_url": {"url": rel_path}}
+                        )
+                        img_idx += 1
+
+            user_text_combined = "\n\n".join(s.strip() for s in user_text_parts if s.strip())
+
+            # Build the user message in OpenAI shape. Text-only → string
+            # content (cleaner JSONL); multimodal → typed-parts array.
+            if user_image_parts:
+                content_parts = []
+                if user_text_combined:
+                    content_parts.append({"type": "text", "text": user_text_combined})
+                content_parts.extend(user_image_parts)
+                user_out = {"role": "user", "content": content_parts}
+            else:
+                user_out = {"role": "user", "content": user_text_combined}
+
+            # ----- Assistant: text only (collapsed if it ever came back as a list) -----
+            assistant_out = {
+                "role": "assistant",
+                "content": _content_text_for_export(assistant_msg.get("content", "")).strip(),
+            }
+
+            jsonl_lines.append(json.dumps(
+                {"messages": [user_out, assistant_out]},
+                ensure_ascii=False,
+            ))
+
+        # Write the JSONL file last so it sits at the front of the directory listing.
+        zf.writestr(f"{safe_title}.jsonl", "\n".join(jsonl_lines) + ("\n" if jsonl_lines else ""))
+
+    return Response(
+        content=zip_buf.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_title}.zip"',
         },
     )
 

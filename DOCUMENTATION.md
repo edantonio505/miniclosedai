@@ -596,7 +596,8 @@ PATCH  /api/conversations/{id}                    → update any subset of field
 DELETE /api/conversations/{id}                    → delete
 POST   /api/conversations/{id}/clear              → wipe messages, keep config
 PATCH  /api/conversations/{id}/messages/{index}   → edit one stored message in place
-GET    /api/conversations/{id}/export.csv         → download the chat as input/output CSV
+GET    /api/conversations/{id}/export.csv         → text-only SFT CSV (input,output)
+GET    /api/conversations/{id}/export.zip         → multimodal SFT bundle (JSONL + images)
 ```
 
 **Create body**:
@@ -817,7 +818,7 @@ Every chat doubles as a curation surface for supervised fine-tuning (SFT). The w
 | UI control | What it does |
 |---|---|
 | ✏️ Pencil (top-right of each assistant bubble) | Inline editor. Textarea prefilled with the raw response (whitespace-trimmed for display). `Save` commits; `Cancel` / `Esc` aborts; `Ctrl/⌘+Enter` saves. Disabled while a stream is active. |
-| ⬇ Download icon (header, between Clear and Delete) | Saves `<chat_title>.csv` to the browser's Downloads. Columns are `input,output`, one row per user→assistant pair. |
+| ⬇ Download icon (header, between Clear and Delete) | Click opens a popover with two formats: **Text CSV** (`<chat_title>.csv` — two columns, image attachments dropped) and **JSONL + images (ZIP)** (`<chat_title>.zip` — OpenAI-shaped JSONL records + an `images/` folder with the actual base64-decoded image bytes). Pick CSV for text-only datasets, ZIP for multimodal. |
 
 Edits to user messages are intentionally not supported — the value of the dataset is in the **real prompts** you'd actually send in production. Only assistant outputs are rewriteable.
 
@@ -864,6 +865,54 @@ frames = [pd.read_csv(pd.io.common.StringIO(
     httpx.get(f"http://localhost:8095/api/conversations/{i}/export.csv").text
 )) for i in ids]
 pd.concat(frames, ignore_index=True).to_csv("sft.csv", index=False)
+```
+
+### ZIP shape (multimodal, JSONL + images)
+
+```
+<title>.zip
+├── <title>.jsonl                  # one user→assistant pair per line, OpenAI shape
+└── images/
+    ├── 0_user_0.png               # pair 0, user turn, image 0
+    ├── 0_user_1.jpg               # pair 0, user turn, image 1
+    └── 2_user_0.png               # pair 2, user turn, image 0
+```
+
+JSONL line format (uses the OpenAI fine-tuning shape that HuggingFace `datasets`, axolotl, unsloth, and OpenAI's API all consume natively):
+
+```json
+{"messages": [
+  {"role": "user", "content": [
+    {"type": "text", "text": "what's in this?"},
+    {"type": "image_url", "image_url": {"url": "images/0_user_0.png"}}
+  ]},
+  {"role": "assistant", "content": "A red square."}
+]}
+```
+
+Implementation notes (from `api_export_conversation_zip` in `app.py`):
+
+- **Pair extraction is shared with the CSV path** (`_iter_pairs(messages)` walks adjacent user→assistant pairs and skips orphans).
+- **Text-only turns serialize with a string `content`**, not a single-element typed-parts array. Cleaner JSONL, no `[{"type":"text","text":"..."}]` wrapper for the common case.
+- **Image extraction**: each `{"type":"image_url","image_url":{"url":"data:image/...;base64,..."}}` part is parsed via regex; the base64 is decoded and written as a real file at `images/<pair-idx>_user_<img-idx>.<ext>`. The `.url` field in the JSONL is rewritten to that relative path. Mime → extension map covers PNG / JPEG / WebP / GIF / BMP; unknown mimes fall back to `.bin`.
+- **PDF and text attachment bodies are inlined** into the user turn's text part (not split into separate files). Demonstration data should preserve what the model actually saw at training time, and the model saw the merged `[Attached: filename]\n<body>\n\n<question>` text.
+- **`images/` folder is omitted** from the archive entirely if no image attachments existed in the conversation.
+- **No external dependencies**. Stdlib `zipfile` builds the archive into a `BytesIO` buffer; the buffer is returned as `application/zip` with `Content-Disposition: attachment; filename="<title>.zip"`. No temp directory, no streaming complexity — small enough datasets that loading the whole thing in memory is fine.
+
+```python
+# Programmatic access — same shape as the CSV section but for the ZIP path.
+import httpx, zipfile, io, json
+
+zip_bytes = httpx.get("http://localhost:8095/api/conversations/3/export.zip").content
+zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+jsonl_name = next(n for n in zf.namelist() if n.endswith(".jsonl"))
+records = [json.loads(line) for line in zf.read(jsonl_name).decode().splitlines()]
+print(f"{len(records)} pairs; {sum(1 for n in zf.namelist() if n.startswith('images/'))} images")
+
+# Or — feed straight to HuggingFace `datasets` after extracting:
+zf.extractall("./mybot")
+from datasets import Dataset
+ds = Dataset.from_json("./mybot/mybot.jsonl")
 ```
 
 ### From SFT to DPO

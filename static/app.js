@@ -1621,7 +1621,7 @@ function bindChat() {
   });
   els.newChatBtn.addEventListener("click", newConversation);
   els.clearChatBtn.addEventListener("click", clearCurrentConversation);
-  els.downloadCsvBtn.addEventListener("click", downloadCurrentConversationCsv);
+  bindDownloadMenu();
   els.deleteChatBtn.addEventListener("click", deleteCurrentConversation);
   els.stopBtn.addEventListener("click", () => {
     if (state.abortController) state.abortController.abort();
@@ -1647,19 +1647,61 @@ async function clearCurrentConversation() {
   els.input.focus();
 }
 
-async function downloadCurrentConversationCsv() {
+// Two export formats are available — see /api/conversations/{id}/export.csv
+// and .../export.zip. The icon button opens a small popover; clicking either
+// menu item triggers the corresponding download via Content-Disposition.
+function _downloadCurrentConversation(format) {
   if (!state.conversationId) {
     alert("Save at least one exchange to this conversation before exporting.");
     return;
   }
-  // Just trigger a navigation — the endpoint returns
-  // Content-Disposition: attachment so the browser saves it as <title>.csv.
+  const ext = format === "zip" ? "zip" : "csv";
   const a = document.createElement("a");
-  a.href = `/api/conversations/${state.conversationId}/export.csv`;
+  a.href = `/api/conversations/${state.conversationId}/export.${ext}`;
   a.rel = "noopener";
   document.body.appendChild(a);
   a.click();
   a.remove();
+}
+
+function _toggleDownloadMenu(force) {
+  const btn = els.downloadCsvBtn;
+  const menu = document.getElementById("download-menu");
+  if (!btn || !menu) return;
+  const willOpen = force != null ? force : menu.hasAttribute("hidden");
+  if (willOpen) {
+    menu.removeAttribute("hidden");
+    btn.setAttribute("aria-expanded", "true");
+  } else {
+    menu.setAttribute("hidden", "");
+    btn.setAttribute("aria-expanded", "false");
+  }
+}
+
+// Bound from bindChat(): clicking the tray icon opens the menu; clicking
+// outside closes it; clicking a menu item triggers the corresponding
+// download and closes the menu. Replaces the old direct-CSV behavior.
+function bindDownloadMenu() {
+  const menu = document.getElementById("download-menu");
+  if (!menu) return;
+  els.downloadCsvBtn.addEventListener("click", e => {
+    e.stopPropagation();
+    _toggleDownloadMenu();
+  });
+  menu.addEventListener("click", e => {
+    const item = e.target.closest('.download-menu-item[data-format]');
+    if (!item) return;
+    e.stopPropagation();
+    _toggleDownloadMenu(false);
+    _downloadCurrentConversation(item.dataset.format);
+  });
+  document.addEventListener("click", e => {
+    if (menu.contains(e.target) || els.downloadCsvBtn.contains(e.target)) return;
+    _toggleDownloadMenu(false);
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") _toggleDownloadMenu(false);
+  });
 }
 
 async function deleteCurrentConversation() {
