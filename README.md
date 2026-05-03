@@ -716,7 +716,8 @@ PATCH  /api/conversations/{id}                    → update any subset of field
 DELETE /api/conversations/{id}                    → delete
 POST   /api/conversations/{id}/clear              → wipe messages, keep config
 PATCH  /api/conversations/{id}/messages/{index}   → edit a stored message in place
-GET    /api/conversations/{id}/export.csv         → download this chat as an SFT CSV
+GET    /api/conversations/{id}/export.csv         → download this chat as an SFT CSV (text-only)
+GET    /api/conversations/{id}/export.zip         → download as JSONL + images bundle (multimodal SFT)
 ```
 
 **Create** — supply any subset of config fields. `backend_id` defaults to `1` (built-in Ollama); set it to pin the bot to an OpenAI-compatible endpoint you registered in Settings.
@@ -770,7 +771,7 @@ curl -X PATCH http://localhost:8095/api/conversations/3/messages/1 \
   -d '{"content": "The rewritten assistant answer that becomes the SFT target."}'
 ```
 
-**GET `.../export.csv`** — download every user→assistant pair in this conversation as a two-column CSV. Columns are literally `input,output`. Rows use RFC-4180 quoting (commas, double quotes, and embedded newlines handled). Leading and trailing whitespace is stripped from both columns. Orphan user turns (no reply yet) are skipped. Response is `text/csv` with a `Content-Disposition: attachment; filename="<title>.csv"` header so the browser saves it directly. 404 if the conversation doesn't exist.
+**GET `.../export.csv`** — text-only SFT CSV. Every user→assistant pair becomes one row. Columns are literally `input,output`. Rows use RFC-4180 quoting (commas, double quotes, and embedded newlines handled). Leading and trailing whitespace is stripped from both columns. Orphan user turns (no reply yet) are skipped. For multimodal turns, the `input` cell uses the user's typed text only (`display_text`) — image attachments are dropped on this path. Response is `text/csv` with `Content-Disposition: attachment; filename="<title>.csv"` so the browser saves it directly. 404 if the conversation doesn't exist.
 
 ```bash
 curl -o mybot.csv http://localhost:8095/api/conversations/3/export.csv
@@ -778,6 +779,43 @@ head -3 mybot.csv
 # input,output
 # "Subject: URGENT — payout broken…","{""intent"":""bug"",""urgency"":""p1"",…}"
 ```
+
+**GET `.../export.zip`** — multimodal SFT bundle. Returns a ZIP archive containing:
+
+```
+<title>.jsonl                  one chat-turn pair per line, OpenAI shape
+images/<i>_user_<j>.<ext>      base64-decoded image bytes (PNG / JPG / WebP / GIF / BMP)
+```
+
+Each JSONL line carries an OpenAI-compatible `messages` array — the same shape consumed by HuggingFace's `datasets.load_dataset`, OpenAI's fine-tuning API, axolotl, unsloth, and most modern training libraries:
+
+```json
+{"messages": [
+  {"role": "user", "content": [
+    {"type": "text", "text": "what's in this?"},
+    {"type": "image_url", "image_url": {"url": "images/0_user_0.png"}}
+  ]},
+  {"role": "assistant", "content": "A red square."}
+]}
+```
+
+Text-only turns serialize with a string `content` for cleaner JSONL (no array wrapper). Text- and PDF-attachment bodies are inlined into the user turn's text — that's what the model actually saw at training time, so that's what demonstration data preserves. `images/` is omitted entirely if no image attachments exist. Filename uses the sanitized conversation title; 404 if the conversation doesn't exist.
+
+```bash
+curl -o mybot.zip http://localhost:8095/api/conversations/3/export.zip
+unzip -l mybot.zip
+# images/0_user_0.png
+# mybot.jsonl
+```
+
+Use it directly with HuggingFace `datasets`:
+
+```python
+from datasets import load_dataset
+ds = load_dataset("json", data_files="mybot/mybot.jsonl", features=...)
+```
+
+Or with OpenAI fine-tuning — pass the JSONL straight to `client.files.create(..., purpose="fine-tune")`.
 
 ### Chat
 
@@ -1405,7 +1443,9 @@ If you have **<5,000 pairs**, demonstration data is the canonical choice — it 
 
 2. **Hover any assistant response → click the pencil (top-right).** An inline textarea appears with the raw response. Rewrite it into the "ideal" version. Save (or `Ctrl/⌘+Enter`). The bubble re-renders with the new content, a small `edited` pill appears, and the pristine output is preserved under `original_content` server-side.
 
-3. **Click the download (tray) icon in the header.** You get `<chat-title>.csv` with `input,output` columns — one row per completed user→assistant pair, edited text as the `output`. Open it in any spreadsheet, load it into `pandas`, or stream it straight into a trainer.
+3. **Click the download (tray) icon in the header.** A small popover offers two formats:
+   - **Text CSV** — `<chat-title>.csv` with `input,output` columns. Best when your dataset is text-only and you want spreadsheet ergonomics.
+   - **JSONL + images (ZIP)** — `<chat-title>.zip` containing `<chat-title>.jsonl` (OpenAI-shaped `messages` records) plus an `images/` folder with any attached images. Use this when your conversations include image attachments — the JSONL points at the relative `images/<…>.png` paths so HuggingFace `datasets`, OpenAI's fine-tune API, axolotl, and unsloth all consume it natively.
 
 Repeat 1–2 as many times as you want before step 3. You can also edit user messages? **No** — only assistant responses are editable. Your real prompts are the whole point of the dataset; you're training the model to handle the prompts you actually write.
 
@@ -1422,6 +1462,49 @@ input,output
 - RFC-4180 escaping: values containing commas, double quotes, or newlines are wrapped in double quotes and internal `"` are doubled to `""`. Every standard CSV parser (pandas, Excel, `csv.reader`) round-trips cleanly.
 - Leading/trailing whitespace stripped from both cells. Important for models like LM Studio's Qwen3.6 which emit a leading `\n\n` separator between their (hidden) reasoning and the answer — training on that pollutes the target and teaches the model to emit junk whitespace.
 - The file is named after the conversation title; non-alphanumeric characters collapse to `_`.
+
+### What's in the ZIP (multimodal)
+
+Pick **JSONL + images (ZIP)** in the download popover when your conversation includes image attachments. The archive layout:
+
+```
+mybot.zip
+├── mybot.jsonl                # one chat-turn pair per line, OpenAI shape
+└── images/
+    ├── 0_user_0.png           # first pair, first image attached to the user turn
+    ├── 0_user_1.png           # first pair, second image
+    └── 2_user_0.jpg           # third pair, first image (jpg etc. preserved by mime)
+```
+
+Each JSONL line:
+
+```json
+{"messages": [
+  {"role": "user", "content": [
+    {"type": "text", "text": "what's in this?"},
+    {"type": "image_url", "image_url": {"url": "images/0_user_0.png"}}
+  ]},
+  {"role": "assistant", "content": "A red square."}
+]}
+```
+
+- **OpenAI-compatible shape.** Drop the JSONL straight into `client.files.create(..., purpose="fine-tune")`, or load it with HuggingFace `datasets` (`load_dataset("json", data_files="mybot.jsonl")`), axolotl, unsloth, etc. — the `messages: [{role, content}]` envelope is what every modern fine-tuning library already expects for vision-language models.
+- **Text-only turns serialize as a string `content`** (no array wrapper) — same JSONL handles mixed text-only and multimodal pairs without forcing a uniform shape.
+- **PDF / text attachments are inlined** into the user turn's text part. That's what the model actually saw at training time, so demonstration data should preserve it.
+- **Images live as real files**, not base64 strings. Pillow / torchvision / DataLoader stream them directly from the unzipped folder — no parsing JSON cells.
+- **No `images/` folder if no image attachments existed** in the conversation.
+- **Filename uses the sanitized conversation title** (same rules as the CSV).
+
+```python
+# Hugging Face — vision-aware load_dataset
+import io, zipfile
+from datasets import Dataset, Features, Value, Sequence, Image
+
+with zipfile.ZipFile("mybot.zip") as zf:
+    zf.extractall("./mybot")
+ds = Dataset.from_json("./mybot/mybot.jsonl")
+print(ds[0])
+```
 
 ### Full workflow example
 

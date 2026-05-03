@@ -27,6 +27,7 @@ What this suite covers
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -929,6 +930,185 @@ def _():
         assert rows[1][1] == "Rewritten answer.", f"unstripped output cell: {rows[1][1]!r}"
     finally:
         client.delete(f"/api/conversations/{cid}")
+
+
+@test("export CSV: multimodal turn — uses display_text, drops images, doesn't crash")
+def _():
+    """Pre-fix bug: `.strip()` on a list-content user message would TypeError.
+    Now: text-only CSV export prefers display_text, falls back to text parts.
+    """
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "csv-mm", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        r = client.post(f"/api/conversations/{c['id']}/chat", json={
+            "message": "what's in this?",
+            "persist": True,
+            "attachments": [{
+                "name": "tiny.png", "kind": "image", "mime": "image/png",
+                "data_url": _TINY_PNG_DATA_URL,
+            }],
+        })
+        assert r.status_code == 200, r.text
+        r = client.get(f"/api/conversations/{c['id']}/export.csv")
+        assert r.status_code == 200, r.text
+        import csv as _csv, io as _io
+        rows = list(_csv.reader(_io.StringIO(r.text)))
+        assert rows[0] == ["input", "output"]
+        # Should be exactly the user's typed text — no `[Attached: ...]` preamble,
+        # no base64 data leak.
+        assert rows[1][0] == "what's in this?", f"unexpected input cell: {rows[1][0]!r}"
+        assert "data:image" not in rows[1][0]
+        assert rows[1][1], "assistant cell empty"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+# ---- ZIP export (multimodal SFT bundle) ----
+
+import zipfile as _zipfile  # noqa: E402
+
+@test("export ZIP: text-only conversation produces clean JSONL, no images/")
+def _():
+    cid = _seed_conv_with_turn("zip-textonly")
+    try:
+        r = client.get(f"/api/conversations/{cid}/export.zip")
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"] == "application/zip"
+        zf = _zipfile.ZipFile(io.BytesIO(r.content))
+        names = zf.namelist()
+        assert any(n.endswith(".jsonl") for n in names), f"no JSONL in ZIP: {names}"
+        assert not any(n.startswith("images/") for n in names), \
+            f"text-only export shouldn't have images/: {names}"
+        jsonl_name = next(n for n in names if n.endswith(".jsonl"))
+        lines = zf.read(jsonl_name).decode().splitlines()
+        assert len(lines) == 1, f"expected 1 pair, got {len(lines)}"
+        rec = json.loads(lines[0])
+        msgs = rec["messages"]
+        assert msgs[0]["role"] == "user" and msgs[1]["role"] == "assistant"
+        # Text-only → string content (cleaner JSONL).
+        assert isinstance(msgs[0]["content"], str)
+        assert isinstance(msgs[1]["content"], str)
+        assert msgs[1]["content"] == "Hello world!", f"assistant: {msgs[1]['content']!r}"
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("export ZIP: image attachment → relative path in JSONL + actual bytes in images/")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "zip-image", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        r = client.post(f"/api/conversations/{c['id']}/chat", json={
+            "message": "describe",
+            "persist": True,
+            "attachments": [{
+                "name": "tiny.png", "kind": "image", "mime": "image/png",
+                "data_url": _TINY_PNG_DATA_URL,
+            }],
+        })
+        assert r.status_code == 200, r.text
+        r = client.get(f"/api/conversations/{c['id']}/export.zip")
+        assert r.status_code == 200, r.text
+        zf = _zipfile.ZipFile(io.BytesIO(r.content))
+        names = zf.namelist()
+        # Exactly one image expected at the canonical path.
+        img_paths = [n for n in names if n.startswith("images/")]
+        assert img_paths == ["images/0_user_0.png"], f"image paths: {img_paths}"
+        # Image bytes match what we sent in (PNG signature).
+        img_bytes = zf.read("images/0_user_0.png")
+        assert img_bytes.startswith(b"\x89PNG\r\n\x1a\n"), "image bytes don't have PNG signature"
+        assert base64.b64encode(img_bytes).decode() == _TINY_PNG_BASE64, \
+            "image bytes don't match the original base64"
+        # JSONL references the relative path, NOT a data: URL.
+        jsonl_name = next(n for n in names if n.endswith(".jsonl"))
+        rec = json.loads(zf.read(jsonl_name).decode().splitlines()[0])
+        user_content = rec["messages"][0]["content"]
+        assert isinstance(user_content, list), f"multimodal user content not array: {user_content}"
+        types = [p["type"] for p in user_content]
+        assert types == ["text", "image_url"], f"types: {types}"
+        url = user_content[1]["image_url"]["url"]
+        assert url == "images/0_user_0.png", f"url not rewritten to relative path: {url}"
+        # User's typed text only (no `[Attached: ...]` preamble — image-only attachments
+        # don't produce that header on the way in either).
+        assert user_content[0]["text"] == "describe", f"text part: {user_content[0]['text']!r}"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("export ZIP: PDF/text attachment body is inlined into the JSON text part")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "zip-pdf", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        r = client.post(f"/api/conversations/{c['id']}/chat", json={
+            "message": "What's the password?",
+            "persist": True,
+            "attachments": [{
+                "name": "secret.pdf", "kind": "pdf",
+                "text": "TOP_SECRET=BLUEFOX42", "page_count": 1,
+                "char_count": 19, "truncated": False,
+            }],
+        })
+        assert r.status_code == 200, r.text
+        r = client.get(f"/api/conversations/{c['id']}/export.zip")
+        assert r.status_code == 200, r.text
+        zf = _zipfile.ZipFile(io.BytesIO(r.content))
+        names = zf.namelist()
+        # No images/ entries — PDF is text-only.
+        assert not any(n.startswith("images/") for n in names), names
+        jsonl_name = next(n for n in names if n.endswith(".jsonl"))
+        rec = json.loads(zf.read(jsonl_name).decode().splitlines()[0])
+        # Text-only → user content is a string. The PDF body lives inline so
+        # the trainer sees what the model actually saw at training time.
+        user_content = rec["messages"][0]["content"]
+        assert isinstance(user_content, str), f"expected string, got {type(user_content)}"
+        assert "[Attached: secret.pdf]" in user_content
+        assert "TOP_SECRET=BLUEFOX42" in user_content
+        assert "What's the password?" in user_content
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("export ZIP: filename uses sanitized conversation title")
+def _():
+    cid = _seed_conv_with_turn("zip / filename:dirty?title")
+    try:
+        r = client.get(f"/api/conversations/{cid}/export.zip")
+        assert r.status_code == 200, r.text
+        cd = r.headers.get("content-disposition", "")
+        # Original title had spaces and punctuation — must be flattened.
+        assert "filename=" in cd
+        # Extract just the filename portion.
+        m = re.search(r'filename="([^"]+)"', cd)
+        assert m, f"no filename in Content-Disposition: {cd}"
+        fname = m.group(1)
+        for ch in (" ", "/", ":", "?"):
+            assert ch not in fname, f"unsafe char {ch!r} in filename: {fname!r}"
+        assert fname.endswith(".zip")
+        # JSONL inside should have the same stem.
+        zf = _zipfile.ZipFile(io.BytesIO(r.content))
+        stem = fname[:-4]
+        assert f"{stem}.jsonl" in zf.namelist(), f"JSONL doesn't match zip stem: {zf.namelist()}"
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("export ZIP: 404 on missing conversation")
+def _():
+    r = client.get("/api/conversations/999999/export.zip")
+    assert r.status_code == 404, r.text
+
+
+# We need `re` and `base64` for the zip tests (the tests reference _TINY_PNG_BASE64
+# defined further down in the multimodal section, so the import order is fine).
+import re  # noqa: E402, F811
+import base64  # noqa: E402, F811
 
 
 @test("per-conv /chat: include_history=true replays saved turns to the model")
