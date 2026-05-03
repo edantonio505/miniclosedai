@@ -716,8 +716,9 @@ PATCH  /api/conversations/{id}                    → update any subset of field
 DELETE /api/conversations/{id}                    → delete
 POST   /api/conversations/{id}/clear              → wipe messages, keep config
 PATCH  /api/conversations/{id}/messages/{index}   → edit a stored message in place
-GET    /api/conversations/{id}/export.csv         → download this chat as an SFT CSV (text-only)
-GET    /api/conversations/{id}/export.zip         → download as JSONL + images bundle (multimodal SFT)
+GET    /api/conversations/{id}/export.csv             → download this chat as an SFT CSV (text-only)
+GET    /api/conversations/{id}/export.zip             → JSONL + images bundle (multimodal SFT)
+GET    /api/conversations/{id}/export.classify.zip    → image-classification dataset (image,label CSV + images/)
 ```
 
 **Create** — supply any subset of config fields. `backend_id` defaults to `1` (built-in Ollama); set it to pin the bot to an OpenAI-compatible endpoint you registered in Settings.
@@ -816,6 +817,47 @@ ds = load_dataset("json", data_files="mybot/mybot.jsonl", features=...)
 ```
 
 Or with OpenAI fine-tuning — pass the JSONL straight to `client.files.create(..., purpose="fine-tune")`.
+
+**GET `.../export.classify.zip`** — image-classification dataset. ZIP layout:
+
+```
+<title>.csv               two columns: image,label
+images/<i>_user_<j>.<ext> one entry per image attached to a user turn
+```
+
+For data-labeling workflows. The system prompt holds your labeling instructions ("answer 'drunk' or 'sober'", "return JSON with bbox + class", etc.); each user turn uploads an image (or a few); each assistant reply is the label. This export keeps only the image-label pair — **the user's typed text alongside the image is ignored**, and pairs that don't have any image attachment are skipped entirely.
+
+```
+image,label
+images/0_user_0.png,drunk
+images/1_user_0.png,sober
+images/2_user_0.png,sober
+images/2_user_1.png,sober
+```
+
+- **One row per image.** When a single user turn carries multiple images and one assistant reply, every image gets its own row sharing the same label — same way a labeling tool would handle a batch tag.
+- **Image filenames match the JSONL ZIP's** (`<pair-idx>_user_<img-idx>.<ext>`), so you can unzip both the multimodal SFT bundle and the classification bundle into the same folder if you want both representations of the same data.
+- **Filename ends in `-classification.zip`** so it doesn't collide with the multimodal SFT ZIP.
+
+```bash
+curl -o labels.zip http://localhost:8095/api/conversations/3/export.classify.zip
+unzip -l labels.zip
+# images/0_user_0.png
+# images/1_user_0.png
+# mybot.csv
+```
+
+```python
+# pandas + ImageFolder-style training pipelines consume it directly
+import pandas as pd, zipfile
+
+with zipfile.ZipFile("labels.zip") as zf:
+    zf.extractall("./labels")
+df = pd.read_csv("./labels/mybot.csv")
+df["label"].value_counts()
+# drunk    142
+# sober    138
+```
 
 ### Chat
 
@@ -1504,6 +1546,51 @@ with zipfile.ZipFile("mybot.zip") as zf:
     zf.extractall("./mybot")
 ds = Dataset.from_json("./mybot/mybot.jsonl")
 print(ds[0])
+```
+
+### What's in the classification ZIP (data-labeling workflow)
+
+Pick **Image classification (ZIP)** in the download popover when the bot is acting as a labeler — i.e. its job is to classify each uploaded image. Typical setup:
+
+1. **System prompt** holds the labeling instructions:
+   > Look at each image. Answer with exactly one word: `drunk` if the person appears intoxicated, `sober` otherwise. No explanations.
+2. **Each user turn** uploads one (or a few) images. You can type something or not — the typed text is ignored at export time.
+3. **Each assistant reply** is the label — `drunk` / `sober`, a JSON tag, a bounding box, whatever the system prompt asks for.
+4. **Edit any wrong label** with the pencil icon before downloading. Edits are exported as the canonical label.
+
+When you click **Image classification (ZIP)** in the download popover, you get:
+
+```
+mybot-classification.zip
+├── mybot.csv                 image,label
+└── images/
+    ├── 0_user_0.png          first labeled image
+    ├── 1_user_0.png
+    └── 2_user_0.jpg
+```
+
+```
+image,label
+images/0_user_0.png,drunk
+images/1_user_0.png,sober
+images/2_user_0.jpg,drunk
+```
+
+Differences from the multimodal SFT ZIP:
+
+- **Only image-bearing pairs make it in.** Text-only conversations export an empty CSV.
+- **Multi-image turns produce one row per image**, all sharing the same label — what a labeler in a real annotation tool expects.
+- **The user's typed text is dropped.** Two reasons: the model already saw it at label time, and a classification dataset's `image → label` mapping shouldn't be polluted with text inputs that won't exist at inference time.
+
+The image filenames are stable across both ZIP exports (multimodal SFT and classification), so you can unzip both into the same folder and have the JSONL records and the CSV index pointing at the same image files.
+
+```python
+# pandas + Pillow / torchvision / sklearn / HuggingFace ImageFolder all consume this
+import pandas as pd, zipfile
+with zipfile.ZipFile("mybot-classification.zip") as zf:
+    zf.extractall("./labels")
+df = pd.read_csv("./labels/mybot.csv")
+print(df["label"].value_counts())
 ```
 
 ### Full workflow example

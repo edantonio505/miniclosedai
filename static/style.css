@@ -9,6 +9,7 @@
   --bg:            #ffffff;
   --bg-elev-1:     #fafafa;
   --bg-elev-2:     #f4f4f5;
+  --bg-deep:       #e8e8eb;            /* subtle "sunken" surface — chips, code blocks, tooltips */
   --panel:         #ffffff;
   --panel-subtle:  #fafafa;
   --panel-hover:   #f5f5f5;
@@ -43,6 +44,7 @@
   --shadow-lg: 0 16px 32px -12px rgba(0, 0, 0, 0.12), 0 4px 10px -4px rgba(0, 0, 0, 0.06);
 
   --r-sm:    6px;
+  --r-md:    8px;
   --r:      10px;
   --r-lg:   14px;
   --r-xl:   20px;
@@ -66,6 +68,7 @@
   --bg:            #0b0b0d;
   --bg-elev-1:     #131316;
   --bg-elev-2:     #1a1a1e;
+  --bg-deep:       #07070a;            /* deeper than --bg — chips, code blocks, tooltips */
   --panel:         #131316;
   --panel-subtle:  #17171b;
   --panel-hover:   #1c1c21;
@@ -673,6 +676,113 @@ textarea {
   height: 18px;
 }
 
+/* =====================================================================
+   Download tray icon — menu trigger with chevron, hover tooltip, and
+   "pressed" state while the popover is open.
+   ===================================================================== */
+
+/* Replaces the round 34×34 .icon-btn shape — the menu trigger is wider so
+   the chevron sits naturally next to the tray icon without crowding. */
+.icon-btn-menu {
+  width: auto;
+  padding: 0 6px 0 8px;
+  gap: 2px;
+  position: relative;   /* anchors the data-tooltip pseudo-element */
+}
+.icon-btn-menu .icon-btn-main {
+  width: 18px;
+  height: 18px;
+}
+.icon-btn-menu .icon-btn-caret {
+  width: 12px;
+  height: 12px;
+  opacity: 0.5;
+  transition: opacity var(--t-fast), transform var(--t-fast);
+}
+.icon-btn-menu:hover .icon-btn-caret {
+  opacity: 1;
+}
+/* Rotate the caret while the menu is open so the affordance flips
+   to "click again to close." Hooked off aria-expanded for accessibility-
+   friendly state tracking — same attribute the JS already toggles. */
+.icon-btn-menu[aria-expanded="true"] .icon-btn-caret {
+  opacity: 1;
+  transform: rotate(180deg);
+}
+/* "Pressed" state while the popover is showing — gives the trigger a
+   visible anchor so the menu doesn't look like it's floating in space. */
+.icon-btn-menu[aria-expanded="true"] {
+  background: var(--panel-hover);
+  color: var(--text);
+}
+
+/* =====================================================================
+   Custom hover tooltip — used by every icon-bearing control in the
+   header + composer. Shared visual language so they all feel the same.
+   Shows immediately (no `title`-attribute 1-second delay), positioned
+   below the trigger by default and above on `data-tooltip-side="top"`
+   (for composer buttons that sit at the bottom of the viewport).
+   ===================================================================== */
+[data-tooltip] {
+  position: relative;
+}
+[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  /* Center under the trigger by default. Works for header icons regardless
+     of where they sit horizontally; the rightmost button's tooltip may
+     extend slightly past the right edge but won't get clipped because
+     overflow on the topbar isn't hidden. */
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translate(-50%, -2px);
+  white-space: nowrap;
+  /* High-contrast inverted color scheme — industry-standard tooltip pattern.
+     `--text` and `--bg` are inverses in every theme, so this gives a near-
+     black bubble with white text in light mode, near-white bubble with dark
+     text in dark mode. Always solid, always readable. */
+  background: var(--text);
+  color: var(--bg);
+  border: none;
+  padding: 5px 9px;
+  border-radius: var(--r-md);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.3;
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--t-fast), transform var(--t-fast);
+  /* Sit above EVERYTHING — popovers (z-index 900), modals are at 1000+
+     but tooltips don't appear inside open modals here so the conflict
+     doesn't happen in practice. */
+  z-index: 9999;
+}
+[data-tooltip]:hover::after,
+[data-tooltip]:focus-visible::after {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+/* Composer buttons sit at the bottom edge of the viewport — flip the
+   tooltip above so it doesn't fall off the screen / fight the input area. */
+[data-tooltip][data-tooltip-side="top"]::after {
+  top: auto;
+  bottom: calc(100% + 6px);
+  transform: translate(-50%, 2px);
+}
+[data-tooltip][data-tooltip-side="top"]:hover::after,
+[data-tooltip][data-tooltip-side="top"]:focus-visible::after {
+  transform: translate(-50%, 0);
+}
+
+/* Don't show the trigger's tooltip while its popover is OPEN — the
+   menu items have clearer labels in that state. */
+[data-tooltip][aria-expanded="true"]::after {
+  opacity: 0 !important;
+  pointer-events: none;
+}
+
 /* Download-format popover (CSV vs JSONL+ZIP) anchored to the tray icon. */
 .download-wrap {
   position: relative;
@@ -717,9 +827,23 @@ textarea {
   color: var(--text);
   width: 100%;
   font-size: 13px;
+  transition: background var(--t-fast), color var(--t-fast);
 }
-.download-menu-item:hover {
-  background: var(--bg-deep);
+.download-menu-item:hover,
+.download-menu-item:focus-visible {
+  /* Accent-tinted hover so the row clearly lights up against the white
+     popover panel. Falls back to a deeper grey on platforms / themes
+     where --accent-soft might be near-transparent. */
+  background: var(--accent-soft);
+  color: var(--text);
+  outline: none;
+}
+.download-menu-item:hover strong,
+.download-menu-item:focus-visible strong {
+  color: var(--accent);
+}
+.download-menu-item:active {
+  background: var(--accent-ring);
 }
 .download-menu-item strong {
   font-weight: 600;

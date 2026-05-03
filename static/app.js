@@ -1647,17 +1647,24 @@ async function clearCurrentConversation() {
   els.input.focus();
 }
 
-// Two export formats are available — see /api/conversations/{id}/export.csv
-// and .../export.zip. The icon button opens a small popover; clicking either
-// menu item triggers the corresponding download via Content-Disposition.
+// Three export formats are available — see /api/conversations/{id}/export.csv,
+// .../export.zip, and .../export.classify.zip. The icon button opens a small
+// popover; clicking any menu item triggers the corresponding download via
+// Content-Disposition.
+const _DOWNLOAD_PATHS = {
+  csv:      "export.csv",            // text-only input,output CSV
+  zip:      "export.zip",            // multimodal SFT (JSONL + images)
+  classify: "export.classify.zip",   // image-classification (CSV + images)
+};
+
 function _downloadCurrentConversation(format) {
   if (!state.conversationId) {
     alert("Save at least one exchange to this conversation before exporting.");
     return;
   }
-  const ext = format === "zip" ? "zip" : "csv";
+  const path = _DOWNLOAD_PATHS[format] || _DOWNLOAD_PATHS.csv;
   const a = document.createElement("a");
-  a.href = `/api/conversations/${state.conversationId}/export.${ext}`;
+  a.href = `/api/conversations/${state.conversationId}/${path}`;
   a.rel = "noopener";
   document.body.appendChild(a);
   a.click();
@@ -1840,7 +1847,7 @@ function applyTheme(choice) {
   els.themeIconLight.style.display = choice === "light" ? "" : "none";
   els.themeIconDark.style.display = choice === "dark" ? "" : "none";
   els.themeIconSystem.style.display = choice === "system" ? "" : "none";
-  els.themeToggle.title = `Theme: ${choice} (click to cycle)`;
+  els.themeToggle.dataset.tooltip = `Theme: ${choice} (click to cycle)`;
 }
 
 function initTheme() {
@@ -1867,7 +1874,7 @@ const SIDEBAR_COLLAPSED_KEY = "miniclosedai:sidebarCollapsed";
 
 function applySidebarCollapsed(collapsed) {
   document.body.classList.toggle("sidebar-collapsed", collapsed);
-  els.sidebarToggle.title = collapsed ? "Show sidebar" : "Hide sidebar";
+  els.sidebarToggle.dataset.tooltip = collapsed ? "Show sidebar" : "Hide sidebar";
   els.sidebarToggle.setAttribute("aria-label", collapsed ? "Show sidebar" : "Hide sidebar");
 }
 

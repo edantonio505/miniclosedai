@@ -596,8 +596,9 @@ PATCH  /api/conversations/{id}                    → update any subset of field
 DELETE /api/conversations/{id}                    → delete
 POST   /api/conversations/{id}/clear              → wipe messages, keep config
 PATCH  /api/conversations/{id}/messages/{index}   → edit one stored message in place
-GET    /api/conversations/{id}/export.csv         → text-only SFT CSV (input,output)
-GET    /api/conversations/{id}/export.zip         → multimodal SFT bundle (JSONL + images)
+GET    /api/conversations/{id}/export.csv             → text-only SFT CSV (input,output)
+GET    /api/conversations/{id}/export.zip             → multimodal SFT bundle (JSONL + images)
+GET    /api/conversations/{id}/export.classify.zip    → image-classification dataset (image,label CSV + images/)
 ```
 
 **Create body**:
@@ -818,7 +819,7 @@ Every chat doubles as a curation surface for supervised fine-tuning (SFT). The w
 | UI control | What it does |
 |---|---|
 | ✏️ Pencil (top-right of each assistant bubble) | Inline editor. Textarea prefilled with the raw response (whitespace-trimmed for display). `Save` commits; `Cancel` / `Esc` aborts; `Ctrl/⌘+Enter` saves. Disabled while a stream is active. |
-| ⬇ Download icon (header, between Clear and Delete) | Click opens a popover with two formats: **Text CSV** (`<chat_title>.csv` — two columns, image attachments dropped) and **JSONL + images (ZIP)** (`<chat_title>.zip` — OpenAI-shaped JSONL records + an `images/` folder with the actual base64-decoded image bytes). Pick CSV for text-only datasets, ZIP for multimodal. |
+| ⬇ Download icon (header, between Clear and Delete) | Click opens a popover with three formats: **Text CSV** (`<chat_title>.csv` — two columns, image attachments dropped), **JSONL + images (ZIP)** (`<chat_title>.zip` — OpenAI-shaped JSONL records + base64-decoded images), and **Image classification (ZIP)** (`<chat_title>-classification.zip` — flat `image,label` CSV + images, for data-labeling workflows where the assistant labels each uploaded image). |
 
 Edits to user messages are intentionally not supported — the value of the dataset is in the **real prompts** you'd actually send in production. Only assistant outputs are rewriteable.
 
@@ -913,6 +914,47 @@ print(f"{len(records)} pairs; {sum(1 for n in zf.namelist() if n.startswith('ima
 zf.extractall("./mybot")
 from datasets import Dataset
 ds = Dataset.from_json("./mybot/mybot.jsonl")
+```
+
+### Image-classification ZIP shape (data-labeling workflow)
+
+A third export format optimized for *image classification / data labeling* — distinct from the multimodal SFT JSONL above. Use case: the system prompt holds your labeling instructions (`"Answer 'drunk' or 'sober'"`, `"Return JSON with bbox + class"`, etc.); each user turn uploads an image; each assistant reply is the label. The resulting dataset is a flat `(image, label)` table.
+
+```
+<title>-classification.zip
+├── <title>.csv               # two columns: image, label
+└── images/
+    ├── 0_user_0.png          # one entry per image attached to a user turn
+    └── 1_user_0.jpg
+```
+
+The CSV body looks like:
+
+```
+image,label
+images/0_user_0.png,drunk
+images/0_user_1.png,drunk
+images/1_user_0.jpg,sober
+```
+
+Implementation notes (from `api_export_conversation_classification_zip` in `app.py`):
+
+- **Pair-walking is shared with the other exporters** (`_iter_pairs`).
+- **Pairs without an image attachment are skipped entirely.** A text-only chat exports a CSV with the header row only — no spurious empty pairs.
+- **The user's typed text is dropped.** Two reasons: (a) the model already saw it at label time, (b) a classification dataset's `image → label` mapping shouldn't be polluted with text inputs that won't exist at inference time. (Use the multimodal SFT ZIP if you need the text preserved.)
+- **Multi-image turns produce one CSV row per image, all sharing the same label** — natural behavior for a labeler tagging a batch in one go. Image filenames use the same `<pair-idx>_user_<img-idx>.<ext>` scheme as the multimodal SFT ZIP, so both archives can be unzipped into the same folder if you want both representations of the same data.
+- **Filename ends `<title>-classification.zip`** (vs the SFT ZIP's `<title>.zip`) — both can be downloaded for the same conversation without overwriting each other.
+- **No external dependencies.** Stdlib `zipfile` + `csv` + `base64` + `re`.
+
+```python
+# Pandas / sklearn / torchvision / HuggingFace ImageFolder all consume this directly.
+import httpx, zipfile, io, pandas as pd
+
+zip_bytes = httpx.get("http://localhost:8095/api/conversations/3/export.classify.zip").content
+zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+zf.extractall("./labels")
+df = pd.read_csv(next(p for p in pathlib.Path("./labels").glob("*.csv")))
+print(df["label"].value_counts())
 ```
 
 ### From SFT to DPO

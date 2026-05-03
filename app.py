@@ -1007,6 +1007,97 @@ def api_export_conversation_zip(conv_id: int):
     )
 
 
+@app.get("/api/conversations/{conv_id}/export.classify.zip")
+def api_export_conversation_classification_zip(conv_id: int):
+    """Download this conversation as an image-classification dataset.
+
+    Use case: a vision-capable bot acting as a labeler. The system prompt
+    holds the labeling instructions ("answer 'drunk' or 'sober'", "return
+    JSON with bbox + class", etc.); each user turn uploads one or more
+    images; each assistant turn returns the label for those images. This
+    endpoint emits a flat CSV-of-(image, label) ready for `ImageFolder`-
+    style loaders, sklearn pipelines, or a training script's `pandas.read_csv`.
+
+    ZIP layout::
+
+        <title>.csv               two columns: image,label
+        images/<i>_user_<j>.<ext> one entry per image attached to a user turn
+
+    Rules:
+
+    - **Pairs without an image attachment are skipped.** Text-only pairs
+      aren't classification examples.
+    - **The user's typed text is ignored.** Only the image and the
+      assistant's reply form a row. (The bot already saw the user text at
+      label time; for the dataset, only `image → label` matters.)
+    - **Multi-image turns produce one row per image, sharing the same
+      label.** That's standard data-labeling behavior — when a labeler
+      tags a batch as "all drunk," the dataset wants one row per image.
+    - **Filename is `<sanitized-title>-classification.zip`** so it doesn't
+      collide with the multimodal SFT ZIP (`<title>.zip`) — both can be
+      downloaded for the same conversation without overwriting each other.
+
+    The image filenames + paths match the multimodal SFT ZIP's, so the two
+    archives can be unzipped into the same folder if you want both
+    representations of the same data.
+    """
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT title, messages FROM conversations WHERE id = ?", (conv_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Conversation not found")
+
+    messages = json.loads(row["messages"] or "[]")
+    safe_title = _safe_filename(row["title"], conv_id)
+
+    zip_buf = io.BytesIO()
+    csv_buf = io.StringIO()
+    writer = csv.writer(csv_buf)
+    writer.writerow(["image", "label"])
+
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for pair_idx, (user_msg, assistant_msg) in enumerate(_iter_pairs(messages)):
+            user_content_in = user_msg.get("content", "")
+            if not isinstance(user_content_in, list):
+                continue  # text-only pair → not a classification example
+
+            # The label is the assistant's text response, stripped of trailing
+            # whitespace. Could be "true" / "false" / a category / a JSON blob —
+            # we don't try to parse, that's the trainer's job.
+            label = _content_text_for_export(assistant_msg.get("content", "")).strip()
+
+            img_idx = 0
+            for p in user_content_in:
+                if not isinstance(p, dict) or p.get("type") != "image_url":
+                    continue
+                url = ((p.get("image_url") or {}).get("url")) or ""
+                m = re.match(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$", url, re.DOTALL)
+                if not m:
+                    continue
+                mime, b64 = m.group(1).lower(), m.group(2)
+                ext = _IMAGE_MIME_TO_EXT.get(mime, "bin")
+                try:
+                    raw = base64.b64decode(b64)
+                except Exception:
+                    continue
+                rel_path = f"images/{pair_idx}_user_{img_idx}.{ext}"
+                zf.writestr(rel_path, raw)
+                writer.writerow([rel_path, label])
+                img_idx += 1
+
+        # CSV last so it appears at the top of the listing.
+        zf.writestr(f"{safe_title}.csv", csv_buf.getvalue())
+
+    return Response(
+        content=zip_buf.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_title}-classification.zip"',
+        },
+    )
+
+
 # ---------- Chat (legacy generic endpoint — ChatRequest carries everything) ----------
 
 def _build_messages(req: ChatRequest) -> list[dict]:

@@ -1111,6 +1111,155 @@ import re  # noqa: E402, F811
 import base64  # noqa: E402, F811
 
 
+# ---- Image-classification export (third format: image,label CSV in a ZIP) ----
+
+@test("export classification: one image → one (image, label) CSV row + matching file")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "classify-one", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        # User attaches one image with some typed text. Fake assistant replies "Hello world!".
+        r = client.post(f"/api/conversations/{c['id']}/chat", json={
+            "message": "is this a drunk person?",
+            "persist": True,
+            "attachments": [{
+                "name": "tiny.png", "kind": "image", "mime": "image/png",
+                "data_url": _TINY_PNG_DATA_URL,
+            }],
+        })
+        assert r.status_code == 200, r.text
+
+        r = client.get(f"/api/conversations/{c['id']}/export.classify.zip")
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"] == "application/zip"
+        zf = _zipfile.ZipFile(io.BytesIO(r.content))
+        names = zf.namelist()
+        assert "images/0_user_0.png" in names, f"image file missing: {names}"
+        csv_name = next(n for n in names if n.endswith(".csv"))
+        import csv as _csv, io as _io
+        rows = list(_csv.reader(_io.StringIO(zf.read(csv_name).decode())))
+        assert rows[0] == ["image", "label"]
+        assert len(rows) == 2, f"expected 1 data row, got {len(rows) - 1}"
+        assert rows[1][0] == "images/0_user_0.png", f"image path mismatch: {rows[1][0]!r}"
+        assert rows[1][1] == "Hello world!", f"label: {rows[1][1]!r}"
+        # Bytes for the image actually match what was sent.
+        assert base64.b64encode(zf.read("images/0_user_0.png")).decode() == _TINY_PNG_BASE64
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("export classification: typed text is ignored — never appears in the CSV")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "classify-no-text", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        TYPED = "DROP TABLE users;-- THIS TEXT MUST NOT LEAK"
+        r = client.post(f"/api/conversations/{c['id']}/chat", json={
+            "message": TYPED,
+            "persist": True,
+            "attachments": [{
+                "name": "tiny.png", "kind": "image", "mime": "image/png",
+                "data_url": _TINY_PNG_DATA_URL,
+            }],
+        })
+        assert r.status_code == 200, r.text
+
+        r = client.get(f"/api/conversations/{c['id']}/export.classify.zip")
+        assert r.status_code == 200, r.text
+        zf = _zipfile.ZipFile(io.BytesIO(r.content))
+        csv_text = zf.read(next(n for n in zf.namelist() if n.endswith(".csv"))).decode()
+        assert TYPED not in csv_text, f"typed text leaked into classification CSV: {csv_text!r}"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("export classification: text-only pairs are skipped (no CSV rows, no images/)")
+def _():
+    cid = _seed_conv_with_turn("classify-textonly")
+    try:
+        # _seed_conv_with_turn produces one user→assistant text-only pair.
+        r = client.get(f"/api/conversations/{cid}/export.classify.zip")
+        assert r.status_code == 200, r.text
+        zf = _zipfile.ZipFile(io.BytesIO(r.content))
+        names = zf.namelist()
+        assert not any(n.startswith("images/") for n in names), \
+            f"text-only conv produced images/ entries: {names}"
+        csv_text = zf.read(next(n for n in names if n.endswith(".csv"))).decode()
+        # Header only — no data rows.
+        assert csv_text.strip() == "image,label", f"unexpected CSV body: {csv_text!r}"
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("export classification: filename uses <title>-classification.zip")
+def _():
+    cid = _seed_conv_with_turn("classify name")
+    try:
+        r = client.get(f"/api/conversations/{cid}/export.classify.zip")
+        assert r.status_code == 200, r.text
+        cd = r.headers.get("content-disposition", "")
+        m = re.search(r'filename="([^"]+)"', cd)
+        assert m, f"no filename in CD: {cd}"
+        fname = m.group(1)
+        assert fname.endswith("-classification.zip"), f"unexpected filename: {fname}"
+        # Doesn't collide with the SFT ZIP name.
+        assert fname != "classify_name.zip"
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("export classification: multi-image turn → one row per image, shared label")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "classify-multi", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        # Three images attached to one user turn — one labeling action covers all three.
+        r = client.post(f"/api/conversations/{c['id']}/chat", json={
+            "message": "label these",
+            "persist": True,
+            "attachments": [
+                {"name": f"a{i}.png", "kind": "image", "mime": "image/png",
+                 "data_url": _TINY_PNG_DATA_URL} for i in range(3)
+            ],
+        })
+        assert r.status_code == 200, r.text
+
+        r = client.get(f"/api/conversations/{c['id']}/export.classify.zip")
+        assert r.status_code == 200, r.text
+        zf = _zipfile.ZipFile(io.BytesIO(r.content))
+        names = zf.namelist()
+        # All three images present at predictable paths.
+        for j in range(3):
+            assert f"images/0_user_{j}.png" in names, f"image {j} missing: {names}"
+        csv_text = zf.read(next(n for n in names if n.endswith(".csv"))).decode()
+        import csv as _csv, io as _io
+        rows = list(_csv.reader(_io.StringIO(csv_text)))
+        assert rows[0] == ["image", "label"]
+        assert len(rows) == 4, f"expected 3 data rows for 3 images, got {len(rows) - 1}"
+        # All three rows share the same assistant-supplied label.
+        labels = {r[1] for r in rows[1:]}
+        assert labels == {"Hello world!"}, f"multi-image rows didn't share label: {labels}"
+        # Each row points at a distinct image path.
+        paths = [r[0] for r in rows[1:]]
+        assert paths == [
+            "images/0_user_0.png", "images/0_user_1.png", "images/0_user_2.png"
+        ], f"image paths not in pair-order: {paths}"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("export classification: 404 on missing conversation")
+def _():
+    r = client.get("/api/conversations/999999/export.classify.zip")
+    assert r.status_code == 404, r.text
+
+
 @test("per-conv /chat: include_history=true replays saved turns to the model")
 def _():
     """Without this, conversational bots (FAQ chat, Doctors Office Bot) forget

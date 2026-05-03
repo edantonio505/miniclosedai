@@ -36,7 +36,7 @@
   <div class="page page-dashboard">
   <header class="topbar">
     <div class="brand">
-      <button id="sidebar-toggle" class="icon-btn" title="Hide sidebar" aria-label="Hide sidebar">
+      <button id="sidebar-toggle" class="icon-btn" data-tooltip="Hide sidebar" aria-label="Hide sidebar">
         <!-- Feather: panel-left -->
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
       </button>
@@ -55,18 +55,19 @@
 
       <span class="divider-v"></span>
 
-      <button id="new-chat-btn" class="icon-btn" title="New chat" aria-label="New chat">
+      <button id="new-chat-btn" class="icon-btn" data-tooltip="New chat" aria-label="New chat">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
       </button>
 
-      <button id="clear-chat-btn" class="icon-btn" title="Clear messages (keep model + system prompt)" aria-label="Clear messages">
+      <button id="clear-chat-btn" class="icon-btn" data-tooltip="Clear messages (keep model + system prompt)" aria-label="Clear messages">
         <!-- Rotate-ccw: reset / start fresh -->
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
       </button>
 
       <div class="download-wrap">
-        <button id="download-csv-btn" class="icon-btn" title="Download this chat as a dataset" aria-label="Download dataset" aria-haspopup="menu" aria-expanded="false">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        <button id="download-csv-btn" class="icon-btn icon-btn-menu" data-tooltip="Download dataset · CSV, JSONL, or classification" aria-label="Download dataset" aria-haspopup="menu" aria-expanded="false">
+          <svg class="icon-btn-main" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <svg class="icon-btn-caret" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><path d="M7 10l5 5 5-5z"/></svg>
         </button>
         <div id="download-menu" class="download-menu" role="menu" hidden>
           <button type="button" class="download-menu-item" data-format="csv" role="menuitem">
@@ -77,21 +78,25 @@
             <strong>JSONL + images (ZIP)</strong>
             <span>Multimodal SFT bundle. Ready for HuggingFace, OpenAI fine-tune, axolotl, unsloth.</span>
           </button>
+          <button type="button" class="download-menu-item" data-format="classify" role="menuitem">
+            <strong>Image classification (ZIP)</strong>
+            <span>image,label CSV + images/. For data labeling — typed text is ignored, text-only pairs are skipped.</span>
+          </button>
         </div>
       </div>
 
-      <button id="delete-chat-btn" class="icon-btn" title="Delete conversation" aria-label="Delete conversation">
+      <button id="delete-chat-btn" class="icon-btn" data-tooltip="Delete conversation" aria-label="Delete conversation">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
       </button>
 
-      <button id="api-code-btn" class="btn btn-small" title="Get API integration code">
+      <button id="api-code-btn" class="btn btn-small" data-tooltip="Get API integration code">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
         API Code
       </button>
 
       <span class="divider-v"></span>
 
-      <button id="theme-toggle" class="icon-btn" title="Theme: system" aria-label="Toggle theme">
+      <button id="theme-toggle" class="icon-btn" data-tooltip="Theme: system" aria-label="Toggle theme">
         <svg id="theme-icon-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
         <svg id="theme-icon-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
         <svg id="theme-icon-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
@@ -208,7 +213,7 @@
 
       <div class="composer-wrap">
         <form id="chat-form" class="composer">
-          <button type="button" id="attach-btn" class="composer-attach-btn" title="Attach images, PDFs, or text files" aria-label="Attach file">
+          <button type="button" id="attach-btn" class="composer-attach-btn" data-tooltip="Attach images, PDFs, or text files" data-tooltip-side="top" aria-label="Attach file">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
           </button>
           <input id="attach-input" type="file" multiple hidden
@@ -218,10 +223,10 @@
             <div id="attachment-warning" class="attachment-warning" hidden></div>
             <textarea id="input" rows="1" placeholder="Message your model…"></textarea>
           </div>
-          <button type="submit" id="send-btn" class="btn btn-primary" title="Send (Enter)" aria-label="Send">
+          <button type="submit" id="send-btn" class="btn btn-primary" data-tooltip="Send (Enter)" data-tooltip-side="top" aria-label="Send">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
           </button>
-          <button type="button" id="stop-btn" class="btn" style="display:none" title="Stop generation" aria-label="Stop">
+          <button type="button" id="stop-btn" class="btn" style="display:none" data-tooltip="Stop generation" data-tooltip-side="top" aria-label="Stop">
             <svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
           </button>
         </form>
@@ -250,7 +255,7 @@
     <div class="modal">
       <div class="modal-header">
         <h3>API Integration Code</h3>
-        <button id="modal-close" class="icon-btn" title="Close" aria-label="Close">
+        <button id="modal-close" class="icon-btn" data-tooltip="Close" aria-label="Close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
@@ -281,7 +286,7 @@
     <div class="modal">
       <div class="modal-header">
         <h3 id="backend-modal-title">Add endpoint</h3>
-        <button id="backend-modal-close" class="icon-btn" title="Close" aria-label="Close">
+        <button id="backend-modal-close" class="icon-btn" data-tooltip="Close" aria-label="Close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
