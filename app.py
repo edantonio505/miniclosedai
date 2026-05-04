@@ -1709,6 +1709,33 @@ def _read_upgrade_progress() -> dict | None:
         return None
 
 
+def _running_in_docker() -> bool:
+    """Best-effort container detection across Linux/macOS/Windows hosts.
+
+    `/.dockerenv` is the classic signal but doesn't exist on every runtime
+    (notably some Docker Desktop + Compose setups on macOS, where the file
+    is absent inside the container). We add two more signals so the GUI
+    correctly classifies Docker installs and skips the in-place upgrade UI.
+    """
+    if Path("/.dockerenv").exists():
+        return True
+    try:
+        cg = Path("/proc/1/cgroup").read_text()
+        if "docker" in cg or "containerd" in cg or "kubepods" in cg:
+            return True
+    except OSError:
+        pass
+    if os.environ.get("MINICLOSEDAI_IN_DOCKER") == "1":
+        return True
+    return False
+
+
+_DOCKER_UPGRADE_REASON = (
+    "Docker installs upgrade with `docker compose pull && "
+    "docker compose up -d` from the host, not via this endpoint."
+)
+
+
 @app.get("/api/upgrade/status")
 def api_upgrade_status():
     """Read-only version + update-availability probe.
@@ -1718,7 +1745,7 @@ def api_upgrade_status():
     Falls back gracefully when the working tree isn't a git checkout (e.g.
     user downloaded a tarball) or when running inside Docker.
     """
-    in_docker = Path("/.dockerenv").exists()
+    in_docker = _running_in_docker()
     git_dir = _PROJECT_DIR / ".git"
 
     base = {
@@ -1737,10 +1764,7 @@ def api_upgrade_status():
             **base,
             "installed_via": "docker",
             "can_upgrade": False,
-            "reason": (
-                "Docker installs upgrade with `docker compose pull && "
-                "docker compose up -d` from the host, not via this endpoint."
-            ),
+            "reason": _DOCKER_UPGRADE_REASON,
         }
 
     if not git_dir.exists():
@@ -1822,6 +1846,13 @@ def api_upgrade_run(request: Request):
     The script writes progress to /tmp/miniclosedai-upgrade.json which the
     GUI polls via /api/upgrade/status.
     """
+    # Docker pre-check fires before the loopback firewall so a Docker user
+    # (whose container traffic enters as the bridge gateway IP, e.g.
+    # 172.18.0.1) gets the actionable "use docker compose pull" message
+    # instead of an unexplained 403.
+    if _running_in_docker():
+        raise HTTPException(status_code=409, detail=_DOCKER_UPGRADE_REASON)
+
     client_host = request.client.host if request.client else None
     if client_host not in ("127.0.0.1", "::1", "localhost"):
         raise HTTPException(

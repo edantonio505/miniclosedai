@@ -66,6 +66,11 @@ services:
     environment:
       OLLAMA_URL: "http://ollama:11434"
       MINICLOSEDAI_DB_PATH: "/app/data/miniclosedai.db"
+      # Belt-and-suspenders Docker signal — /.dockerenv and /proc/1/cgroup
+      # aren't reliable on every Docker Desktop runtime (notably macOS), so
+      # we tag the env explicitly. The /api/upgrade/* endpoints read this
+      # to skip the in-place upgrade UI for Docker installs.
+      MINICLOSEDAI_IN_DOCKER: "1"
     volumes:
       - miniclosedai_db:/app/data
     # 127.0.0.1 prefix = loopback only. Remove it to expose on LAN (no auth!).

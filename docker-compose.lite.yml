@@ -34,6 +34,11 @@ services:
       # the dashboard dropdown isn't permanently broken.
       MINICLOSEDAI_NO_OLLAMA: "1"
       MINICLOSEDAI_DB_PATH: "/app/data/miniclosedai.db"
+      # Tag the env as Docker so /api/upgrade/* routes the user to
+      # `docker compose pull` instead of the in-place upgrade UI. /.dockerenv
+      # and /proc/1/cgroup aren't reliable across all Docker runtimes (notably
+      # Docker Desktop on macOS), so we set this explicitly.
+      MINICLOSEDAI_IN_DOCKER: "1"
     volumes:
       - miniclosedai_db:/app/data
     # 127.0.0.1 prefix = loopback only. Remove it to expose on LAN (no auth!).

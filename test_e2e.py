@@ -1298,6 +1298,22 @@ def _():
     assert "loopback" in r.json().get("detail", "").lower()
 
 
+@test("upgrade run: Docker install returns helpful 409 before loopback 403")
+def _():
+    # Regression for the Mac+Docker bug: when the app runs inside a container,
+    # the client_host appears as the bridge gateway IP (e.g. 172.18.0.1), so
+    # the loopback firewall would fire 403 first and hide the actionable
+    # `docker compose pull` instructions. The Docker pre-check must run
+    # BEFORE the loopback check and return 409 with the documented reason.
+    import os
+    from unittest.mock import patch
+    with patch.dict(os.environ, {"MINICLOSEDAI_IN_DOCKER": "1"}):
+        r = client.post("/api/upgrade/run")
+    assert r.status_code == 409, f"expected 409 (Docker), got {r.status_code}: {r.text}"
+    detail = r.json().get("detail", "").lower()
+    assert "docker compose" in detail, f"missing docker compose hint: {detail}"
+
+
 @test("upgrade run: requires can_upgrade=True even from loopback")
 def _():
     # We can't easily fake `request.client.host = "127.0.0.1"` from inside
