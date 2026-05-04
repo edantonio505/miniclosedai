@@ -94,6 +94,11 @@
         API Code
       </button>
 
+      <button id="upgrade-badge" class="btn btn-small btn-upgrade" data-tooltip="Update available — click to upgrade" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px"><path d="M12 2v6m0 0l-3-3m3 3l3-3"/><path d="M3 12a9 9 0 0 0 9 9 9 9 0 0 0 9-9"/></svg>
+        <span id="upgrade-badge-count">·</span>
+      </button>
+
       <span class="divider-v"></span>
 
       <button id="theme-toggle" class="icon-btn" data-tooltip="Theme: system" aria-label="Toggle theme">
@@ -324,6 +329,23 @@
           <button type="submit" id="backend-save-btn" class="btn btn-primary btn-small">Save</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- Upgrade Modal — appears when /api/upgrade/status reports behind > 0 -->
+  <div id="upgrade-modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal upgrade-modal">
+      <div class="modal-header">
+        <h3 id="upgrade-modal-title">MiniClosedAI update</h3>
+        <button id="upgrade-modal-close" class="icon-btn" data-tooltip="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div id="upgrade-modal-body" class="upgrade-modal-body"></div>
+      <div class="upgrade-modal-actions">
+        <button type="button" id="upgrade-cancel-btn" class="btn btn-small">Cancel</button>
+        <button type="button" id="upgrade-run-btn" class="btn btn-primary btn-small">Run upgrade</button>
+      </div>
     </div>
   </div>
 

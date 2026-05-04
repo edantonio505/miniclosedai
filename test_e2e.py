@@ -1260,6 +1260,67 @@ def _():
     assert r.status_code == 404, r.text
 
 
+# ---- Self-upgrade endpoints ----
+
+@test("upgrade status: returns shape with current/latest SHAs + can_upgrade flag")
+def _():
+    # The repo we're testing against IS a git repo (the project's own checkout),
+    # so we can hit the real endpoint and assert on its structural shape.
+    r = client.get("/api/upgrade/status")
+    assert r.status_code == 200, r.text
+    j = r.json()
+    # Shape: every documented key is present, regardless of state.
+    for key in ("installed_via", "can_upgrade", "current_sha", "current_short",
+                "latest_sha", "latest_short", "behind", "dirty",
+                "latest_messages", "last_run"):
+        assert key in j, f"missing key in /api/upgrade/status: {key}"
+    assert j["installed_via"] in ("git", "docker", "unknown")
+    assert isinstance(j["behind"], int) and j["behind"] >= 0
+    assert isinstance(j["dirty"], bool)
+    assert isinstance(j["latest_messages"], list)
+    # can_upgrade is conjunction: behind > 0 AND not dirty AND git install.
+    if j["installed_via"] == "git" and j["behind"] > 0 and not j["dirty"]:
+        # Could be False if upgrade.sh is missing — but we ship it, so:
+        assert j["can_upgrade"] is True, f"expected can_upgrade with behind>0 + clean: {j}"
+    else:
+        assert j["can_upgrade"] is False, f"can_upgrade should be False here: {j}"
+
+
+@test("upgrade run: refuses non-loopback client (security check)")
+def _():
+    # FastAPI's TestClient sets request.client.host to "testclient" by default,
+    # which is NOT in the loopback allowlist — so the POST must bounce with
+    # 403 BEFORE any shell exec or even the can_upgrade check happens. This
+    # is the security guarantee: an HTTP caller from outside loopback cannot
+    # trigger the script under any circumstance.
+    r = client.post("/api/upgrade/run")
+    assert r.status_code == 403, f"expected 403, got {r.status_code}: {r.text}"
+    assert "loopback" in r.json().get("detail", "").lower()
+
+
+@test("upgrade run: requires can_upgrade=True even from loopback")
+def _():
+    # We can't easily fake `request.client.host = "127.0.0.1"` from inside
+    # TestClient without patching ASGI internals. Instead, exercise the
+    # mid-tier guard directly: call api_upgrade_status() in-process and
+    # assert that the can_upgrade conjunction matches the documented rules.
+    # (The full POST path is exercised manually + by the security test above.)
+    from app import api_upgrade_status
+    j = api_upgrade_status()
+    expected_ok = (
+        j["installed_via"] == "git"
+        and j["behind"] > 0
+        and not j["dirty"]
+        and j.get("reason") in (None, "")
+    )
+    if expected_ok:
+        assert j["can_upgrade"] is True, j
+    else:
+        assert j["can_upgrade"] is False, j
+        # And there's always a human-readable reason explaining why not.
+        assert j.get("reason"), f"can_upgrade=False but no reason: {j}"
+
+
 @test("per-conv /chat: include_history=true replays saved turns to the model")
 def _():
     """Without this, conversational bots (FAQ chat, Doctors Office Bot) forget

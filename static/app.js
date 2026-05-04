@@ -2558,6 +2558,295 @@ function startPullPoller() {
   _pullPollTimer = setInterval(_pollPullsOnce, 1000);
 }
 
+// =====================================================================
+// Self-upgrade — "Update available" badge + click-to-upgrade modal.
+// Backed by /api/upgrade/status (read-only) and /api/upgrade/run (loopback,
+// spawns upgrade.sh in a detached session).
+// =====================================================================
+
+const UPGRADE_PHASES = [
+  { key: "pulling",    label: "Pulling latest code from GitHub" },
+  { key: "installing", label: "Installing Python dependencies" },
+  { key: "restarting", label: "Restarting server" },
+  { key: "verifying",  label: "Verifying new server is healthy" },
+];
+
+let _upgradeStatus = null;
+let _upgradePollTimer = null;
+
+async function _fetchUpgradeStatus() {
+  try {
+    const r = await fetch("/api/upgrade/status", { cache: "no-store" });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+function _renderUpgradeBadge(status) {
+  const btn = document.getElementById("upgrade-badge");
+  const count = document.getElementById("upgrade-badge-count");
+  if (!btn || !count) return;
+  if (status && status.behind > 0) {
+    btn.hidden = false;
+    count.textContent = String(status.behind);
+    btn.dataset.tooltip = `${status.behind} commit${status.behind === 1 ? "" : "s"} behind — click to upgrade`;
+  } else {
+    btn.hidden = true;
+  }
+}
+
+function _renderUpgradeModalBody(status, opts = {}) {
+  const body = document.getElementById("upgrade-modal-body");
+  const runBtn = document.getElementById("upgrade-run-btn");
+  if (!body || !runBtn) return;
+  body.innerHTML = "";
+
+  if (opts.running) {
+    // ----- progress UI while the script is running -----
+    const last = (status && status.last_run) || {};
+    const phaseKey = last.state || "pulling";
+    const failed = phaseKey === "failed";
+    const done = phaseKey === "done";
+
+    const shaLine = document.createElement("div");
+    shaLine.className = "upgrade-shas";
+    shaLine.textContent = `${last.from_sha || status.current_short} → ${last.to_sha || status.latest_short}`;
+    body.appendChild(shaLine);
+
+    const progress = document.createElement("div");
+    progress.className = "upgrade-progress";
+    let crossedActive = false;
+    for (const phase of UPGRADE_PHASES) {
+      const step = document.createElement("div");
+      step.className = "upgrade-progress-step";
+      if (failed && phase.key === phaseKey) {
+        step.classList.add("failed");
+      } else if (done) {
+        step.classList.add("done");
+      } else if (phase.key === phaseKey) {
+        step.classList.add("active");
+        crossedActive = true;
+      } else if (!crossedActive) {
+        step.classList.add("done");
+      }
+      step.textContent = phase.label;
+      progress.appendChild(step);
+    }
+    body.appendChild(progress);
+
+    if (failed) {
+      const err = document.createElement("div");
+      err.className = "upgrade-error";
+      err.textContent = `Upgrade failed: ${last.error || "unknown error"}`;
+      body.appendChild(err);
+      const note = document.createElement("div");
+      note.style.color = "var(--text-muted)";
+      note.style.fontSize = "12px";
+      note.textContent = "Auto-rollback ran — your install is back on the previous version. See /tmp/miniclosedai-upgrade.log for details.";
+      body.appendChild(note);
+      runBtn.textContent = "Close";
+      runBtn.disabled = false;
+    } else if (done) {
+      const ok = document.createElement("div");
+      ok.className = "upgrade-success";
+      ok.textContent = `Upgraded ${last.from_sha} → ${last.to_sha}. Reloading…`;
+      body.appendChild(ok);
+      runBtn.disabled = true;
+    } else {
+      runBtn.disabled = true;
+      runBtn.textContent = "Upgrading…";
+    }
+    return;
+  }
+
+  // ----- pre-upgrade UI: show current → latest + diff list -----
+  if (!status) {
+    body.textContent = "Checking for updates…";
+    runBtn.disabled = true;
+    return;
+  }
+
+  if (status.installed_via === "docker") {
+    body.innerHTML = `
+      <p>Docker installs upgrade from the host shell, not from inside the container.</p>
+      <pre>docker compose pull
+docker compose up -d</pre>`;
+    runBtn.hidden = true;
+    return;
+  }
+
+  if (status.installed_via !== "git") {
+    body.innerHTML = `
+      <p>${status.reason || "This install isn't a git checkout — in-place upgrades aren't available."}</p>
+      <p>Re-clone from <code>https://github.com/edantonio505/miniclosedai.git</code> if you want one-click upgrades.</p>`;
+    runBtn.hidden = true;
+    return;
+  }
+
+  const shaLine = document.createElement("div");
+  shaLine.className = "upgrade-shas";
+  shaLine.textContent = `${status.current_short} → ${status.latest_short}  (${status.behind} commit${status.behind === 1 ? "" : "s"} behind)`;
+  body.appendChild(shaLine);
+
+  if (status.behind === 0) {
+    const ok = document.createElement("div");
+    ok.className = "upgrade-success";
+    ok.textContent = "You're already on the latest version.";
+    body.appendChild(ok);
+    runBtn.hidden = true;
+    return;
+  }
+
+  if (status.dirty) {
+    const warn = document.createElement("div");
+    warn.className = "upgrade-warning";
+    warn.innerHTML = "You have uncommitted changes. Commit, stash, or run <code>git checkout -- .</code> before upgrading. The upgrade button is disabled until your tree is clean.";
+    body.appendChild(warn);
+  }
+
+  if (status.latest_messages && status.latest_messages.length) {
+    const list = document.createElement("ul");
+    list.className = "upgrade-commit-list";
+    for (const msg of status.latest_messages) {
+      const li = document.createElement("li");
+      li.textContent = msg;
+      list.appendChild(li);
+    }
+    body.appendChild(list);
+  }
+
+  const note = document.createElement("div");
+  note.style.color = "var(--text-faint)";
+  note.style.fontSize = "11.5px";
+  note.style.marginTop = "10px";
+  note.innerHTML = `Or run <code>./upgrade.sh</code> from the project directory.`;
+  body.appendChild(note);
+
+  runBtn.hidden = false;
+  runBtn.textContent = "Run upgrade";
+  runBtn.disabled = !status.can_upgrade;
+}
+
+function _openUpgradeModal() {
+  document.getElementById("upgrade-modal-backdrop")?.classList.remove("hidden");
+  _renderUpgradeModalBody(_upgradeStatus);
+  // Refresh in the background in case it's been a while since the last poll.
+  _fetchUpgradeStatus().then(s => {
+    if (s) {
+      _upgradeStatus = s;
+      _renderUpgradeModalBody(s);
+    }
+  });
+}
+
+function _closeUpgradeModal() {
+  document.getElementById("upgrade-modal-backdrop")?.classList.add("hidden");
+  if (_upgradePollTimer) {
+    clearInterval(_upgradePollTimer);
+    _upgradePollTimer = null;
+  }
+}
+
+async function _runUpgrade() {
+  // Capture the target SHA so we know what to expect when polling.
+  const expectedSha = _upgradeStatus?.latest_short;
+  const fromSha = _upgradeStatus?.current_short;
+
+  let started = false;
+  try {
+    const r = await fetch("/api/upgrade/run", { method: "POST" });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${r.status}`);
+    }
+    started = true;
+  } catch (e) {
+    const body = document.getElementById("upgrade-modal-body");
+    if (body) {
+      body.innerHTML = `<div class="upgrade-error">Couldn't start upgrade: ${(e && e.message) || e}</div>`;
+    }
+    return;
+  }
+
+  // Render an "in progress" view immediately, even before the script writes
+  // its first state record. The script does that quickly but there's a tiny
+  // window where last_run is still null (or stale from a previous run).
+  _upgradeStatus = {
+    ..._upgradeStatus,
+    last_run: { state: "pulling", from_sha: fromSha, to_sha: expectedSha, error: null },
+  };
+  _renderUpgradeModalBody(_upgradeStatus, { running: true });
+
+  // Poll. Server can disappear briefly during restart — fetch errors are
+  // expected. When the server is back AND last_run.state === "done" AND
+  // current_sha matches the target, we cache-bust reload.
+  let pollCount = 0;
+  if (_upgradePollTimer) clearInterval(_upgradePollTimer);
+  _upgradePollTimer = setInterval(async () => {
+    pollCount += 1;
+    const s = await _fetchUpgradeStatus();
+    if (s) {
+      _upgradeStatus = s;
+      _renderUpgradeModalBody(s, { running: true });
+      const lr = s.last_run || {};
+      if (lr.state === "done" && (s.current_short === expectedSha || s.current_short === lr.to_sha)) {
+        clearInterval(_upgradePollTimer);
+        _upgradePollTimer = null;
+        // Force a cache-busted reload so fresh JS / CSS land too.
+        setTimeout(() => {
+          location.href = location.pathname + "?_ts=" + Date.now();
+        }, 800);
+      } else if (lr.state === "failed") {
+        clearInterval(_upgradePollTimer);
+        _upgradePollTimer = null;
+      }
+    }
+    // Safety cutoff: 90s ≈ pull + install + restart + verify even on slow boxes.
+    if (pollCount > 60) {
+      clearInterval(_upgradePollTimer);
+      _upgradePollTimer = null;
+    }
+  }, 1500);
+}
+
+function initUpgradeUI() {
+  const badge = document.getElementById("upgrade-badge");
+  const closeBtn = document.getElementById("upgrade-modal-close");
+  const cancelBtn = document.getElementById("upgrade-cancel-btn");
+  const runBtn = document.getElementById("upgrade-run-btn");
+  const backdrop = document.getElementById("upgrade-modal-backdrop");
+
+  if (badge) badge.addEventListener("click", _openUpgradeModal);
+  if (closeBtn) closeBtn.addEventListener("click", _closeUpgradeModal);
+  if (cancelBtn) cancelBtn.addEventListener("click", _closeUpgradeModal);
+  if (backdrop) backdrop.addEventListener("click", e => {
+    if (e.target === backdrop) _closeUpgradeModal();
+  });
+  if (runBtn) runBtn.addEventListener("click", () => {
+    // Reuses the same button as a "Close" affordance after a failed/done run.
+    if (runBtn.textContent === "Close") {
+      _closeUpgradeModal();
+      return;
+    }
+    _runUpgrade();
+  });
+
+  // Initial probe + light periodic refresh (every 10 min so a long-open tab
+  // notices new releases without hammering origin).
+  _fetchUpgradeStatus().then(s => {
+    _upgradeStatus = s;
+    _renderUpgradeBadge(s);
+  });
+  setInterval(() => {
+    _fetchUpgradeStatus().then(s => {
+      _upgradeStatus = s;
+      _renderUpgradeBadge(s);
+    });
+  }, 10 * 60 * 1000);
+}
+
 async function init() {
   initTheme();
   initSidebarToggle();
@@ -2572,6 +2861,7 @@ async function init() {
   initSuggestionChips();
   if (typeof initBackendsUI === "function") initBackendsUI();
   startPullPoller();
+  initUpgradeUI();
   els.input.addEventListener("input", autoGrowInput);
   await loadModels();
   await loadConversations();

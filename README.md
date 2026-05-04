@@ -1634,6 +1634,69 @@ That's the full curation story: start with demonstrations today; the preference-
 
 ---
 
+## Upgrading MiniClosedAI
+
+Two ways to pull the latest from `https://github.com/edantonio505/miniclosedai`. Both are safe — every upgrade snapshots the current commit and **auto-rolls back** if the new code fails to start within 15 seconds.
+
+### Option 1 — One click in the GUI
+
+When new commits are available on `main`, a small **"Update available"** badge appears in the header (between **API Code** and the theme toggle) showing the count of pending commits. Click it.
+
+The modal shows:
+- Current commit short-SHA → latest commit short-SHA
+- The list of commit subjects you'll pick up
+- A warning if your working tree has local changes (you'll need to commit, stash, or `git checkout -- .` first)
+- A primary **"Run upgrade"** button
+
+Clicking **Run upgrade** triggers `upgrade.sh` server-side in a detached shell session. The modal then walks the four phases live:
+
+```
+○ Pulling latest code from GitHub
+◌ Installing Python dependencies          ← active
+○ Restarting server
+○ Verifying new server is healthy
+```
+
+When verification passes, the page **auto-reloads with cache-bust** so fresh JS/CSS land too. If anything fails, the script automatically rolls back to the previous commit and the modal shows the rollback notice.
+
+The `POST /api/upgrade/run` endpoint is **loopback-only** by design — only `127.0.0.1` / `::1` callers can trigger upgrades. The status endpoint (`GET /api/upgrade/status`) is always safe to call.
+
+### Option 2 — Run `./upgrade.sh` from the terminal
+
+If you'd rather see the output stream past, just run the script directly:
+
+```bash
+cd miniclosedai
+./upgrade.sh
+```
+
+It does exactly the same thing the button does — pull, install deps, restart uvicorn, verify, auto-rollback on failure — and prints each step. Use this when you want to watch the upgrade in detail or when the GUI isn't available (server crashed, port conflict, fresh setup).
+
+### What happens if an upgrade breaks
+
+The script verifies the new server actually answers `/api/upgrade/status` within 15 seconds before declaring success. If it doesn't:
+
+1. The new uvicorn process is killed.
+2. `git reset --hard <previous-sha>` restores your previous code.
+3. `pip install -qr requirements.txt` reverts dependency versions if `requirements.txt` changed.
+4. The previous server is restarted on the same port.
+5. The modal shows the rollback notice with the previous SHA so you can investigate.
+
+Logs from the upgrade attempt land in `/tmp/miniclosedai-upgrade.log` for postmortem.
+
+### When the upgrade button isn't available
+
+Three reasons the button stays hidden / disabled:
+
+| Situation | What you'll see | How to fix |
+|---|---|---|
+| Already on latest | Badge hidden | Nothing to do |
+| Local uncommitted changes | Badge visible, button disabled, modal shows the warning | `git stash` (or commit / discard) first |
+| Docker install | Modal shows the `docker compose pull && up -d` command | Run that from the host, not from inside the container |
+| Tarball download (no `.git/`) | Modal explains in-place upgrades aren't available | Re-clone with git |
+
+---
+
 ## LAN access
 
 To use MiniClosedAI from your phone, a tablet, or another machine on the same network:
@@ -1749,7 +1812,8 @@ miniclosedai/
 ├── app.py                     # FastAPI routes (native + OpenAI-compat, multi-backend)
 ├── llm.py                     # Kind-dispatched client: Ollama + OpenAI-compat
 ├── db.py                      # SQLite schema + MINICLOSEDAI_DB_PATH env override
-├── requirements.txt           # fastapi, uvicorn, httpx  (that's all)
+├── requirements.txt           # fastapi, uvicorn, httpx, pypdf, python-multipart
+├── upgrade.sh                 # in-place upgrade: git pull + reinstall + restart with auto-rollback
 ├── static/
 │   ├── index.html             # Single-page UI (activity bar + Dashboard + Settings)
 │   ├── style.css              # Design system (light + dark)

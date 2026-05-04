@@ -783,6 +783,147 @@ textarea {
   pointer-events: none;
 }
 
+/* "Update available" badge in the header. Hidden until /api/upgrade/status
+   reports behind > 0; shows a small accent-tinted pill with a count. */
+.btn-upgrade {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent-soft);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 600;
+}
+.btn-upgrade:hover {
+  background: var(--accent);
+  color: #ffffff;
+  border-color: var(--accent);
+}
+.btn-upgrade #upgrade-badge-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  padding: 0 4px;
+  border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, 0.5);
+}
+.btn-upgrade:hover #upgrade-badge-count {
+  background: rgba(0, 0, 0, 0.18);
+  color: #ffffff;
+}
+
+/* Upgrade modal — body has a phase indicator while the script runs. */
+.upgrade-modal {
+  max-width: 540px;
+}
+.upgrade-modal-body {
+  padding: 16px 20px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
+}
+.upgrade-modal-body .upgrade-shas {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+.upgrade-modal-body .upgrade-commit-list {
+  list-style: none;
+  margin: 0;
+  padding: 8px 0;
+  border-top: 1px solid var(--divider);
+  border-bottom: 1px solid var(--divider);
+  max-height: 220px;
+  overflow-y: auto;
+}
+.upgrade-modal-body .upgrade-commit-list li {
+  padding: 3px 0;
+  color: var(--text);
+}
+.upgrade-modal-body .upgrade-commit-list li::before {
+  content: "• ";
+  color: var(--text-faint);
+}
+.upgrade-modal-body .upgrade-warning {
+  background: rgba(217, 119, 6, 0.08);
+  border: 1px solid rgba(217, 119, 6, 0.25);
+  color: var(--warn);
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  margin: 8px 0;
+  font-size: 12.5px;
+}
+.upgrade-modal-body .upgrade-error {
+  background: rgba(220, 38, 38, 0.08);
+  border: 1px solid rgba(220, 38, 38, 0.25);
+  color: var(--danger);
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  margin: 8px 0;
+  font-size: 12.5px;
+}
+.upgrade-modal-body .upgrade-success {
+  background: rgba(22, 163, 74, 0.08);
+  border: 1px solid rgba(22, 163, 74, 0.25);
+  color: var(--success);
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  margin: 8px 0;
+  font-size: 12.5px;
+}
+.upgrade-modal-body .upgrade-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 12px 0;
+}
+.upgrade-modal-body .upgrade-progress-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-faint);
+}
+.upgrade-modal-body .upgrade-progress-step.active {
+  color: var(--accent);
+  font-weight: 500;
+}
+.upgrade-modal-body .upgrade-progress-step.done {
+  color: var(--success);
+}
+.upgrade-modal-body .upgrade-progress-step.failed {
+  color: var(--danger);
+}
+.upgrade-modal-body .upgrade-progress-step::before {
+  content: "○";
+  display: inline-block;
+  width: 16px;
+  text-align: center;
+  font-size: 12px;
+}
+.upgrade-modal-body .upgrade-progress-step.active::before { content: "◌"; }
+.upgrade-modal-body .upgrade-progress-step.done::before   { content: "✓"; }
+.upgrade-modal-body .upgrade-progress-step.failed::before { content: "✗"; }
+.upgrade-modal-body code,
+.upgrade-modal-body pre {
+  font-family: var(--font-mono);
+  background: var(--bg-deep);
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+  font-size: 11.5px;
+}
+.upgrade-modal-body pre {
+  display: block;
+  padding: 10px 12px;
+  overflow-x: auto;
+  white-space: pre;
+}
+.upgrade-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 20px 16px;
+}
+
 /* Download-format popover (CSV vs JSONL+ZIP) anchored to the tray icon. */
 .download-wrap {
   position: relative;

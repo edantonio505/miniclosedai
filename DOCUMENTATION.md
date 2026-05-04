@@ -963,6 +963,75 @@ The `original_content` field means the database already contains preference trip
 
 ---
 
+## Self-upgrade
+
+Two surfaces for pulling the latest from GitHub: a CLI script (`upgrade.sh`) and a GUI button. The button is just a thin trigger over the script — the script is the source of truth, runs identically either way.
+
+### Architecture
+
+```
+[Browser]               [Server (uvicorn)]            [upgrade.sh]
+   │                          │                              │
+   ├─ click Update ──────▶    │                              │
+   │                          ├─ Popen([./upgrade.sh],       │
+   │  ◀── 202 ───────────     │     start_new_session=True)──▶ (own process group)
+   │                          │                              │
+   ├─ poll /status (1.5 s) ──▶│                              ├ git pull
+   │                          │   ◀── kill (SIGTERM) ────────┤
+   │                          ✗ (server dead)                ├ pip install
+   ├─ poll /status ────▶ ✗ (conn refused)                    │
+   ├─ poll /status ────▶ ✗ (conn refused)                    ├ nohup uvicorn ──▶ ✓ new server up
+   ├─ poll /status ────────────────────────────────────────────────▶ 200, current_sha = new_sha
+   │                                                                │
+   ├─ location.href = pathname + "?_ts=" + Date.now()  (cache-busted reload)
+```
+
+The script becomes its own process group via `setsid` (Python: `subprocess.Popen(start_new_session=True)`) so the SIGTERM that kills the old uvicorn doesn't kill the script that's mid-pull. The new uvicorn is spawned via `nohup … &; disown` so it survives the script exiting.
+
+### Endpoints
+
+| Route | Purpose | Safety |
+|---|---|---|
+| `GET  /api/upgrade/status` | Returns `{installed_via, current_sha, current_short, latest_sha, latest_short, behind, dirty, latest_messages, can_upgrade, reason, last_run}`. Read-only. Does a best-effort `git fetch` (10 s timeout — falls back to last-known origin if offline). | Always exposed. |
+| `POST /api/upgrade/run` | Spawns `upgrade.sh` detached. Returns 202 immediately with `{started, from_sha, to_sha}`. | **Loopback-only** — refuses with 403 if `request.client.host` isn't in `{127.0.0.1, ::1, localhost}`. Refuses with 409 if `can_upgrade=false`. |
+
+### Script states
+
+The script writes `/tmp/miniclosedai-upgrade.json` at every phase so the GUI can show meaningful progress without re-running git. Possible values for the `state` field:
+
+| State | Meaning |
+|---|---|
+| `pulling` | git fetch + ff-only pull in progress |
+| `installing` | `pip install -qr requirements.txt` |
+| `restarting` | killing old uvicorn + spawning new one |
+| `verifying` | polling `/api/upgrade/status` on the new server |
+| `done` | new server answered within the 15 s window — success |
+| `failed` | something broke; auto-rollback ran; install is back on `from_sha` |
+
+### Auto-rollback
+
+The script's last act before declaring success is to verify the new server actually answers `/api/upgrade/status`. If it doesn't within 15 seconds (30 polls × 0.5 s):
+
+1. Kill the new uvicorn process.
+2. `git reset --hard $PREV_SHA`.
+3. Reinstall the previous deps.
+4. Re-spawn uvicorn with the old code.
+5. Write `state: "failed"` with the error so the GUI can surface it.
+
+Logs of the failed attempt land in `/tmp/miniclosedai-upgrade.log` for postmortem.
+
+### Why loopback-only
+
+Even on a single-user playground, exposing "shell-exec via HTTP" to anything other than the local machine is a non-trivial blast-radius if the bind address ever changes (e.g. someone runs `--host 0.0.0.0` to share the GUI with their phone on the LAN — perfectly reasonable for chat, dangerous for upgrade). The 403 guard makes the policy explicit at the framework boundary instead of relying on bind config.
+
+The status endpoint is always exposed because reading version metadata is harmless and the GUI's "behind by N" badge needs to work over the LAN.
+
+### When the script is run directly vs from the GUI
+
+The script checks `MINICLOSEDAI_UPGRADE_VIA_GUI`: when set (the FastAPI `Popen` call sets it), it sleeps 1 s before doing anything heavy so the server has time to flush the 202 response before the script kills it. When run from a terminal (env var unset), it skips the sleep — there's no parent HTTP request to flush.
+
+---
+
 ## Database
 
 Single SQLite file `miniclosedai.db`, auto-created at startup. One table:
@@ -1017,7 +1086,8 @@ miniclosedai/
 ├── app.py                     # FastAPI routes (models, conversations, chat, SSE)
 ├── llm.py                     # Client: Ollama + OpenAI-compat, think support
 ├── db.py                      # SQLite schema + helpers (MINICLOSEDAI_DB_PATH override)
-├── requirements.txt           # fastapi, uvicorn, httpx
+├── requirements.txt           # fastapi, uvicorn, httpx, pypdf, python-multipart
+├── upgrade.sh                 # in-place upgrade with auto-rollback (CLI + GUI button trigger)
 ├── test_e2e.py                # 39-test single-file suite, no pytest
 ├── static/
 │   ├── index.html             # Single-page UI

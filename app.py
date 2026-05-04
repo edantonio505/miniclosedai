@@ -10,7 +10,9 @@ import base64
 import csv
 import io
 import json
+import os
 import re
+import subprocess
 import time
 import zipfile
 from contextlib import asynccontextmanager
@@ -18,7 +20,7 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -1663,6 +1665,197 @@ async def openai_list_models():
             }
             for r in rows
         ],
+    }
+
+
+# ---------- Self-upgrade ----------
+#
+# Two endpoints power the GUI's "Update available" badge + click-to-upgrade
+# flow. The actual work happens in `upgrade.sh` — these endpoints just
+# expose the current state and spawn the script in a detached session.
+#
+#   GET  /api/upgrade/status   → version metadata + last-run progress (safe)
+#   POST /api/upgrade/run      → loopback-only, fires the script (mutating)
+
+_PROJECT_DIR = Path(__file__).parent
+_UPGRADE_SCRIPT = _PROJECT_DIR / "upgrade.sh"
+_UPGRADE_PROGRESS_PATH = Path("/tmp/miniclosedai-upgrade.json")
+
+
+def _git_cmd(*args: str, timeout: float = 5.0) -> str:
+    """Run a git subcommand in the project root and return stdout-stripped.
+    Raises RuntimeError on non-zero exit so the status endpoint can degrade
+    gracefully instead of 500-ing on a missing remote / offline network.
+    """
+    result = subprocess.run(
+        ["git", *args],
+        cwd=_PROJECT_DIR,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed: {result.stderr.strip() or '(no stderr)'}"
+        )
+    return result.stdout.strip()
+
+
+def _read_upgrade_progress() -> dict | None:
+    """Latest progress record written by upgrade.sh, or None if no run yet."""
+    try:
+        return json.loads(_UPGRADE_PROGRESS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+@app.get("/api/upgrade/status")
+def api_upgrade_status():
+    """Read-only version + update-availability probe.
+
+    Safe to call as often as the UI wants — runs `git fetch` (best-effort,
+    times out at 10 s if offline) then a few cheap rev-parse / status calls.
+    Falls back gracefully when the working tree isn't a git checkout (e.g.
+    user downloaded a tarball) or when running inside Docker.
+    """
+    in_docker = Path("/.dockerenv").exists()
+    git_dir = _PROJECT_DIR / ".git"
+
+    base = {
+        "current_sha": None,
+        "current_short": None,
+        "latest_sha": None,
+        "latest_short": None,
+        "behind": 0,
+        "dirty": False,
+        "latest_messages": [],
+        "last_run": _read_upgrade_progress(),
+    }
+
+    if in_docker:
+        return {
+            **base,
+            "installed_via": "docker",
+            "can_upgrade": False,
+            "reason": (
+                "Docker installs upgrade with `docker compose pull && "
+                "docker compose up -d` from the host, not via this endpoint."
+            ),
+        }
+
+    if not git_dir.exists():
+        return {
+            **base,
+            "installed_via": "unknown",
+            "can_upgrade": False,
+            "reason": (
+                "Not a git checkout. Re-clone from "
+                "https://github.com/edantonio505/miniclosedai.git "
+                "to enable in-place upgrades."
+            ),
+        }
+
+    # Best-effort fetch so behind-count + latest messages reflect origin/main.
+    # Offline / DNS failures shouldn't break the endpoint — we just fall back
+    # to last-known-origin if fetch can't reach the remote.
+    try:
+        _git_cmd("fetch", "--quiet", "--prune", "origin", "main", timeout=10.0)
+    except Exception:
+        pass  # offline or other transient issue; continue with cached origin/main
+
+    try:
+        current_sha = _git_cmd("rev-parse", "HEAD")
+        current_short = _git_cmd("rev-parse", "--short", "HEAD")
+        try:
+            latest_sha = _git_cmd("rev-parse", "origin/main")
+            latest_short = _git_cmd("rev-parse", "--short", "origin/main")
+            behind = int(_git_cmd("rev-list", "--count", f"{current_sha}..{latest_sha}"))
+        except Exception:
+            latest_sha, latest_short, behind = current_sha, current_short, 0
+        dirty = bool(_git_cmd("status", "--porcelain"))
+        if behind > 0:
+            log = _git_cmd("log", "--pretty=%s", "-50", f"{current_sha}..{latest_sha}")
+            messages = [line for line in log.splitlines() if line.strip()]
+        else:
+            messages = []
+    except Exception as e:
+        return {
+            **base,
+            "installed_via": "git",
+            "can_upgrade": False,
+            "reason": f"git read failed: {e}",
+        }
+
+    can_upgrade = behind > 0 and not dirty and _UPGRADE_SCRIPT.exists()
+    reason = None
+    if behind == 0:
+        reason = "Already on the latest commit."
+    elif dirty:
+        reason = (
+            "Working tree has local changes. Commit, stash, or discard them "
+            "before upgrading."
+        )
+    elif not _UPGRADE_SCRIPT.exists():
+        reason = "upgrade.sh missing from the project root."
+
+    return {
+        "current_sha": current_sha,
+        "current_short": current_short,
+        "latest_sha": latest_sha,
+        "latest_short": latest_short,
+        "behind": behind,
+        "dirty": dirty,
+        "latest_messages": messages,
+        "last_run": _read_upgrade_progress(),
+        "installed_via": "git",
+        "can_upgrade": can_upgrade,
+        "reason": reason,
+    }
+
+
+@app.post("/api/upgrade/run")
+def api_upgrade_run(request: Request):
+    """Spawn upgrade.sh detached and return 202 immediately.
+
+    Loopback-only on principle — even though the app has no auth, mutating
+    "shell-exec from HTTP" surface should never be reachable from the LAN.
+    The script writes progress to /tmp/miniclosedai-upgrade.json which the
+    GUI polls via /api/upgrade/status.
+    """
+    client_host = request.client.host if request.client else None
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Upgrades only allowed from loopback (got client.host={client_host!r}).",
+        )
+
+    status = api_upgrade_status()
+    if not status["can_upgrade"]:
+        raise HTTPException(
+            status_code=409,
+            detail=status.get("reason") or "Upgrade not allowed in this state.",
+        )
+
+    if not _UPGRADE_SCRIPT.exists():
+        raise HTTPException(status_code=500, detail="upgrade.sh missing")
+
+    # Detach: new session means the script outlives this server process,
+    # which is critical because the script's job is to *kill* this server.
+    # stdin/out/err to DEVNULL so the script doesn't pin a closed pipe.
+    subprocess.Popen(
+        ["bash", str(_UPGRADE_SCRIPT)],
+        cwd=str(_PROJECT_DIR),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env={**os.environ, "MINICLOSEDAI_UPGRADE_VIA_GUI": "1"},
+    )
+
+    return {
+        "started": True,
+        "from_sha": status["current_short"],
+        "to_sha": status["latest_short"],
     }
 
 
