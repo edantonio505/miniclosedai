@@ -2,6 +2,14 @@
    MiniClosedAI — design system
    ===================================================================== */
 
+/* The HTML `hidden` attribute maps to UA `[hidden] { display: none }`, but
+   any author rule like `display: flex` on the same element wins the
+   same-specificity tie and silently un-hides it. JS that toggles
+   `el.hidden` is meaningless without this guard. */
+[hidden] {
+  display: none !important;
+}
+
 :root {
   /* --------- Light theme (defaults) --------- */
   color-scheme: light;
