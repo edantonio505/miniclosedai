@@ -1692,7 +1692,7 @@ Three reasons the button stays hidden / disabled:
 |---|---|---|
 | Already on latest | Badge hidden | Nothing to do |
 | Local uncommitted changes | Badge visible, button disabled, modal shows the warning | `git stash` (or commit / discard) first |
-| Docker install | Modal shows the `docker compose pull && up -d` command | Run that from the host, not from inside the container |
+| Docker install | Modal shows the `git pull && docker compose up -d --build` command | Run that from the host, not from inside the container (image tags are built from source — `docker compose pull` will fail with `pull access denied`) |
 | Tarball download (no `.git/`) | Modal explains in-place upgrades aren't available | Re-clone with git |
 
 ---

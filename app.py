@@ -1731,8 +1731,10 @@ def _running_in_docker() -> bool:
 
 
 _DOCKER_UPGRADE_REASON = (
-    "Docker installs upgrade with `docker compose pull && "
-    "docker compose up -d` from the host, not via this endpoint."
+    "Docker installs upgrade with `git pull && docker compose up -d --build` "
+    "from the host, not via this endpoint. (The image tags in this project are "
+    "built from source, not published to a registry, so `docker compose pull` "
+    "always fails with `pull access denied` — rebuild instead.)"
 )
 
 
@@ -1848,8 +1850,8 @@ def api_upgrade_run(request: Request):
     """
     # Docker pre-check fires before the loopback firewall so a Docker user
     # (whose container traffic enters as the bridge gateway IP, e.g.
-    # 172.18.0.1) gets the actionable "use docker compose pull" message
-    # instead of an unexplained 403.
+    # 172.18.0.1) gets the actionable rebuild message instead of an
+    # unexplained 403.
     if _running_in_docker():
         raise HTTPException(status_code=409, detail=_DOCKER_UPGRADE_REASON)
 

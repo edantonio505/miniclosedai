@@ -2670,9 +2670,9 @@ function _renderUpgradeModalBody(status, opts = {}) {
 
   if (status.installed_via === "docker") {
     body.innerHTML = `
-      <p>Docker installs upgrade from the host shell, not from inside the container.</p>
-      <pre>docker compose pull
-docker compose up -d</pre>`;
+      <p>Docker installs upgrade from the host shell, not from inside the container. The image tags in this project are built from source (not published to a registry), so <code>docker compose pull</code> won't work — rebuild instead:</p>
+      <pre>git pull
+docker compose up -d --build</pre>`;
     runBtn.hidden = true;
     return;
   }
