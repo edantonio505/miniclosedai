@@ -5,52 +5,10 @@ A tiny, 100%-local LLM playground. Chat with small Ollama models (1B–10B param
 Built with **FastAPI** (3 Python deps), vanilla JS, and SQLite. Runs on a laptop.
 
 <p align="center">
-  <img src="miniclsedai1.png"
+  <img src="docs/images/miniclsedai1.png"
        alt="MiniClosedAI — a saved Pikachu bot responding to a message, with system prompt and parameters visible in the sidebar"
        width="820">
   <br><em>A saved bot. The sidebar is the full control panel; the chat is the live test.</em>
-</p>
-
-<p align="center">
-  <img src="miniclosedai2.png"
-       alt="Sentiment classifier bot: a reasoning model's 'Thoughts' block is expanded above the final one-word answer ('positive')"
-       width="820">
-  <br><em>Reasoning models stream their chain-of-thought into a collapsible block, separate from the final answer.</em>
-</p>
-
-<p align="center">
-  <img src="miniclosedai3.png"
-       alt="API Integration Code modal with three toggle groups — Language, Mode, Style — showing the JavaScript / Non-streaming / OpenAI-compat variant pointed at this instance"
-       width="820">
-  <br><em>Every saved chat is a microservice. Copy the snippet as cURL, Python, or JavaScript — native or OpenAI-SDK-compatible.</em>
-</p>
-
-<p align="center">
-  <img src="miniclosedai4.png"
-       alt="Support Ticket Router bot: the sidebar shows the JSON-extraction system prompt and deterministic sampling params; the chat shows a real inbound ticket on the right and the assistant's pretty-printed, syntax-highlighted JSON response next to it"
-       width="820">
-  <br><em>The Support Ticket Router recipe in action. A real inbound ticket (top right) goes in; structured, pretty-printed, syntax-highlighted JSON comes out — ready for a downstream CRM, Linear, or Slack webhook to consume. Recipes for this and a sister <a href="#7-inbound-lead-qualifier--full-walkthrough">Lead Qualifier</a> bot are documented as standalone walkthroughs.</em>
-</p>
-
-<p align="center">
-  <img src="miniclosedai5.png"
-       alt="Sentiment classifier chat with the header's download icon hovered, showing the tooltip 'Download this chat as CSV (input,output)' — saves the conversation as a two-column SFT dataset"
-       width="820">
-  <br><em>Every chat doubles as a fine-tuning dataset. The download icon in the header exports the conversation as a two-column <code>input,output</code> CSV — edited assistant responses become the ideal targets, ready for SFT. See <a href="#curating-fine-tuning-data">Curating fine-tuning data</a>.</em>
-</p>
-
-<p align="center">
-  <img src="miniclosedai6.png"
-       alt="MiniClosedAI Settings page with three registered LLM endpoints: Ollama (built-in) at localhost:11434 showing 23 reachable models, LM Studio at 192.168.0.110:1234/v1 with 7 models and an API key set, and Bonsai at localhost:8080/v1 with 1 model — each card has Edit and (for non-built-in) Delete buttons"
-       width="820">
-  <br><em>Settings → LLM Endpoints. Register as many backends as you want: the built-in Ollama, an LM Studio instance on your LAN, and PrismML's 1-bit Bonsai server all coexist. Each card shows its kind, base URL, API-key status, and a live reachability count. Models from every reachable endpoint merge into one grouped dropdown on the Dashboard, OpenWebUI-style. See <a href="#connecting-lm-studio-and-other-openai-compatible-endpoints">Connecting LM Studio and other endpoints</a> and <a href="#adding-bonsai-prismmls-1-bit-8b--step-by-step">Adding Bonsai</a>.</em>
-</p>
-
-<p align="center">
-  <img src="miniclosedai7.png"
-       alt="Doctor's Office Bot chat running on qwen3:8b. The sidebar shows the system prompt with the 'Required-fields gate (HARD RULE)' section visible. The chat shows the bot asking for patient details, the user's one-shot info-dump reply ('Ed Johnson, 1989-02-23, (347) 853-8734, new patient. Routine checkup, any available provider. Morning works best...'), and the bot's response — a natural confirmation sentence followed by a fenced create_appointment JSON block rendered as a code block in the chat, containing patient, visit, insurance, and confirmation sub-objects"
-       width="820">
-  <br><em>A conversational bot that emits structured actions. The <a href="#9-doctors-office-chatbot--full-walkthrough">Doctor's Office Bot</a> replies in natural language during info gathering, then emits a fenced <code>create_appointment</code> JSON block the moment every required field is present. Downstream apps strip the fence and dispatch to the real scheduler. Works with <code>qwen3:8b</code> on Ollama — full system prompt, worked examples, and the load-bearing few-shot section in <a href="./Doctors%20Office%20Bot.md"><code>Doctors Office Bot.md</code></a>.</em>
 </p>
 
 ![stack](https://img.shields.io/badge/FastAPI-0.110+-009688) ![Ollama](https://img.shields.io/badge/Ollama-local-000000) ![license](https://img.shields.io/badge/license-MIT-blue)
@@ -449,6 +407,13 @@ Three independent toggles produce **12 snippet variants**:
 
 Copy button works on both HTTPS/localhost (via `navigator.clipboard`) and plain-HTTP LAN (falls back to `document.execCommand("copy")`).
 
+<p align="center">
+  <img src="docs/images/miniclosedai3.png"
+       alt="API Integration Code modal with three toggle groups — Language, Mode, Style — showing the JavaScript / Non-streaming / OpenAI-compat variant pointed at this instance"
+       width="820">
+  <br><em>Every saved chat is a microservice. Copy the snippet as cURL, Python, or JavaScript — native or OpenAI-SDK-compatible.</em>
+</p>
+
 ---
 
 ## Connecting LM Studio and other OpenAI-compatible endpoints
@@ -456,6 +421,13 @@ Copy button works on both HTTPS/localhost (via `navigator.clipboard`) and plain-
 MiniClosedAI ships with **Ollama as a built-in endpoint** and lets you register any number of additional **OpenAI-compatible** servers alongside it: [LM Studio](https://lmstudio.ai), [vLLM](https://docs.vllm.ai), `llama.cpp`'s `server` binary, [Text Generation WebUI](https://github.com/oobabooga/text-generation-webui)'s OpenAI extension, or the real OpenAI API itself if you want.
 
 Each saved conversation picks one endpoint + one model; the Dashboard's model dropdown groups everything into a single OpenWebUI-style `<optgroup>` picker so you can chat with a Qwen3.6 on LM Studio and a Llama3.2 on Ollama in separate tabs without swapping anything.
+
+<p align="center">
+  <img src="docs/images/miniclosedai6.png"
+       alt="MiniClosedAI Settings page with three registered LLM endpoints: Ollama (built-in) at localhost:11434 showing 23 reachable models, LM Studio at 192.168.0.110:1234/v1 with 7 models and an API key set, and Bonsai at localhost:8080/v1 with 1 model — each card has Edit and (for non-built-in) Delete buttons"
+       width="820">
+  <br><em>Settings → LLM Endpoints. The built-in Ollama, an LM Studio instance on your LAN, and PrismML's 1-bit Bonsai server all coexist. Each card shows its kind, base URL, API-key status, and a live reachability count.</em>
+</p>
 
 ### Adding LM Studio — step by step
 
@@ -522,7 +494,7 @@ Back on the Dashboard, open the model dropdown → there's a `Bonsai` optgroup w
 
 The per-conv microservice pattern applies unchanged: `POST /api/conversations/{id}/chat` is your Bonsai bot's stable callable URL, and the API Code modal emits cURL / Python / JavaScript snippets that point at it.
 
-**Ready-made Bonsai microservice recipe:** see **[`RAG Query Router.md`](./RAG%20Query%20Router.md)** for a complete system prompt, recommended settings, and Python integration code for a latency-critical query-classification bot that's purpose-built for Bonsai's speed profile. Covered in the Recipes section below as [#8 RAG query router](#8-rag-query-router-bonsai-paired--full-walkthrough).
+**Ready-made Bonsai microservice recipe:** see **[`RAG Query Router.md`](./docs/recipes/RAG%20Query%20Router.md)** for a complete system prompt, recommended settings, and Python integration code for a latency-critical query-classification bot that's purpose-built for Bonsai's speed profile. Covered in the Recipes section below as [#8 RAG query router](#8-rag-query-router-bonsai-paired--full-walkthrough).
 
 #### Notes and gotchas specific to Bonsai
 
@@ -539,6 +511,13 @@ The per-conv microservice pattern applies unchanged: `POST /api/conversations/{i
 - **Mix freely.** One bot on Ollama, another on LM Studio (different host on your LAN), a third on Bonsai, a fourth on vLLM — all callable from the same URL base.
 
 ### Reasoning models on LM Studio / vLLM
+
+<p align="center">
+  <img src="docs/images/miniclosedai2.png"
+       alt="Sentiment classifier bot: a reasoning model's 'Thoughts' block is expanded above the final one-word answer ('positive')"
+       width="820">
+  <br><em>Reasoning models stream their chain-of-thought into a collapsible block, separate from the final answer.</em>
+</p>
 
 The **Thinking** sidebar control translates as follows when a conversation is bound to an OpenAI-compatible endpoint:
 
@@ -1296,7 +1275,14 @@ No preamble, no praise, no code quoting.
 
 ---
 
-### 6. Support ticket router — [full walkthrough](./Support%20Ticket%20Router.md)
+### 6. Support ticket router — [full walkthrough](./docs/recipes/Support%20Ticket%20Router.md)
+
+<p align="center">
+  <img src="docs/images/miniclosedai4.png"
+       alt="Support Ticket Router bot: the sidebar shows the JSON-extraction system prompt and deterministic sampling params; the chat shows a real inbound ticket on the right and the assistant's pretty-printed, syntax-highlighted JSON response next to it"
+       width="820">
+  <br><em>A real inbound ticket (right) goes in; structured, pretty-printed, syntax-highlighted JSON comes out — ready for a downstream CRM, Linear, or Slack webhook to consume.</em>
+</p>
 
 Takes an inbound support message, returns a JSON blob that classifies `intent`, picks a `team`, assigns `urgency` (p0–p3), extracts `key_entities` (product areas, order IDs, error codes, dates), scores `sentiment`, and suggests a reply tone. Includes a `needs_human_review` escape hatch for low-confidence cases.
 
@@ -1318,11 +1304,11 @@ Takes an inbound support message, returns a JSON blob that classifies `intent`, 
 
 **Settings:** `qwen3:8b`, temperature `0.1`, Thinking `Off`, max_tokens `700`.
 
-**Archetype:** classify → route → extract → flag-for-human. The canonical LLM-as-decision-service pattern. Drop-in replacement for the rules-plus-regex ticket-triage scripts every support team has written three times. Full system prompt, example I/O, integration code, and variant ideas in **[`Support Ticket Router.md`](./Support%20Ticket%20Router.md)**.
+**Archetype:** classify → route → extract → flag-for-human. The canonical LLM-as-decision-service pattern. Drop-in replacement for the rules-plus-regex ticket-triage scripts every support team has written three times. Full system prompt, example I/O, integration code, and variant ideas in **[`Support Ticket Router.md`](./docs/recipes/Support%20Ticket%20Router.md)**.
 
 ---
 
-### 7. Inbound lead qualifier — [full walkthrough](./Inbound%20Lead%20Qualifier.md)
+### 7. Inbound lead qualifier — [full walkthrough](./docs/recipes/Inbound%20Lead%20Qualifier.md)
 
 B2B sibling of the ticket router. Takes an inbound prospect message (form-fill, email, chat), returns a JSON blob with a numeric `fit_score` (0–100), `intent`, `role_signal`, company-size and industry guesses, budget + timeline signals, and a routing decision that maps to CRM stages (`book_demo`, `send_pricing`, `escalate_to_AE`, etc.).
 
@@ -1349,11 +1335,11 @@ B2B sibling of the ticket router. Takes an inbound prospect message (form-fill, 
 
 **Settings:** `qwen3:8b`, temperature `0.1`, Thinking `Off`, max_tokens `900`.
 
-**Archetype:** adds a numeric scoring dimension on top of the ticket-router pattern, plus a first-match routing table stated in plain English. Great proof that an 8B local model is enough to replace a spreadsheet-and-two-contractors lead-triage process. Full system prompt, example I/O, `match`/`case` routing code, and four more schema variants (applicant screener, investor inbound, beta applicant, partnership inbound) in **[`Inbound Lead Qualifier.md`](./Inbound%20Lead%20Qualifier.md)**.
+**Archetype:** adds a numeric scoring dimension on top of the ticket-router pattern, plus a first-match routing table stated in plain English. Great proof that an 8B local model is enough to replace a spreadsheet-and-two-contractors lead-triage process. Full system prompt, example I/O, `match`/`case` routing code, and four more schema variants (applicant screener, investor inbound, beta applicant, partnership inbound) in **[`Inbound Lead Qualifier.md`](./docs/recipes/Inbound%20Lead%20Qualifier.md)**.
 
 ---
 
-### 8. RAG query router (Bonsai-paired) — [full walkthrough](./RAG%20Query%20Router.md)
+### 8. RAG query router (Bonsai-paired) — [full walkthrough](./docs/recipes/RAG%20Query%20Router.md)
 
 A latency-critical pre-router for retrieval-augmented QA systems. Every inbound user question hits this bot first; it returns a JSON decision telling the orchestrator whether to hit the cache, fire a fast LLM-only reply, run light RAG, run deep RAG, or ask the user a clarifying question. Designed specifically to be paired with **[Bonsai-8B](#adding-bonsai-prismmls-1-bit-8b--step-by-step)** — the 1-bit model's ~200 ms inference makes this classifier free on the hot path of every user turn, which is the difference between a router being usable and being a bottleneck.
 
@@ -1375,11 +1361,18 @@ A latency-critical pre-router for retrieval-augmented QA systems. Every inbound 
 
 **Settings:** `Bonsai-8B.gguf` on the Bonsai endpoint, **temperature `0.0`** (pure greedy — same question always routes the same way), Thinking `Off`, max_tokens `400`. Works equally well with `llama3.2:3b` or `gemma2:2b` on Ollama if you don't want to run a separate llama.cpp server.
 
-**Archetype:** *classify → decide → delegate*, not *classify → answer*. Differs from the ticket router / lead qualifier in that the output is an intermediate orchestration decision rather than an end-state record. Includes explicit handling for demonstrative pronouns ("how does this work?" → `ask_clarification` with a clarifying question) which is where small classifiers typically fail. Full system prompt, example I/O, Python `match/case` dispatcher, and five variant ideas (prompt-safety gatekeeper, agent-task decomposer, cache key canonicalizer, and more) in **[`RAG Query Router.md`](./RAG%20Query%20Router.md)**.
+**Archetype:** *classify → decide → delegate*, not *classify → answer*. Differs from the ticket router / lead qualifier in that the output is an intermediate orchestration decision rather than an end-state record. Includes explicit handling for demonstrative pronouns ("how does this work?" → `ask_clarification` with a clarifying question) which is where small classifiers typically fail. Full system prompt, example I/O, Python `match/case` dispatcher, and five variant ideas (prompt-safety gatekeeper, agent-task decomposer, cache key canonicalizer, and more) in **[`RAG Query Router.md`](./docs/recipes/RAG%20Query%20Router.md)**.
 
 ---
 
-### 9. Doctor's office chatbot — [full walkthrough](./Doctors%20Office%20Bot.md)
+### 9. Doctor's office chatbot — [full walkthrough](./docs/recipes/Doctors%20Office%20Bot.md)
+
+<p align="center">
+  <img src="docs/images/miniclosedai7.png"
+       alt="Doctor's Office Bot chat running on qwen3:8b. The sidebar shows the system prompt with the 'Required-fields gate (HARD RULE)' section visible. The chat shows the bot asking for patient details, the user's one-shot info-dump reply, and the bot's response — a natural confirmation sentence followed by a fenced create_appointment JSON block rendered as a code block in the chat, containing patient, visit, insurance, and confirmation sub-objects"
+       width="820">
+  <br><em>A conversational bot that emits structured actions. The bot replies in natural language during info gathering, then emits a fenced <code>create_appointment</code> JSON block the moment every required field is present. Downstream apps strip the fence and dispatch to the real scheduler.</em>
+</p>
 
 A front-of-house chatbot for a primary-care practice. Answers FAQs from an explicit knowledge base in the system prompt, collects appointment-booking details across multiple turns, detects red-flag symptoms and redirects to 911, routes prescription-refill requests to a nurse callback, and offers a human-transfer path on request. **Different archetype from the three routers above:** conversational state + **dual-mode output** — plain text on info-gathering turns, plus a fenced JSON action block on the turn it's ready to execute (booking, emergency redirect, refill request, human handoff).
 
@@ -1394,11 +1387,11 @@ A front-of-house chatbot for a primary-care practice. Answers FAQs from an expli
 
 **Settings:** `qwen3:8b` on Ollama, temperature `0.3`, Thinking `Off`, max_tokens `600`. The MiniClosedAI UI sends `include_history: true` automatically so the model sees every prior turn. **Do not use Bonsai-8B (1-bit) for this bot** — verified live on this repo that 1-bit quantization drops the conditional JSON emission even with the few-shot-patched prompt. 1-bit is for single-mode classifiers (RAG Query Router, Ticket Router); mixed-mode needs full-precision 7–9B.
 
-**Archetype:** *converse → gather → emit side effect*. Sits at the front door of a real website or patient portal. The bot is a chatbot for the user AND a microservice for your backend at the same time — dual-audience design. Includes hard guardrails (no medical advice, no policy invention, no prompt disclosure), a required-fields gate that prevents premature booking, and three load-bearing few-shot examples inside the system prompt (booking, red-flag, FAQ-out-of-scope) without which the JSON emission drops. Full system prompt, eight worked conversation examples (including an adversarial prompt-injection turn and an after-hours callback), Python session-state integration with regex-stripping of the fenced action block, and five domain variants (veterinary, dental, PT, mental-health, HVAC) in **[`Doctors Office Bot.md`](./Doctors%20Office%20Bot.md)**.
+**Archetype:** *converse → gather → emit side effect*. Sits at the front door of a real website or patient portal. The bot is a chatbot for the user AND a microservice for your backend at the same time — dual-audience design. Includes hard guardrails (no medical advice, no policy invention, no prompt disclosure), a required-fields gate that prevents premature booking, and three load-bearing few-shot examples inside the system prompt (booking, red-flag, FAQ-out-of-scope) without which the JSON emission drops. Full system prompt, eight worked conversation examples (including an adversarial prompt-injection turn and an after-hours callback), Python session-state integration with regex-stripping of the fenced action block, and five domain variants (veterinary, dental, PT, mental-health, HVAC) in **[`Doctors Office Bot.md`](./docs/recipes/Doctors%20Office%20Bot.md)**.
 
 ---
 
-### 10. Restaurant reservations bot — [full walkthrough](./Restaurant%20Reservations%20Bot.md)
+### 10. Restaurant reservations bot — [full walkthrough](./docs/recipes/Restaurant%20Reservations%20Bot.md)
 
 Same dual-mode archetype as the Doctor's Office Bot, applied to a sit-down restaurant's host stand. Answers FAQs from an explicit `RESTAURANT FACTS` block (hours, dress code, dietary, corkage, parking, cancellation policy), books / modifies / cancels reservations across multiple turns, hard-overrides any party of 9+ or private-event request to the events team, attaches a `kitchen_allergy_flag` to the reservation when the guest mentions celiac / anaphylaxis / "deathly allergic," and offers a human host transfer on request.
 
@@ -1413,11 +1406,11 @@ Same dual-mode archetype as the Doctor's Office Bot, applied to a sit-down resta
 
 **Settings:** `qwen3:8b` on Ollama, temperature `0.3`, Thinking `Off`, max_tokens `500`, `include_history: true`.
 
-**Archetype:** drop-in twin of the Doctor's Office Bot for hospitality. Same `=== BEGIN/END FACTS ===` source-of-truth pattern, same dual-mode output, same required-fields gate — plus a hardened **pre-confirmation checklist** (closed-day check, in-service-hours check, party-size 1–8, seating-bookable check, all-fields-present check, **explicit affirmative trigger**, JSON-or-no-confirmation) and four negative-path few-shot examples (Examples D/E/F/G — closed Monday with dog indoors, Sunday post-close, bar counter not bookable, partial gather with no trigger). The hardening was added after live testing showed `qwen3:8b` would otherwise sometimes confirm prematurely on a follow-up answer like "no allergies" instead of waiting for an explicit yes. Edit the facts block to point at your restaurant. Walkthrough in **[`Restaurant Reservations Bot.md`](./Restaurant%20Reservations%20Bot.md)**.
+**Archetype:** drop-in twin of the Doctor's Office Bot for hospitality. Same `=== BEGIN/END FACTS ===` source-of-truth pattern, same dual-mode output, same required-fields gate — plus a hardened **pre-confirmation checklist** (closed-day check, in-service-hours check, party-size 1–8, seating-bookable check, all-fields-present check, **explicit affirmative trigger**, JSON-or-no-confirmation) and four negative-path few-shot examples (Examples D/E/F/G — closed Monday with dog indoors, Sunday post-close, bar counter not bookable, partial gather with no trigger). The hardening was added after live testing showed `qwen3:8b` would otherwise sometimes confirm prematurely on a follow-up answer like "no allergies" instead of waiting for an explicit yes. Edit the facts block to point at your restaurant. Walkthrough in **[`Restaurant Reservations Bot.md`](./docs/recipes/Restaurant%20Reservations%20Bot.md)**.
 
 ---
 
-### 11. Hotel reservations bot — [full walkthrough](./Hotel%20Reservations%20Bot.md)
+### 11. Hotel reservations bot — [full walkthrough](./docs/recipes/Hotel%20Reservations%20Bot.md)
 
 Same dual-mode archetype, applied to a boutique hotel's reservations chat. Answers FAQs from an explicit `HOTEL FACTS` block (check-in/out, room types, rates, pet policy, parking, cancellation), books / modifies / cancels stays of any length, hard-overrides group blocks of 5+ rooms / weddings / conferences / buyouts / negotiated corporate rates to the sales team, and refuses to accept a credit-card number in chat — payment happens on the secure confirmation page after the inquiry is saved. (Stay length is intentionally NOT a routing trigger — a single guest booking 17 nights goes through the normal flow.)
 
@@ -1433,11 +1426,11 @@ Same dual-mode archetype, applied to a boutique hotel's reservations chat. Answe
 
 **Settings:** `qwen3:8b` on Ollama, temperature `0.3`, Thinking `Off`, max_tokens `600`, `include_history: true`.
 
-**Archetype:** same skeleton as the other conversational recipes, with one extra hard rule worth noting: **never accept card details in chat.** A real PMS hands payment off to a tokenized confirmation page — the bot's job is to capture the inquiry and refuse the card. The bot also runs a hardened **pre-confirmation checklist** (room-type-in-rate-card, occupancy-fits, pet/smoking, group-block routing, no-card-in-chat, all-fields-present, **explicit affirmative trigger**, JSON-or-no-confirmation) and ships with five negative-path few-shot examples (D/E/F/G/H — invalid room + over-occupancy, card refusal, group-block routing, long-stay-books-normally, partial gather with no trigger). Stay length is **not** a routing trigger — a single guest booking 17 nights books normally. Walkthrough in **[`Hotel Reservations Bot.md`](./Hotel%20Reservations%20Bot.md)**.
+**Archetype:** same skeleton as the other conversational recipes, with one extra hard rule worth noting: **never accept card details in chat.** A real PMS hands payment off to a tokenized confirmation page — the bot's job is to capture the inquiry and refuse the card. The bot also runs a hardened **pre-confirmation checklist** (room-type-in-rate-card, occupancy-fits, pet/smoking, group-block routing, no-card-in-chat, all-fields-present, **explicit affirmative trigger**, JSON-or-no-confirmation) and ships with five negative-path few-shot examples (D/E/F/G/H — invalid room + over-occupancy, card refusal, group-block routing, long-stay-books-normally, partial gather with no trigger). Stay length is **not** a routing trigger — a single guest booking 17 nights books normally. Walkthrough in **[`Hotel Reservations Bot.md`](./docs/recipes/Hotel%20Reservations%20Bot.md)**.
 
 ---
 
-### 12. Dentist appointment bot — [full walkthrough](./Dentist%20Appointment%20Bot.md)
+### 12. Dentist appointment bot — [full walkthrough](./docs/recipes/Dentist%20Appointment%20Bot.md)
 
 Closest sibling to the Doctor's Office Bot — primary-care archetype, dental-specific facts and red flags. Answers FAQs from an explicit `PRACTICE FACTS` block (services offered, services NOT offered → ortho/wisdom teeth/oral surgery referred out, insurance, sedation/nitrous availability), books / reschedules / cancels appointments, and routes emergencies on **two tiers**:
 
@@ -1458,7 +1451,7 @@ Closest sibling to the Doctor's Office Bot — primary-care archetype, dental-sp
 
 **Settings:** `qwen3:8b` on Ollama, temperature `0.3`, Thinking `Off`, max_tokens `600`, `include_history: true`.
 
-**Archetype:** same conversational dual-mode pattern as the Doctor's Office Bot, with the practical addition of an explicit "services NOT offered" line in the facts block — the bot proactively refers Invisalign, wisdom-tooth extraction, full-arch implants, and IV sedation out, instead of inventing a plausible-sounding answer. Also runs a hardened **pre-confirmation checklist** (provider-in-facts, all-fields-present including insurance, time-in-office-hours, **explicit affirmative trigger**, JSON-or-no-confirmation) and three negative-path few-shot examples (D/E/F — unknown provider + missing insurance, time before opening, partial gather with no trigger). Added after live testing showed the bot would otherwise hallucinate a "Dr. Kamata" provider name when asked, and confirm without an explicit yes. Walkthrough in **[`Dentist Appointment Bot.md`](./Dentist%20Appointment%20Bot.md)**.
+**Archetype:** same conversational dual-mode pattern as the Doctor's Office Bot, with the practical addition of an explicit "services NOT offered" line in the facts block — the bot proactively refers Invisalign, wisdom-tooth extraction, full-arch implants, and IV sedation out, instead of inventing a plausible-sounding answer. Also runs a hardened **pre-confirmation checklist** (provider-in-facts, all-fields-present including insurance, time-in-office-hours, **explicit affirmative trigger**, JSON-or-no-confirmation) and three negative-path few-shot examples (D/E/F — unknown provider + missing insurance, time before opening, partial gather with no trigger). Added after live testing showed the bot would otherwise hallucinate a "Dr. Kamata" provider name when asked, and confirm without an explicit yes. Walkthrough in **[`Dentist Appointment Bot.md`](./docs/recipes/Dentist%20Appointment%20Bot.md)**.
 
 ---
 
@@ -1504,6 +1497,13 @@ The UI reads `ollama list` at startup and auto-populates the model dropdown for 
 ---
 
 ## Curating fine-tuning data
+
+<p align="center">
+  <img src="docs/images/miniclosedai5.png"
+       alt="Sentiment classifier chat with the header's download icon hovered, showing the tooltip 'Download this chat as CSV (input,output)' — saves the conversation as a two-column SFT dataset"
+       width="820">
+  <br><em>Every chat doubles as a fine-tuning dataset. The download icon in the header exports the conversation as a two-column <code>input,output</code> CSV — edited assistant responses become the ideal SFT targets.</em>
+</p>
 
 Every chat in MiniClosedAI is both a playground and a dataset-in-progress. The workflow is deliberately the simplest one that works for small high-quality SFT datasets: **demonstration data collection** — keep the real user prompts, rewrite imperfect assistant responses into the ideal ones, export the pairs as CSV.
 
@@ -1930,14 +1930,17 @@ miniclosedai/
 ├── README.md                  # This document
 ├── DOCUMENTATION.md           # Extra architecture detail (covers Docker in depth)
 ├── INSTALL.md                 # Per-OS Ollama install detail
-├── Support Ticket Router.md   # Standalone bot recipe
-├── Inbound Lead Qualifier.md  # Standalone bot recipe
-├── RAG Query Router.md        # Standalone bot recipe (Bonsai-paired)
-├── Doctors Office Bot.md      # Standalone bot recipe (conversational, qwen3:8b)
-├── Restaurant Reservations Bot.md  # Standalone bot recipe (conversational, qwen3:8b)
-├── Hotel Reservations Bot.md       # Standalone bot recipe (conversational, qwen3:8b)
-├── Dentist Appointment Bot.md      # Standalone bot recipe (conversational, qwen3:8b)
-├── test_e2e.py                # Single-file end-to-end regression suite (39 tests)
+├── docs/
+│   ├── images/                # Promotional screenshots referenced from README
+│   └── recipes/               # Standalone bot recipes (.md, one per archetype)
+│       ├── Doctors Office Bot.md           # Conversational, qwen3:8b
+│       ├── Restaurant Reservations Bot.md  # Conversational, qwen3:8b
+│       ├── Hotel Reservations Bot.md       # Conversational, qwen3:8b
+│       ├── Dentist Appointment Bot.md      # Conversational, qwen3:8b
+│       ├── Support Ticket Router.md        # JSON extractor / classifier
+│       ├── Inbound Lead Qualifier.md       # Scoring + routing
+│       └── RAG Query Router.md             # Bonsai-paired classifier
+├── test_e2e.py                # Single-file end-to-end regression suite
 └── miniclosedai.db            # SQLite file (gitignored; Docker: in named volume)
 ```
 
