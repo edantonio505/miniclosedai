@@ -26,20 +26,21 @@ Built with **FastAPI** (3 Python deps), vanilla JS, and SQLite. Runs on a laptop
 5. [Your first bot — 60 seconds](#your-first-bot--60-seconds)
 6. [UI guide](#ui-guide)
 7. [Connecting LM Studio and other OpenAI-compatible endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)
-8. [The microservice pattern](#the-microservice-pattern)
-9. [API reference — native endpoints](#api-reference--native-endpoints)
-10. [OpenAI-compatible endpoint](#openai-compatible-endpoint)
-11. [Recipes — common bot patterns](#recipes--common-bot-patterns)
-12. [Getting good responses from small models](#getting-good-responses-from-small-models)
-13. [Curating fine-tuning data](#curating-fine-tuning-data)
-14. [Sharing bots between instances](#sharing-bots-between-instances)
-15. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
-16. [LAN access](#lan-access)
-17. [Troubleshooting](#troubleshooting)
-18. [Testing](#testing)
-19. [Project layout](#project-layout)
-20. [Security](#security)
-21. [License](#license)
+8. [Generating system prompts](#generating-system-prompts)
+9. [The microservice pattern](#the-microservice-pattern)
+10. [API reference — native endpoints](#api-reference--native-endpoints)
+11. [OpenAI-compatible endpoint](#openai-compatible-endpoint)
+12. [Recipes — common bot patterns](#recipes--common-bot-patterns)
+13. [Getting good responses from small models](#getting-good-responses-from-small-models)
+14. [Curating fine-tuning data](#curating-fine-tuning-data)
+15. [Sharing bots between instances](#sharing-bots-between-instances)
+16. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
+17. [LAN access](#lan-access)
+18. [Troubleshooting](#troubleshooting)
+19. [Testing](#testing)
+20. [Project layout](#project-layout)
+21. [Security](#security)
+22. [License](#license)
 
 ---
 
@@ -345,12 +346,7 @@ Your selection persists across reloads. Streaming chats keep playing when you fl
 
 Two panels, separated by a **horizontal splitter** you can drag to resize:
 
-**System Prompt** — the bot's role. Auto-saved to the active conversation. Above the textarea sits a small **✨ Generate prompt / Improve prompt** button (visible whenever at least one enabled, reachable backend has models). Click it to expand a description box:
-
-- **Empty system prompt → "Generate prompt"**: type a description ("Polite SaaS support agent that escalates billing to humans"), click Generate, and the chosen model writes a complete system prompt and streams it into the textarea.
-- **Existing system prompt → "Improve prompt"**: type what to change ("Be more concise"; "Always confirm before booking"). The model receives **the current prompt + the recent conversation transcript + your instruction** and rewrites the prompt incorporating the change. The conversation acts as evidence — if the bot misbehaved on a turn, the new prompt is asked to prevent that. Works equally well with no transcript yet.
-
-The model used for generation/improvement is picked in **⚙️ Settings → Prompt Generator** (any model from any reachable backend; choice persists in localStorage). Failures restore your existing prompt — you can't lose it to a streaming hiccup.
+**System Prompt** — the bot's role. Auto-saved to the active conversation. Above the textarea sits a small **✨ Generate prompt / Improve prompt** button — it uses any LLM you've registered to write or rewrite the prompt for you. See [Generating system prompts](#generating-system-prompts) for the full flow.
 
 **Parameters**:
 
@@ -547,6 +543,59 @@ From the Settings page:
 - **Edit** lets you change the name, URL, API key, or custom headers. `kind` is immutable once saved.
 - **Delete** removes a non-built-in endpoint. If any conversation is still bound to it, you get a 409 listing the conversations — rebind them first, then retry.
 - **The built-in Ollama endpoint** can be renamed or have its URL changed (useful if Ollama runs on a different port or host), but can't be deleted.
+
+---
+
+## Generating system prompts
+
+Above the **System Prompt** textarea in the sidebar sits a small **✨ Generate prompt / Improve prompt** button. It uses an LLM you've already registered to write or rewrite the system prompt itself, so you don't have to start from a blank textarea or hand-edit a long prompt that's drifted.
+
+The button only appears when at least one enabled, reachable backend has at least one model. The same button serves two flows; the label flips based on whether the textarea is empty.
+
+### Generate (empty textarea)
+
+You describe the bot in one or two sentences; the model writes a complete system prompt and streams it into the textarea. Examples of useful descriptions:
+
+- *"Polite SaaS customer support agent that escalates billing questions to humans."*
+- *"JSON extractor for inbound support tickets; output exactly `{intent, urgency, team, key_entities}` and nothing else."*
+- *"Restaurant reservations chatbot. Confirm party size, date, time, and any allergies before issuing a `create_reservation` JSON block."*
+
+The meta-prompt under the hood asks for role+tone, concrete instructions, guardrails (only when relevant), and an output format hint (only when relevant). The result lands in the textarea and is auto-saved to the active conversation just like any hand-typed prompt.
+
+### Improve (existing textarea)
+
+Once a prompt exists, the button label flips to **Improve prompt**. Click it, type what you want changed (*"Be more concise"*, *"Always confirm before booking"*, *"Refuse off-topic questions politely"*), and the model receives **three labeled sections**:
+
+```
+=== CURRENT SYSTEM PROMPT ===
+<the prompt as it stands now>
+
+=== CONVERSATION TRANSCRIPT ===
+User: how do I cancel my subscription?
+Assistant: Sure, I can help. Just send me your billing email…
+User: I want a refund for last month
+Assistant: For refunds you'll want to talk to billing — let me transfer you.
+
+=== IMPROVEMENT REQUEST ===
+The bot should never offer to look up billing info itself; refer all
+billing questions to a human immediately.
+```
+
+The conversation transcript acts as **evidence**: if the bot misbehaved on a turn that the request points at, the new prompt is asked to prevent that exact failure. If the conversation is empty (you're improving a prompt that hasn't been tested yet), the section reads `(no conversation has been run against this prompt yet)` so the model knows it can't lean on examples.
+
+Only the last 30 turns are sent — long chats stay well inside any backend's context window. Multimodal turns are reduced to their text content; image attachments aren't re-sent to the prompt-generator backend.
+
+### Picking the model
+
+Open **⚙️ Settings → Prompt Generator**. The dropdown lists every model from every enabled, reachable backend, grouped by backend (the same `<optgroup>` pattern as the dashboard's main model picker). Pick one and it's stored in browser localStorage; the next click of Generate/Improve uses it. If the chosen model later disappears (backend disabled, model uninstalled), the resolver falls back automatically — first to any backend still serving that model name, then to the first model on the first available backend.
+
+The choice is per-browser, not per-conversation: a single picker drives every Generate/Improve action across all your bots.
+
+### Failure handling
+
+Errors restore your existing prompt. If the streaming call to the chosen backend fails partway through an Improve operation, the textarea reverts to whatever it held before you clicked — you can't lose your prompt to a network hiccup. The status line under the button flips red with `Improvement failed: <reason>` (or `Generation failed: …`); the textarea is re-enabled and re-focused.
+
+Architectural deep-dive (wire format, localStorage key, resolution order, what's deliberately *not* built into this) lives in [DOCUMENTATION.md → Prompt generator](./DOCUMENTATION.md#prompt-generator).
 
 ---
 
