@@ -1298,6 +1298,182 @@ def _():
     assert "loopback" in r.json().get("detail", "").lower()
 
 
+def _clear_upgrade_state_file() -> None:
+    """Wipe the persistent upgrade-check state so each test starts cold.
+    Tests that exercise the once-per-version notification need a clean slate
+    or the prior test's `last_notified_sha` would suppress this one's log."""
+    import app as app_mod
+    try:
+        app_mod._UPGRADE_CHECK_STATE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+@test("upgrade state: once-per-version log fires exactly once per new SHA")
+def _():
+    # Two consecutive status calls with the same (current, latest) pair
+    # should print the "update available" line exactly once. Mirrors
+    # OpenClaw's `lastNotifiedVersion` semantics.
+    import io, os, sys
+    from contextlib import redirect_stderr
+    from unittest.mock import patch
+    _clear_upgrade_state_file()
+    fake_main = "f" * 40
+    fake_build = "0" * 40
+    captured = io.StringIO()
+    with patch.dict(os.environ, {
+        "MINICLOSEDAI_IN_DOCKER": "1",
+        "MINICLOSEDAI_BUILD_SHA": fake_build,
+    }), patch("app._github_main_sha", return_value=fake_main), redirect_stderr(captured):
+        from app import api_upgrade_status
+        api_upgrade_status()
+        api_upgrade_status()
+        api_upgrade_status()
+    log = captured.getvalue()
+    occurrences = log.count("update available:")
+    assert occurrences == 1, f"expected exactly 1 notify line, got {occurrences}: {log!r}"
+
+
+@test("upgrade state: new version after a known one re-fires the notify log")
+def _():
+    # Once we *do* see a different remote SHA, the log should fire again
+    # (so users actually learn about each release, not just the first).
+    import io, os
+    from contextlib import redirect_stderr
+    from unittest.mock import patch
+    _clear_upgrade_state_file()
+    fake_build = "0" * 40
+    sha_v1 = "1" * 40
+    sha_v2 = "2" * 40
+    captured = io.StringIO()
+    with patch.dict(os.environ, {
+        "MINICLOSEDAI_IN_DOCKER": "1",
+        "MINICLOSEDAI_BUILD_SHA": fake_build,
+    }), redirect_stderr(captured):
+        from app import api_upgrade_status
+        with patch("app._github_main_sha", return_value=sha_v1):
+            api_upgrade_status()
+            api_upgrade_status()
+        # Force the cache to expire, otherwise the cached SHA wins and
+        # our fresh patch never gets called.
+        import json as _json, app as _app
+        st = _json.loads(_app._UPGRADE_CHECK_STATE_PATH.read_text())
+        st["last_checked_at"] = "1970-01-01T00:00:00+00:00"
+        _app._UPGRADE_CHECK_STATE_PATH.write_text(_json.dumps(st))
+        with patch("app._github_main_sha", return_value=sha_v2):
+            api_upgrade_status()
+    log = captured.getvalue()
+    assert log.count("update available:") == 2, log
+
+
+@test("upgrade state: first_seen_at is preserved across repeat calls for the same version")
+def _():
+    import os
+    from unittest.mock import patch
+    _clear_upgrade_state_file()
+    fake_main = "f" * 40
+    fake_build = "0" * 40
+    with patch.dict(os.environ, {
+        "MINICLOSEDAI_IN_DOCKER": "1",
+        "MINICLOSEDAI_BUILD_SHA": fake_build,
+    }), patch("app._github_main_sha", return_value=fake_main):
+        from app import api_upgrade_status
+        first = api_upgrade_status()["first_seen_at"]
+        second = api_upgrade_status()["first_seen_at"]
+    assert first is not None and first == second, (first, second)
+
+
+@test("upgrade state: first_seen_at clears once the install catches up to the remote")
+def _():
+    # If the user upgrades and later polls report behind=0, we should clear
+    # the seen-since marker so a future regression starts fresh.
+    import os
+    from unittest.mock import patch
+    _clear_upgrade_state_file()
+    sha = "a" * 40
+    fake_build = "0" * 40
+    with patch.dict(os.environ, {
+        "MINICLOSEDAI_IN_DOCKER": "1",
+        "MINICLOSEDAI_BUILD_SHA": fake_build,
+    }), patch("app._github_main_sha", return_value=sha):
+        from app import api_upgrade_status
+        first = api_upgrade_status()
+        assert first["first_seen_at"] is not None
+    # Simulate the install catching up: build SHA now matches the remote.
+    with patch.dict(os.environ, {
+        "MINICLOSEDAI_IN_DOCKER": "1",
+        "MINICLOSEDAI_BUILD_SHA": sha,
+    }), patch("app._github_main_sha", return_value=sha):
+        caught_up = api_upgrade_status()
+    assert caught_up["behind"] == 0
+    assert caught_up["first_seen_at"] is None
+
+
+@test("upgrade status: Docker install reports behind>0 when build SHA != GitHub main")
+def _():
+    # Regression for "Docker users never see the upgrade badge". When running
+    # in a container we can't run git, so we bake the build SHA into env at
+    # image-build time and consult GitHub's REST API for origin/main. With a
+    # mismatch we expect installed_via=docker, behind>=1, and the actionable
+    # rebuild reason. The test mocks _github_main_sha so we don't depend on
+    # network or hit GitHub's rate limit.
+    import os
+    from unittest.mock import patch
+    _clear_upgrade_state_file()
+    fake_main = "f" * 40
+    fake_build = "0" * 40
+    with patch.dict(os.environ, {
+        "MINICLOSEDAI_IN_DOCKER": "1",
+        "MINICLOSEDAI_BUILD_SHA": fake_build,
+    }), patch("app._github_main_sha", return_value=fake_main):
+        from app import api_upgrade_status
+        j = api_upgrade_status()
+    assert j["installed_via"] == "docker", j
+    assert j["current_sha"] == fake_build, j
+    assert j["latest_sha"] == fake_main, j
+    assert j["behind"] == 1, j
+    assert j["can_upgrade"] is False, j
+    assert "docker compose" in (j["reason"] or "").lower(), j
+
+
+@test("upgrade status: Docker install reports behind=0 when build SHA == GitHub main")
+def _():
+    # The "no update" half of the prior test — same SHA both sides → no badge.
+    import os
+    from unittest.mock import patch
+    _clear_upgrade_state_file()
+    sha = "a" * 40
+    with patch.dict(os.environ, {
+        "MINICLOSEDAI_IN_DOCKER": "1",
+        "MINICLOSEDAI_BUILD_SHA": sha,
+    }), patch("app._github_main_sha", return_value=sha):
+        from app import api_upgrade_status
+        j = api_upgrade_status()
+    assert j["installed_via"] == "docker", j
+    assert j["behind"] == 0, j
+    assert "already on the latest" in (j["reason"] or "").lower(), j
+
+
+@test("upgrade status: Docker install with unknown build SHA degrades gracefully")
+def _():
+    # Image rebuilt without the GIT_SHA build arg — we can't compare anything,
+    # so we shouldn't claim an update. Reason text steers the user toward
+    # rebuilding with the build arg set.
+    import os
+    from unittest.mock import patch
+    _clear_upgrade_state_file()
+    with patch.dict(os.environ, {
+        "MINICLOSEDAI_IN_DOCKER": "1",
+        "MINICLOSEDAI_BUILD_SHA": "unknown",
+    }), patch("app._github_main_sha", return_value="f" * 40):
+        from app import api_upgrade_status
+        j = api_upgrade_status()
+    assert j["installed_via"] == "docker", j
+    assert j["behind"] == 0, j
+    assert j["can_upgrade"] is False, j
+    assert "build sha not baked" in (j["reason"] or "").lower(), j
+
+
 @test("upgrade run: Docker install returns helpful 409 before loopback 403")
 def _():
     # Regression for the Mac+Docker bug: when the app runs inside a container,

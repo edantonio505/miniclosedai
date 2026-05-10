@@ -28,6 +28,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py db.py llm.py ./
 COPY static/ ./static/
 
+# Build-time SHA so Docker installs (which don't ship .git inside the image)
+# can still tell whether origin/main on GitHub has moved past them. Pass at
+# build via `--build-arg GIT_SHA=$(git rev-parse HEAD)`; docker-compose.yml
+# does this automatically. Falls back to "unknown" — the runtime status
+# endpoint then can't compute `behind` but won't crash.
+ARG GIT_SHA=unknown
+ENV MINICLOSEDAI_BUILD_SHA=$GIT_SHA
+
 # Non-root user + writable data dir for the SQLite DB volume mount.
 RUN useradd --create-home --shell /bin/bash --uid 1000 app \
  && mkdir -p /app/data \

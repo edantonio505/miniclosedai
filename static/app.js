@@ -2037,19 +2037,23 @@ function _renderBackendCard(b) {
   return card;
 }
 
-// Pull only makes sense on Ollama instances you control — typically localhost
-// or a machine on your LAN. Public-hostname Ollama backends (e.g. an
-// authenticating relay like app.interdataresearch.com) generally forward
-// `/api/chat` but reject `/api/pull`, since they don't let you write models
-// onto someone else's disk. Hide the download UI in that case.
+// Hostnames known to forward `/api/chat` but reject `/api/pull` (typically
+// authenticating relays where models live on someone else's disk and only
+// inference is exposed). Substring match so `.com` and `.ai` variants both
+// hit; lowercased before comparison.
+const _OLLAMA_PULL_DENY_HOST_FRAGMENTS = ["app.interdataresearch"];
+
+// Pull is allowed by default for any Ollama backend the user has registered
+// — if they added it, they likely admin the target machine. The denylist
+// above suppresses the form for known relay providers where attempting a
+// pull would 403 on every keystroke.
 function _ollamaAllowsPull(b) {
   let host;
-  try { host = new URL(b.base_url).hostname; } catch { return false; }
-  if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0") return true;
-  if (/^10\./.test(host)) return true;                               // 10.0.0.0/8
-  if (/^192\.168\./.test(host)) return true;                         // 192.168.0.0/16
-  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) return true;         // 172.16.0.0/12
-  return false;  // public hostname / IP — assume no pull capability
+  try { host = new URL(b.base_url).hostname.toLowerCase(); } catch { return false; }
+  for (const frag of _OLLAMA_PULL_DENY_HOST_FRAGMENTS) {
+    if (host.includes(frag)) return false;
+  }
+  return true;
 }
 
 function _renderPullSection(b) {
@@ -2712,6 +2716,23 @@ docker compose up -d --build</pre>`;
     warn.className = "upgrade-warning";
     warn.innerHTML = "You have uncommitted changes. Commit, stash, or run <code>git checkout -- .</code> before upgrading. The upgrade button is disabled until your tree is clean.";
     body.appendChild(warn);
+  }
+
+  // "Available since X" line — server stamps `first_seen_at` the first time
+  // a given remote SHA is observed and clears it once the install catches up.
+  // Useful when a release has been sitting available for a while and the user
+  // just opened the modal.
+  if (status.first_seen_at) {
+    const since = document.createElement("div");
+    since.className = "upgrade-since";
+    since.style.color = "var(--text-muted)";
+    since.style.fontSize = "11.5px";
+    since.style.marginTop = "6px";
+    const d = new Date(status.first_seen_at);
+    since.textContent = isNaN(d.valueOf())
+      ? `Available since ${status.first_seen_at}`
+      : `Available since ${d.toLocaleString()}`;
+    body.appendChild(since);
   }
 
   if (status.latest_messages && status.latest_messages.length) {
