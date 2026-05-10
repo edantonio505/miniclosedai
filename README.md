@@ -345,7 +345,12 @@ Your selection persists across reloads. Streaming chats keep playing when you fl
 
 Two panels, separated by a **horizontal splitter** you can drag to resize:
 
-**System Prompt** — the bot's role. Auto-saved to the active conversation.
+**System Prompt** — the bot's role. Auto-saved to the active conversation. Above the textarea sits a small **✨ Generate prompt / Improve prompt** button (visible whenever at least one enabled, reachable backend has models). Click it to expand a description box:
+
+- **Empty system prompt → "Generate prompt"**: type a description ("Polite SaaS support agent that escalates billing to humans"), click Generate, and the chosen model writes a complete system prompt and streams it into the textarea.
+- **Existing system prompt → "Improve prompt"**: type what to change ("Be more concise"; "Always confirm before booking"). The model receives **the current prompt + the recent conversation transcript + your instruction** and rewrites the prompt incorporating the change. The conversation acts as evidence — if the bot misbehaved on a turn, the new prompt is asked to prevent that. Works equally well with no transcript yet.
+
+The model used for generation/improvement is picked in **⚙️ Settings → Prompt Generator** (any model from any reachable backend; choice persists in localStorage). Failures restore your existing prompt — you can't lose it to a streaming hiccup.
 
 **Parameters**:
 

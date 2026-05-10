@@ -34,11 +34,12 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 11. [Fine-tuning data export](#fine-tuning-data-export)
 12. [Bot import / export](#bot-import--export)
 13. [Self-upgrade](#self-upgrade)
-14. [Database](#database)
-15. [Configuration](#configuration)
-16. [File layout](#file-layout)
-17. [Security](#security)
-18. [Troubleshooting](#troubleshooting)
+14. [Prompt generator](#prompt-generator)
+15. [Database](#database)
+16. [Configuration](#configuration)
+17. [File layout](#file-layout)
+18. [Security](#security)
+19. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -332,7 +333,7 @@ See [Security](#security) and the README's [LAN access](./README.md#lan-access) 
 
 ### Sidebar
 
-- **System Prompt** — editable textarea; auto-saves per conversation.
+- **System Prompt** — editable textarea; auto-saves per conversation. A **✨ Generate prompt / Improve prompt** affordance sits above it (see [Prompt generator](#prompt-generator) below).
 - **Parameters** — sliders and inputs for:
   - **Temperature** (0.0–2.0)
   - **Max tokens** (64–32 000) — cap on the response length.
@@ -1186,6 +1187,75 @@ The status endpoint is always exposed because reading version metadata is harmle
 ### When the script is run directly vs from the GUI
 
 The script checks `MINICLOSEDAI_UPGRADE_VIA_GUI`: when set (the FastAPI `Popen` call sets it), it sleeps 1 s before doing anything heavy so the server has time to flush the 202 response before the script kills it. When run from a terminal (env var unset), it skips the sleep — there's no parent HTTP request to flush.
+
+---
+
+## Prompt generator
+
+A small client-side affordance above the System Prompt textarea that turns a free-text description into a complete system prompt — and, when a prompt already exists, rewrites it using the running conversation as evidence. Pure GUI feature: no new server endpoints, no DB changes, all logic in `static/app.js`.
+
+### Two modes, one button
+
+The same toggle button switches label based on whether the system-prompt textarea has any content:
+
+| State | Label | Meta-prompt sent | User payload |
+|---|---|---|---|
+| Empty textarea | **✨ Generate prompt** | `_PROMPT_GEN_META_PROMPT` (write a fresh system prompt) | `<description>` |
+| Non-empty textarea | **✨ Improve prompt** | `_PROMPT_IMPROVE_META_PROMPT` (rewrite preserving what works) | Three labeled sections: `=== CURRENT SYSTEM PROMPT ===` + `=== CONVERSATION TRANSCRIPT ===` + `=== IMPROVEMENT REQUEST ===` |
+
+The mode is decided live on every input event (`_promptGenMode()` in `static/app.js`), so the label flips in real time as the user types or clears the prompt. Programmatic value sets (loading a conversation, "Reset defaults") explicitly call `_updatePromptGenAffordance()` since assigning `.value` doesn't fire `input`.
+
+### Wire format
+
+The button reuses `POST /api/chat/stream` — the same legacy endpoint the dashboard uses for non-saved-conversation inference. No new backend code:
+
+```
+POST /api/chat/stream
+Content-Type: application/json
+
+{
+  "backend_id": <selected backend id>,
+  "model":      "<selected model name>",
+  "system_prompt": "<meta-prompt for the chosen mode>",
+  "messages": [{"role": "user", "content": "<description or 3-section payload>"}],
+  "max_tokens": 4000,
+  "temperature": 0.5,
+  "think": false
+}
+```
+
+The response is consumed as standard SSE; each `chunk` event is appended to the System Prompt textarea live. After the stream ends the final value is right-trimmed (models often append a stray newline) and an `input` event is dispatched to the textarea so the existing `saveSettings()` + `scheduleSaveToConversation()` listeners persist the new prompt.
+
+### Conversation transcript (improve mode only)
+
+The transcript section is built from `state.messages` — the in-memory messages of the active conversation:
+
+- **Last 30 turns only**, to stay well under any backend's context window even on long chats.
+- **`_userVisibleText(m)`** is reused to extract the typed text from multimodal turns; PDF/image content is *not* inlined.
+- **Empty turns dropped**, **`role: "system"`** turns dropped (only `user` / `assistant` appear).
+- If `state.messages` is empty, the section reads `(no conversation has been run against this prompt yet)` so the model knows it can't lean on evidence.
+
+### Model picker (Settings → Prompt Generator)
+
+The section appears in **⚙️ Settings** when at least one enabled, reachable backend has at least one model. The dropdown is grouped by `<optgroup>` per backend (mirrors the dashboard's main model picker). Option values are encoded `<backend_id>::<model_name>` so the change handler recovers both halves and persists them as a JSON-encoded `{backend_id, model}` blob in `localStorage` under the key `miniclosedai:promptGenChoice`.
+
+Resolution order on every refresh (called once at init + every 60 s):
+
+1. Saved `(backend_id, model)` exact pair → use it if the backend is still enabled+running and still serves that model.
+2. Saved model name → use any backend that currently advertises it (handles backend re-registration where the id changed).
+3. No match → first model on the first enabled+running backend.
+
+The 60-second poll is what makes the affordance auto-appear/disappear when a backend's reachability flips. The same `/api/models` payload that powers the dashboard's model dropdown is reused — no new endpoint.
+
+### Failure handling
+
+The streaming loop wraps the whole flow in `try/catch`. Any error (network, backend down, malformed SSE frame, model returns `error` event) restores **the original prompt in Improve mode** so a streaming hiccup never destroys the user's existing system prompt. The status line flips red with `"Improvement failed: <reason>"` (or `Generation failed: …`); the textarea is re-enabled and re-focused.
+
+### What this is NOT
+
+- **Not a server-side endpoint**. No `/api/prompt-gen` or similar; the LLM call is just `/api/chat/stream` with a custom system prompt + user message.
+- **Not persisted to the conversation history.** The generated prompt lands in the System Prompt field (and is auto-saved there), but the meta-prompt + the user's description are *not* stored anywhere; only the resulting system prompt is.
+- **Not a separate model abstraction.** Whatever backends/models the user has registered for normal chat are the same ones offered here; the choice is per-browser (localStorage), not per-conversation.
 
 ---
 
