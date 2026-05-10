@@ -541,8 +541,10 @@ From the Settings page:
 
 - **Test connection** (on each card or in the Add/Edit modal) probes the endpoint *through the MiniClosedAI server* — avoids browser CORS blocks on cross-origin calls to LM Studio.
 - **Edit** lets you change the name, URL, API key, or custom headers. `kind` is immutable once saved.
-- **Delete** removes a non-built-in endpoint. If any conversation is still bound to it, you get a 409 listing the conversations — rebind them first, then retry.
-- **The built-in Ollama endpoint** can be renamed or have its URL changed (useful if Ollama runs on a different port or host), but can't be deleted.
+- **Delete** removes a non-built-in endpoint. Two paths depending on whether bots are pinned to it:
+  - **No bots pinned** → single confirm, gone.
+  - **N bots pinned** → first dialog lists the bot titles and recommends rebinding instead. If you OK, a second dialog gates the cascade (`Really delete N bot(s)? This is permanent.`); confirming both deletes the backend AND every bot pinned to it in one transaction. Use this for stale endpoints whose bots aren't worth migrating.
+- **The built-in Ollama endpoint** can be renamed or have its URL changed (useful if Ollama runs on a different port or host), but can't be deleted (the 403 fires regardless of `force=true` so you can't accidentally wipe the only Ollama row in lite mode).
 
 ### Downloading new models from Ollama
 
@@ -715,7 +717,7 @@ Returns every enabled backend and the models it reports, plus a legacy flat shap
 GET    /api/backends              → list all (api_key scrubbed to api_key_set bool)
 POST   /api/backends              → create. Strip trailing /, normalize URL.
 PATCH  /api/backends/{id}         → update (kind is immutable)
-DELETE /api/backends/{id}         → 403 on is_builtin, 409 if bound to chats
+DELETE /api/backends/{id}         → 403 on is_builtin, 409 if bound (force=true cascades)
 GET    /api/backends/{id}/models  → list that backend's models only
 GET    /api/backends/{id}/status  → is it reachable?
 POST   /api/backends/test         → probe a draft config without saving
@@ -739,8 +741,19 @@ curl -X POST http://localhost:8095/api/backends \
 
 **Delete guardrails:**
 
-- `DELETE /api/backends/1` (or any row with `is_builtin=1`) → **403 Forbidden**.
-- `DELETE /api/backends/<id>` when one or more conversations still point at it → **409 Conflict** with a `bound_conversations` list. Rebind those conversations first (change their saved model to one on a different backend), then retry the delete.
+- `DELETE /api/backends/1` (or any row with `is_builtin=1`) → **403 Forbidden**, regardless of `force=true`. The built-in is undeletable so a lite-mode user can't accidentally end up with zero Ollama rows.
+- `DELETE /api/backends/<id>` when one or more conversations still point at it → **409 Conflict** with a `bound_conversations` list. Rebind those conversations first (change their saved model to one on a different backend), then retry. Or **cascade-delete** with `?force=true` to remove the backend AND every bot pinned to it in one transaction. Response body includes `deleted_conversations: <count>` so callers can confirm what was wiped.
+
+```bash
+# Default: refuses with 409 + bound list
+curl -X DELETE http://localhost:8095/api/backends/4
+# → 409 {"detail": {"message": "...still bound to 3 conversation(s)...",
+#                    "bound_conversations": [{"id":17,"title":"…"}, …]}}
+
+# Cascade — deletes backend + 3 bots in one go
+curl -X DELETE 'http://localhost:8095/api/backends/4?force=true'
+# → 200 {"ok": true, "deleted_conversations": 3}
+```
 
 **Test endpoint** (draft probe — server-side, bypasses browser CORS):
 

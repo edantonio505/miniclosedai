@@ -366,10 +366,21 @@ def _():
         client.delete(f"/api/backends/{bid}")
 
 
-@test("backends: DELETE built-in is forbidden (403)")
+@test("backends: DELETE built-in is forbidden (403) without force")
 def _():
+    # Default policy: deleting the built-in needs explicit `?force=true`
+    # (the GUI sets this after a stern two-step confirm). This guard
+    # protects callers that hand-fire `DELETE /api/backends/1` from
+    # accidentally wiping their primary Ollama row.
     r = client.delete("/api/backends/1")
     assert r.status_code == 403
+    detail = r.json().get("detail")
+    # Detail can be a dict or string depending on FastAPI version — handle both.
+    if isinstance(detail, dict):
+        assert detail.get("is_builtin") is True
+        assert "force=true" in (detail.get("message") or "").lower()
+    else:
+        assert "built-in" in (detail or "").lower()
 
 
 @test("backends: DELETE returns 409 when a conversation is bound")
@@ -387,6 +398,100 @@ def _():
     finally:
         client.delete(f"/api/conversations/{conv['id']}")
         client.delete(f"/api/backends/{bid}")
+
+
+@test("backends: DELETE ?force=true cascades — backend + bound bots gone")
+def _():
+    # Settings → Delete should let users blow away a stale endpoint AND the
+    # bots pinned to it in one shot, after a two-step confirm in the GUI.
+    # The force flag is the server side of that escape hatch.
+    bid = _add_openai_backend()
+    conv1 = client.post("/api/conversations", json={
+        "title": "stale-1", "model": "openai-a-4b", "backend_id": bid,
+    }).json()
+    conv2 = client.post("/api/conversations", json={
+        "title": "stale-2", "model": "openai-a-4b", "backend_id": bid,
+    }).json()
+    # Sanity: force=true succeeds and reports the cascade count.
+    r = client.delete(f"/api/backends/{bid}?force=true")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["deleted_conversations"] == 2, body
+    # Backend gone — verified via the list endpoint since there's no
+    # /api/backends/{id} GET (the path only takes DELETE/PATCH).
+    listed = client.get("/api/backends").json()
+    assert all(b["id"] != bid for b in listed), f"backend {bid} still present: {listed}"
+    # Both conversations gone too.
+    for c in (conv1, conv2):
+        assert client.get(f"/api/conversations/{c['id']}").status_code == 404
+
+
+@test("backends: DELETE ?force=true on built-in succeeds")
+def _():
+    # The user explicitly opted in via `?force=true` (or, in the GUI, the
+    # extra-stern confirm dialog). We trust them — including for the
+    # built-in row. The seed in db.init_db() only re-creates it when the
+    # backends table is *fully empty*, so this deletion sticks across
+    # restarts as long as at least one other backend exists.
+    #
+    # Re-add a fresh built-in row after the test so subsequent tests using
+    # `_reseed_builtin_to_fake_ollama` (which patches id=1) don't 404.
+    import db as db_mod
+    bid_other = _add_openai_backend()
+    try:
+        r = client.delete("/api/backends/1?force=true")
+        assert r.status_code == 200, r.text
+        # Backend gone from the listing.
+        listed = client.get("/api/backends").json()
+        assert all(b["id"] != 1 for b in listed), listed
+    finally:
+        # Manually re-seed so later tests find the built-in at id=1.
+        with db_mod.get_conn() as conn:
+            conn.execute(
+                """INSERT INTO backends (id, name, kind, base_url, is_builtin, enabled)
+                   VALUES (1, 'Ollama (built-in)', 'ollama', 'http://localhost:11434', 1, 1)"""
+            )
+            conn.commit()
+        client.delete(f"/api/backends/{bid_other}")
+
+
+@test("backends: init_db re-seeds built-in only when backends table is empty")
+def _():
+    # The seed change in db.init_db() must NOT resurrect the built-in when
+    # the user has any other backends. This is the "deletion sticks" guarantee.
+    import db as db_mod
+    # 1. Wipe everything, including the built-in.
+    with db_mod.get_conn() as conn:
+        conn.execute("DELETE FROM backends")
+        conn.commit()
+    # 2. Add a non-built-in backend, then run init_db. The built-in should
+    #    NOT come back, because backend_count > 0.
+    bid = _add_openai_backend()
+    try:
+        db_mod.init_db()
+        listed = client.get("/api/backends").json()
+        assert all(not b.get("is_builtin") for b in listed), listed
+        assert any(b["id"] == bid for b in listed), listed
+    finally:
+        # 3. Wipe again; init_db on an empty table SHOULD re-seed the built-in.
+        with db_mod.get_conn() as conn:
+            conn.execute("DELETE FROM backends")
+            conn.commit()
+        db_mod.init_db()
+        listed = client.get("/api/backends").json()
+        assert any(b.get("is_builtin") for b in listed), \
+            f"built-in didn't re-seed on empty table: {listed}"
+
+
+@test("backends: DELETE ?force=true with no bound bots is a no-op cascade")
+def _():
+    # Force-delete a clean backend (no bots) — should still succeed and
+    # report 0 deletions, not error or count a phantom bot.
+    bid = _add_openai_backend()
+    r = client.delete(f"/api/backends/{bid}?force=true")
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted_conversations"] == 0
 
 
 @test("backends: /status reports reachable for our fake")

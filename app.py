@@ -294,34 +294,67 @@ def api_update_backend(backend_id: int, data: BackendUpdate):
 
 
 @app.delete("/api/backends/{backend_id}")
-def api_delete_backend(backend_id: int):
+def api_delete_backend(backend_id: int, force: bool = False):
+    """Delete a backend.
+
+    Three guard clauses, all overridable with `?force=true`:
+
+    - **Built-in backend**: 403 without `force` (the GUI's two-step confirm
+      sets `force=true` after warning the user). The seed logic in `db.py`
+      only re-creates the built-in on a *fully empty* backends table, so
+      once you delete it AND keep at least one other backend, it stays
+      gone across restarts.
+
+    - **Bound conversations**: 409 with the bound list. With `force`, those
+      conversations are deleted in the same transaction.
+
+    - **Both at once** (built-in with bound bots): with `force`, deletes
+      the bots and the backend together.
+    """
     with db.get_conn() as conn:
         row = conn.execute(
             "SELECT id, name, is_builtin FROM backends WHERE id = ?", (backend_id,)
         ).fetchone()
         if not row:
             raise HTTPException(404, f"Backend {backend_id} not found")
-        if row["is_builtin"]:
-            raise HTTPException(403, "The built-in backend can't be deleted.")
+        if row["is_builtin"] and not force:
+            raise HTTPException(
+                403,
+                {
+                    "message": "The built-in backend can't be deleted by default. "
+                               "Retry with `?force=true` to confirm — the GUI's "
+                               "Delete button does this automatically after a "
+                               "two-step confirm.",
+                    "is_builtin": True,
+                },
+            )
 
         bound = conn.execute(
             "SELECT id, title FROM conversations WHERE backend_id = ?", (backend_id,)
         ).fetchall()
-        if bound:
+        if bound and not force:
             raise HTTPException(
                 409,
                 {
                     "message": f"Backend {backend_id} is still bound to "
-                               f"{len(bound)} conversation(s). Rebind them first.",
+                               f"{len(bound)} conversation(s). Rebind them first, "
+                               f"or retry with `?force=true` to cascade-delete the bots.",
                     "bound_conversations": [
                         {"id": r["id"], "title": r["title"]} for r in bound
                     ],
                 },
             )
 
+        if force and bound:
+            conn.execute(
+                "DELETE FROM conversations WHERE backend_id = ?", (backend_id,)
+            )
         conn.execute("DELETE FROM backends WHERE id = ?", (backend_id,))
         conn.commit()
-    return {"ok": True}
+    return {
+        "ok": True,
+        "deleted_conversations": len(bound) if force else 0,
+    }
 
 
 class BackendTestRequest(BackendCreate):

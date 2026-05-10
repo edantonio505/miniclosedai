@@ -589,6 +589,30 @@ Lists Ollama models available locally.
 }
 ```
 
+### Backends
+
+```
+GET    /api/backends                              → list all (api_key scrubbed to api_key_set bool)
+POST   /api/backends                              → create. Strip trailing /, normalize URL.
+PATCH  /api/backends/{id}                         → update (kind is immutable)
+DELETE /api/backends/{id}                         → 403 on is_builtin, 409 if bound to chats
+DELETE /api/backends/{id}?force=true              → cascade-delete: removes backend + every bound bot in one tx
+GET    /api/backends/{id}/models                  → list that backend's models only
+GET    /api/backends/{id}/status                  → reachability probe (running, kind, model count)
+POST   /api/backends/test                         → probe a draft config without saving
+POST   /api/backends/{id}/pull                    → start a streaming model pull on Ollama backends
+GET    /api/pulls                                 → poll progress for all in-flight pulls
+DELETE /api/backends/{id}/pulls/{name:path}       → cancel an in-flight pull
+```
+
+**Delete semantics**:
+
+- The built-in row (`is_builtin=1`, default `id=1`) is undeletable — 403 fires *before* the bound-bots check, regardless of `?force=true`. This protects lite-mode users from ending up with zero Ollama rows by accident.
+- Default delete refuses (409) when any conversation has `backend_id = <this id>`. The body's `detail.bound_conversations` lists `[{id, title}, …]` so the GUI can offer to rebind those bots.
+- `?force=true` skips the 409 and runs `DELETE FROM conversations WHERE backend_id = ?` in the same transaction as the backend delete. Response includes `deleted_conversations: <count>` so callers can confirm what was wiped. Used by the Settings GUI's two-step cascade-confirm dialog.
+
+**Why the GUI gates with two confirms**: the data being wiped (whole bots, full message history, attachments) is high-value. The first dialog names the bots and recommends rebinding instead; the second dialog gates the actual destructive call. Single-click confirm would be a too-easy regret-trigger for what's effectively `DROP TABLE … CASCADE`.
+
 ### Conversations
 
 ```
