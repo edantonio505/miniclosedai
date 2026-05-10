@@ -1150,7 +1150,7 @@ The script becomes its own process group via `setsid` (Python: `subprocess.Popen
 
 | Route | Purpose | Safety |
 |---|---|---|
-| `GET  /api/upgrade/status` | Returns `{installed_via, current_sha, current_short, latest_sha, latest_short, behind, dirty, latest_messages, can_upgrade, reason, last_run}`. Read-only. Does a best-effort `git fetch` (10 s timeout — falls back to last-known origin if offline). | Always exposed. |
+| `GET  /api/upgrade/status` | Returns `{installed_via, current_sha, current_short, latest_sha, latest_short, behind, dirty, latest_messages, can_upgrade, reason, last_run, first_seen_at}`. Read-only. **Three modes:** `git` (best-effort `git fetch` + local graph), `docker` (build SHA env + GitHub REST API, cache-windowed at 10 min), `unknown` (no `.git`, in-place upgrade impossible). See [Update detection state](#update-detection-state) below for the persistent state file and once-per-version logging. | Always exposed. |
 | `POST /api/upgrade/run` | Spawns `upgrade.sh` detached. Returns 202 immediately with `{started, from_sha, to_sha}`. | **Loopback-only** — refuses with 403 if `request.client.host` isn't in `{127.0.0.1, ::1, localhost}`. Refuses with 409 if `can_upgrade=false`. |
 
 ### Script states
@@ -1187,6 +1187,41 @@ The status endpoint is always exposed because reading version metadata is harmle
 ### When the script is run directly vs from the GUI
 
 The script checks `MINICLOSEDAI_UPGRADE_VIA_GUI`: when set (the FastAPI `Popen` call sets it), it sleeps 1 s before doing anything heavy so the server has time to flush the 202 response before the script kills it. When run from a terminal (env var unset), it skips the sleep — there's no parent HTTP request to flush.
+
+### Update detection state
+
+Pattern lifted from OpenClaw's `update-check.json`. The status endpoint persists what it learned across requests so we can:
+
+1. **Cache the GitHub API call.** Anonymous `api.github.com` is rate-limited to 60 requests / hour / IP. A LAN with several browser tabs each polling every 10 minutes can creep up; the cache window collapses repeats into one network call.
+2. **Stamp `first_seen_at`** the first time a given new remote SHA is observed. The modal surfaces this as "Available since X" so a release that's been sitting unupgraded for days is obvious.
+3. **Log the announcement once.** When a brand-new SHA is seen, the server prints `[miniclosedai] update available: <current> → <latest>` to stderr exactly once per new version — not every poll. Mirrors OpenClaw's `lastNotifiedVersion` gating.
+
+State file: `/tmp/miniclosedai-upgrade-check.json`
+
+```json
+{
+  "last_checked_at":   "2026-05-10T14:30:00+00:00",
+  "last_remote_sha":   "abc123...",
+  "first_seen_at":     "2026-05-10T14:30:00+00:00",
+  "last_notified_sha": "abc123..."
+}
+```
+
+Lifecycle:
+
+| Transition | What happens |
+|---|---|
+| `current == latest` (no update) | `last_remote_sha` and `first_seen_at` cleared. `last_notified_sha` retained so we don't re-announce a now-applied version if it ever comes back. |
+| `current != latest`, never seen | `last_remote_sha = latest`, `first_seen_at = now`. Log fires. `last_notified_sha = latest`. |
+| Same `latest` re-observed | Nothing changes. `first_seen_at` stays put (so the UI hint stays consistent). No log line. |
+| New `latest` (different from `last_remote_sha`) | `last_remote_sha`, `first_seen_at` re-stamped. Log fires again. `last_notified_sha` updated. |
+| Cache window (`last_checked_at` < 10 min ago) | Docker mode skips the GitHub API call and reuses `last_remote_sha`. Git mode still does its local `git fetch` (cheap, no rate limit). |
+
+The state file is only written by `_record_update_state` in `app.py`; the upgrade script doesn't touch it. Failures to read or write are swallowed — a corrupted/missing file just means the next call rebuilds the state from scratch, never breaks `/api/upgrade/status` itself.
+
+### Why not a server-side ticker?
+
+OpenClaw runs a `setTimeout` loop server-side (a "gateway update check") so it detects releases even with no client connected. MiniClosedAI doesn't need this: the GUI polls `/api/upgrade/status` every 10 minutes while a tab is open, and a closed tab means there's no UI to notify anyway. Adding a server ticker would duplicate work the client poll already does. The `first_seen_at` stamp + once-per-version log are the two pieces from OpenClaw worth keeping; the ticker isn't.
 
 ---
 

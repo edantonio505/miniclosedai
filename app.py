@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import zipfile
 from contextlib import asynccontextmanager
@@ -1883,6 +1884,17 @@ async def openai_list_models():
 _PROJECT_DIR = Path(__file__).parent
 _UPGRADE_SCRIPT = _PROJECT_DIR / "upgrade.sh"
 _UPGRADE_PROGRESS_PATH = Path("/tmp/miniclosedai-upgrade.json")
+# Persistent "what did we last see on origin/main?" cache. Mirrors OpenClaw's
+# `update-check.json`: lets the server cache the remote SHA across requests
+# (so we don't hit GitHub's 60-req/hr anonymous limit on every poll), records
+# `first_seen_at` for an "available since X" UI hint, and tracks
+# `last_notified_sha` so the once-per-version server log fires exactly once
+# per new release rather than every 10 minutes.
+_UPGRADE_CHECK_STATE_PATH = Path("/tmp/miniclosedai-upgrade-check.json")
+# How long to trust the cached remote SHA before re-querying GitHub. Matches
+# the GUI's idle poll cadence — anything shorter would just re-do work the
+# previous tick already did.
+_UPGRADE_RECHECK_INTERVAL_S = 600
 
 
 def _git_cmd(*args: str, timeout: float = 5.0) -> str:
@@ -1940,20 +1952,129 @@ _DOCKER_UPGRADE_REASON = (
     "always fails with `pull access denied` — rebuild instead.)"
 )
 
+_GITHUB_API_MAIN = "https://api.github.com/repos/edantonio505/miniclosedai/commits/main"
 
-@app.get("/api/upgrade/status")
-def api_upgrade_status():
-    """Read-only version + update-availability probe.
 
-    Safe to call as often as the UI wants — runs `git fetch` (best-effort,
-    times out at 10 s if offline) then a few cheap rev-parse / status calls.
-    Falls back gracefully when the working tree isn't a git checkout (e.g.
-    user downloaded a tarball) or when running inside Docker.
+def _github_main_sha(timeout: float = 4.0) -> str | None:
+    """Fetch the current SHA of `main` on the canonical GitHub repo.
+
+    Used by the Docker path of `api_upgrade_status` since containers don't
+    ship a git client. Returns None on any failure (offline, 403/rate-limit,
+    repo renamed) — caller degrades gracefully and still surfaces the docker
+    rebuild message rather than claiming an update that can't be verified.
     """
-    in_docker = _running_in_docker()
-    git_dir = _PROJECT_DIR / ".git"
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(
+                _GITHUB_API_MAIN,
+                headers={"Accept": "application/vnd.github+json"},
+            )
+        if resp.status_code != 200:
+            return None
+        return resp.json().get("sha")
+    except Exception:
+        return None
 
-    base = {
+
+def _read_upgrade_check_state() -> dict:
+    """Persistent state for the version-check loop. See `_record_update_state`.
+    Missing / corrupted files yield an empty dict — the caller handles bootstrap.
+    """
+    try:
+        return json.loads(_UPGRADE_CHECK_STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_upgrade_check_state(state: dict) -> None:
+    """Persist state. Failures are swallowed — a corrupted FS shouldn't break
+    the read-only `/api/upgrade/status` endpoint that callers rely on."""
+    try:
+        _UPGRADE_CHECK_STATE_PATH.write_text(json.dumps(state))
+    except OSError:
+        pass
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _record_update_state(current_sha: str | None, latest_sha: str | None) -> dict:
+    """Persist a (current, latest) observation and emit a once-per-version log.
+
+    Returns the updated state dict so callers can surface `first_seen_at` in
+    the API response. Three transitions matter:
+
+    - **No update available** (latest is None or matches current):
+      clear `last_remote_sha` / `first_seen_at` so a future regression to
+      "behind" gets a fresh `first_seen_at` timestamp.
+
+    - **New version detected** (latest != last_remote_sha):
+      stamp `first_seen_at = now`. This is the "available since X" hint.
+
+    - **First time we've seen this version** (latest != last_notified_sha):
+      print a single line to the server log so operators tailing the log see
+      the announcement once, not every 10 minutes. Mirrors OpenClaw's
+      `lastNotifiedVersion` gating.
+
+    Note: this function is the side-effect surface for state changes — both
+    branches of `api_upgrade_status` (git + docker) call into it so they
+    share the once-per-version semantics.
+    """
+    state = _read_upgrade_check_state()
+    state["last_checked_at"] = _now_iso()
+
+    if not current_sha or not latest_sha or latest_sha == current_sha:
+        state.pop("last_remote_sha", None)
+        state.pop("first_seen_at", None)
+        _write_upgrade_check_state(state)
+        return state
+
+    if state.get("last_remote_sha") != latest_sha:
+        state["last_remote_sha"] = latest_sha
+        state["first_seen_at"] = _now_iso()
+
+    if state.get("last_notified_sha") != latest_sha:
+        # stderr so it shows up alongside uvicorn's request log without
+        # depending on the logging module (rest of app.py uses neither).
+        print(
+            f"[miniclosedai] update available: {current_sha[:7]} → {latest_sha[:7]}",
+            file=sys.stderr,
+            flush=True,
+        )
+        state["last_notified_sha"] = latest_sha
+
+    _write_upgrade_check_state(state)
+    return state
+
+
+def _cached_or_fetch_github_sha() -> str | None:
+    """Cached-or-fetch wrapper around `_github_main_sha` for Docker mode.
+
+    GitHub's anonymous REST API allows 60 requests / hour / IP. A single
+    chatty client polling every minute would exhaust that in an hour; a busy
+    LAN with several browsers open each polling every 10 minutes can also
+    creep up. The cache window collapses N concurrent requests within a
+    10-minute window into one network call.
+    """
+    state = _read_upgrade_check_state()
+    last_at = state.get("last_checked_at")
+    last_sha = state.get("last_remote_sha")
+    if last_at and last_sha:
+        try:
+            cached_age = time.time() - datetime.fromisoformat(last_at).timestamp()
+            if 0 <= cached_age < _UPGRADE_RECHECK_INTERVAL_S:
+                return last_sha
+        except Exception:
+            pass
+    return _github_main_sha()
+
+
+def _upgrade_status_base() -> dict:
+    """Shared scaffolding fields for the upgrade-status response. Every code
+    path in `api_upgrade_status` builds on this to keep the response shape
+    stable regardless of which branch was taken."""
+    return {
         "current_sha": None,
         "current_short": None,
         "latest_sha": None,
@@ -1962,35 +2083,79 @@ def api_upgrade_status():
         "dirty": False,
         "latest_messages": [],
         "last_run": _read_upgrade_progress(),
+        "first_seen_at": None,
     }
 
-    if in_docker:
+
+def _upgrade_status_unknown(base: dict) -> dict:
+    """No `.git` directory — user installed from a tarball, or the working
+    tree was nuked. In-place upgrade can't work; tell them to re-clone."""
+    return {
+        **base,
+        "installed_via": "unknown",
+        "can_upgrade": False,
+        "reason": (
+            "Not a git checkout. Re-clone from "
+            "https://github.com/edantonio505/miniclosedai.git "
+            "to enable in-place upgrades."
+        ),
+    }
+
+
+def _upgrade_status_docker(base: dict) -> dict:
+    """Containers don't ship `.git`, so we can't run git locally. Instead the
+    build SHA is baked in via the `GIT_SHA` build arg (compose passes it) and
+    we ask GitHub's REST API what `origin/main` currently is. If the two
+    differ the badge fires; clicking it surfaces the docker-compose rebuild
+    instructions (in-place upgrade still off)."""
+    build_sha = (os.environ.get("MINICLOSEDAI_BUILD_SHA") or "").strip() or None
+
+    if not build_sha or build_sha == "unknown":
+        reason = (
+            _DOCKER_UPGRADE_REASON
+            + " (Build SHA not baked into this image — rebuild with "
+            "`GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build` "
+            "to enable update notifications.)"
+        )
+        return {**base, "installed_via": "docker", "can_upgrade": False, "reason": reason}
+
+    latest_sha = _cached_or_fetch_github_sha()
+    if not latest_sha:
+        # GitHub unreachable / rate-limited — degrade gracefully rather than
+        # claim either presence or absence of an update we can't verify.
         return {
             **base,
+            "current_sha": build_sha,
+            "current_short": build_sha[:7],
             "installed_via": "docker",
             "can_upgrade": False,
             "reason": _DOCKER_UPGRADE_REASON,
         }
 
-    if not git_dir.exists():
-        return {
-            **base,
-            "installed_via": "unknown",
-            "can_upgrade": False,
-            "reason": (
-                "Not a git checkout. Re-clone from "
-                "https://github.com/edantonio505/miniclosedai.git "
-                "to enable in-place upgrades."
-            ),
-        }
+    state = _record_update_state(build_sha, latest_sha)
+    behind = 0 if latest_sha == build_sha else 1   # binary — no graph in-container
+    return {
+        **base,
+        "current_sha": build_sha,
+        "current_short": build_sha[:7],
+        "latest_sha": latest_sha,
+        "latest_short": latest_sha[:7],
+        "behind": behind,
+        "installed_via": "docker",
+        "can_upgrade": False,  # Docker upgrade is always rebuild-from-source
+        "reason": _DOCKER_UPGRADE_REASON if behind else "Already on the latest commit.",
+        "first_seen_at": state.get("first_seen_at") if behind else None,
+    }
 
-    # Best-effort fetch so behind-count + latest messages reflect origin/main.
-    # Offline / DNS failures shouldn't break the endpoint — we just fall back
-    # to last-known-origin if fetch can't reach the remote.
+
+def _upgrade_status_git(base: dict) -> dict:
+    """Git checkout — fetch origin/main (best-effort, offline tolerated) and
+    compute behind-count via the local graph. Records a state-file entry so
+    the once-per-version log fires here too, matching Docker mode."""
     try:
         _git_cmd("fetch", "--quiet", "--prune", "origin", "main", timeout=10.0)
     except Exception:
-        pass  # offline or other transient issue; continue with cached origin/main
+        pass  # offline / DNS failure → fall back to last-known origin/main
 
     try:
         current_sha = _git_cmd("rev-parse", "HEAD")
@@ -2003,17 +2168,15 @@ def api_upgrade_status():
             latest_sha, latest_short, behind = current_sha, current_short, 0
         dirty = bool(_git_cmd("status", "--porcelain"))
         if behind > 0:
-            log = _git_cmd("log", "--pretty=%s", "-50", f"{current_sha}..{latest_sha}")
-            messages = [line for line in log.splitlines() if line.strip()]
+            log_out = _git_cmd("log", "--pretty=%s", "-50", f"{current_sha}..{latest_sha}")
+            messages = [line for line in log_out.splitlines() if line.strip()]
         else:
             messages = []
     except Exception as e:
-        return {
-            **base,
-            "installed_via": "git",
-            "can_upgrade": False,
-            "reason": f"git read failed: {e}",
-        }
+        return {**base, "installed_via": "git", "can_upgrade": False,
+                "reason": f"git read failed: {e}"}
+
+    state = _record_update_state(current_sha, latest_sha if behind > 0 else current_sha)
 
     can_upgrade = behind > 0 and not dirty and _UPGRADE_SCRIPT.exists()
     reason = None
@@ -2028,6 +2191,7 @@ def api_upgrade_status():
         reason = "upgrade.sh missing from the project root."
 
     return {
+        **base,
         "current_sha": current_sha,
         "current_short": current_short,
         "latest_sha": latest_sha,
@@ -2035,11 +2199,32 @@ def api_upgrade_status():
         "behind": behind,
         "dirty": dirty,
         "latest_messages": messages,
-        "last_run": _read_upgrade_progress(),
         "installed_via": "git",
         "can_upgrade": can_upgrade,
         "reason": reason,
+        "first_seen_at": state.get("first_seen_at") if behind > 0 else None,
     }
+
+
+@app.get("/api/upgrade/status")
+def api_upgrade_status():
+    """Read-only version + update-availability probe.
+
+    Three modes, dispatched by environment:
+    - **Docker**: build SHA env + GitHub REST (cache-windowed)
+    - **Unknown**: no `.git` directory present, in-place upgrade impossible
+    - **Git**: standard `git fetch` + local graph for the behind-count
+
+    All three converge on the same response shape and call into
+    `_record_update_state` so the once-per-version log fires regardless of
+    which mode the install is running in.
+    """
+    base = _upgrade_status_base()
+    if _running_in_docker():
+        return _upgrade_status_docker(base)
+    if not (_PROJECT_DIR / ".git").exists():
+        return _upgrade_status_unknown(base)
+    return _upgrade_status_git(base)
 
 
 @app.post("/api/upgrade/run")

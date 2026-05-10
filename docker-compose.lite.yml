@@ -27,6 +27,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Captured at build time so the running container can answer "is
+        # there a newer commit on origin/main?" without shipping a git
+        # client. Resolved against the host's checkout where this compose
+        # file lives.
+        GIT_SHA: ${GIT_SHA:-unknown}
     image: miniclosedai/app:latest
     environment:
       # Lite mode: skip seeding the built-in Ollama backend on a fresh DB,

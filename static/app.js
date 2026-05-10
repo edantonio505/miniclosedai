@@ -2714,6 +2714,23 @@ docker compose up -d --build</pre>`;
     body.appendChild(warn);
   }
 
+  // "Available since X" line — server stamps `first_seen_at` the first time
+  // a given remote SHA is observed and clears it once the install catches up.
+  // Useful when a release has been sitting available for a while and the user
+  // just opened the modal.
+  if (status.first_seen_at) {
+    const since = document.createElement("div");
+    since.className = "upgrade-since";
+    since.style.color = "var(--text-muted)";
+    since.style.fontSize = "11.5px";
+    since.style.marginTop = "6px";
+    const d = new Date(status.first_seen_at);
+    since.textContent = isNaN(d.valueOf())
+      ? `Available since ${status.first_seen_at}`
+      : `Available since ${d.toLocaleString()}`;
+    body.appendChild(since);
+  }
+
   if (status.latest_messages && status.latest_messages.length) {
     const list = document.createElement("ul");
     list.className = "upgrade-commit-list";
