@@ -431,7 +431,12 @@ async function openConversation(id) {
   const c = await r.json();
   state.conversationId = c.id;
   state.messages = c.messages || [];
-  if (c.system_prompt) els.systemPrompt.value = c.system_prompt;
+  els.systemPrompt.value = c.system_prompt || "";
+  // Programmatic .value sets don't fire `input`, so the toggle label (and
+  // any future prompt-edit observers) won't update on conversation switch
+  // without this nudge. The bound listener also re-runs saveSettings, which
+  // is a no-op for an unchanged localStorage payload.
+  if (typeof _updatePromptGenAffordance === "function") _updatePromptGenAffordance();
 
   // Match by (model, backend_id) pair. Falls back to model-only if the exact
   // pair can't be found (e.g. the endpoint was deleted). If nothing matches,
@@ -497,6 +502,7 @@ async function newConversation() {
 
 function resetSidebarToDefaults() {
   els.systemPrompt.value = "";
+  if (typeof _updatePromptGenAffordance === "function") _updatePromptGenAffordance();
   els.temperature.value = DEFAULTS.temperature;
   els.maxTokens.value   = DEFAULTS.max_tokens;
   els.topP.value        = DEFAULTS.top_p;
@@ -2993,10 +2999,392 @@ async function init() {
   els.input.addEventListener("input", autoGrowInput);
   await loadModels();
   await loadConversations();
+  initPromptGenUI();
 
   // Auto-open most recent conversation if any
   const list = await (await fetch("/api/conversations")).json();
   if (list.length) await openConversation(list[0].id);
+}
+
+// =====================================================================
+// "Generate prompt" affordance — sidebar button that conjures a system
+// prompt from a free-text description, using a remote Ollama hosted on
+// app.interdataresearch.{com,ai}. Hidden unless that backend is both
+// registered AND reachable.
+// =====================================================================
+
+// Storage: JSON-encoded {backend_id, model} so we can re-resolve the chosen
+// pair after a reload. Old format (bare model name) is migrated on read.
+const _PROMPT_GEN_CHOICE_KEY = "miniclosedai:promptGenChoice";
+
+// Two meta-prompts. The "generate" path takes a free-text description and
+// produces a system prompt from scratch. The "improve" path takes the current
+// system prompt + the conversation transcript + a user instruction and
+// rewrites the prompt to incorporate the change.
+const _PROMPT_GEN_META_PROMPT = `You are an expert prompt engineer. Given a short description of what an AI assistant should do, write a single complete system prompt that defines:
+- The assistant's role and tone
+- What it should do (concrete, actionable instructions)
+- What it should NOT do (only when relevant — guardrails, scope limits)
+- The output format the assistant should follow (only if relevant)
+
+Output ONLY the system prompt itself. Do not preface it with "Here is the prompt:" or explain your choices. Do not wrap it in code fences or quotation marks. Begin directly with the prompt body.`;
+
+const _PROMPT_IMPROVE_META_PROMPT = `You are an expert prompt engineer. The user will send you three labeled sections:
+1. CURRENT SYSTEM PROMPT — the system prompt as it stands now.
+2. CONVERSATION TRANSCRIPT — recent turns between a user and the assistant running on that prompt. May be empty if the prompt has not been tested yet.
+3. IMPROVEMENT REQUEST — what the prompt's owner wants changed or added.
+
+Rewrite the system prompt to incorporate the improvement. Preserve everything that should stay; change only what is needed. When the conversation transcript shows the assistant doing the wrong thing, treat those turns as concrete failure cases the new prompt must prevent. When the transcript shows the assistant succeeding, preserve the behavior that produced those wins.
+
+Output ONLY the improved system prompt body. No preface ("Here is the improved prompt:"), no commentary, no code fences, no quotation marks. Begin directly with the new prompt body.`;
+
+// Currently-selected pair (resolved from saved choice or defaulted).
+let _promptGenBackend = null;
+let _promptGenModel = null;
+// Latest snapshot of every enabled+running backend with at least one model,
+// used to populate the Settings dropdown's optgroups.
+let _promptGenAllBackends = [];
+
+function _readSavedPromptGenChoice() {
+  try {
+    const raw = localStorage.getItem(_PROMPT_GEN_CHOICE_KEY);
+    if (!raw) return null;
+    // Old format: a bare model name string. Migrate by treating backend_id as
+    // unknown so we'll just match by model name on first available backend.
+    if (raw[0] !== "{") return { backend_id: null, model: raw };
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.model !== "string") return null;
+    return { backend_id: parsed.backend_id ?? null, model: parsed.model };
+  } catch {
+    return null;
+  }
+}
+
+function _resolvePromptGenChoice(allBackends) {
+  if (!allBackends.length) return null;
+  const saved = _readSavedPromptGenChoice();
+  if (saved) {
+    // Prefer exact (backend_id, model) match.
+    if (saved.backend_id != null) {
+      const b = allBackends.find(x => x.id === saved.backend_id);
+      if (b) {
+        const names = (b.models || []).map(m => m && m.name).filter(Boolean);
+        if (names.includes(saved.model)) return { backend: b, model: saved.model };
+      }
+    }
+    // Fall back to model-name match across any backend (handles migrated
+    // old-format entries and the case where the user removed/re-added the
+    // backend so its id changed).
+    for (const b of allBackends) {
+      const names = (b.models || []).map(m => m && m.name).filter(Boolean);
+      if (names.includes(saved.model)) return { backend: b, model: saved.model };
+    }
+  }
+  // Nothing saved or saved choice has vanished — pick the first model on the
+  // first backend.
+  const first = allBackends[0];
+  const firstNames = (first.models || []).map(m => m && m.name).filter(Boolean);
+  return { backend: first, model: firstNames[0] };
+}
+
+function _collectUsableBackends(modelsResponse) {
+  const backends = (modelsResponse && modelsResponse.backends) || [];
+  return backends.filter(b => {
+    if (!b.enabled || !b.running) return false;
+    const names = (b.models || []).map(m => m && m.name).filter(Boolean);
+    return names.length > 0;
+  });
+}
+
+function _renderPromptGenSettings() {
+  const section = document.getElementById("prompt-gen-settings-section");
+  const select = document.getElementById("prompt-gen-model-select");
+  const hint = document.getElementById("prompt-gen-model-hint");
+  if (!section || !select) return;
+
+  if (!_promptGenAllBackends.length) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+
+  // Group by backend, mirroring the Dashboard's model dropdown.
+  select.innerHTML = "";
+  let totalModels = 0;
+  for (const b of _promptGenAllBackends) {
+    const group = document.createElement("optgroup");
+    group.label = `${b.name} — ${b.kind}`;
+    const names = (b.models || []).map(m => m && m.name).filter(Boolean);
+    for (const name of names) {
+      const opt = document.createElement("option");
+      // Encode backend_id in the value so the change handler can recover it.
+      opt.value = `${b.id}::${name}`;
+      opt.textContent = name;
+      group.appendChild(opt);
+      totalModels += 1;
+    }
+    select.appendChild(group);
+  }
+  if (_promptGenBackend && _promptGenModel) {
+    select.value = `${_promptGenBackend.id}::${_promptGenModel}`;
+  }
+  if (hint) {
+    const backendCount = _promptGenAllBackends.length;
+    hint.textContent = `${totalModels} model${totalModels === 1 ? "" : "s"} across ${backendCount} reachable backend${backendCount === 1 ? "" : "s"}. The first model on the first backend is used by default; pick a larger or instruction-tuned one for better-quality prompts. Selection persists across reloads.`;
+  }
+}
+
+async function _refreshPromptGenAvailability() {
+  const bar = document.getElementById("prompt-gen-bar");
+  const reset = () => {
+    _promptGenBackend = null;
+    _promptGenModel = null;
+    _promptGenAllBackends = [];
+    if (bar) bar.hidden = true;
+    _renderPromptGenSettings();
+  };
+  try {
+    const r = await fetch("/api/models");
+    if (!r.ok) { reset(); return; }
+    const data = await r.json();
+    const usable = _collectUsableBackends(data);
+    if (!usable.length) { reset(); return; }
+    const chosen = _resolvePromptGenChoice(usable);
+    if (!chosen) { reset(); return; }
+    _promptGenAllBackends = usable;
+    _promptGenBackend = chosen.backend;
+    _promptGenModel = chosen.model;
+    if (bar) bar.hidden = false;
+    _renderPromptGenSettings();
+  } catch {
+    reset();
+  }
+}
+
+function _setPromptGenStatus(text, isError = false) {
+  const el = document.getElementById("prompt-gen-status");
+  if (!el) return;
+  if (!text) { el.hidden = true; el.textContent = ""; return; }
+  el.hidden = false;
+  el.textContent = text;
+  el.classList.toggle("error", !!isError);
+}
+
+// Mode is decided by whether the System Prompt textarea has any content.
+// Empty → "generate" (build from scratch). Non-empty → "improve" (rewrite
+// using the existing prompt + chat transcript + user instruction).
+function _promptGenMode() {
+  const ta = document.getElementById("system-prompt");
+  return (ta && ta.value.trim()) ? "improve" : "generate";
+}
+
+function _updatePromptGenAffordance() {
+  const labelEl = document.getElementById("prompt-gen-toggle-label");
+  const toggle = document.getElementById("prompt-gen-toggle");
+  const inputEl = document.getElementById("prompt-gen-input");
+  const submitBtn = document.getElementById("prompt-gen-submit");
+  if (!labelEl || !toggle) return;
+  if (_promptGenMode() === "improve") {
+    labelEl.textContent = "Improve prompt";
+    toggle.dataset.tooltip = "Rewrite the existing prompt using the conversation as evidence";
+    if (inputEl) inputEl.placeholder = "What should be improved? e.g. 'Be more concise', 'Always confirm before booking', 'Refuse off-topic questions politely'";
+    if (submitBtn) submitBtn.textContent = "Improve";
+  } else {
+    labelEl.textContent = "Generate prompt";
+    toggle.dataset.tooltip = "Generate a system prompt from a description";
+    if (inputEl) inputEl.placeholder = "Describe the bot, e.g. 'Polite customer support agent for a SaaS company that escalates billing questions to humans'";
+    if (submitBtn) submitBtn.textContent = "Generate";
+  }
+}
+
+// Compact, plain-text transcript of the visible chat messages for the
+// "improve" path. Long conversations get tail-trimmed (last 30 turns) to keep
+// the prompt-gen request well under any backend's context window.
+function _promptImproveTranscript() {
+  const msgs = (typeof state !== "undefined" && Array.isArray(state.messages)) ? state.messages : [];
+  if (!msgs.length) return "";
+  const tail = msgs.slice(-30);
+  const lines = [];
+  for (const m of tail) {
+    if (!m || !m.role) continue;
+    const text = (typeof _userVisibleText === "function") ? _userVisibleText(m) : (typeof m.content === "string" ? m.content : "");
+    const cleaned = (text || "").trim();
+    if (!cleaned) continue;
+    const speaker = m.role === "assistant" ? "Assistant" : (m.role === "user" ? "User" : m.role);
+    lines.push(`${speaker}: ${cleaned}`);
+  }
+  return lines.join("\n\n");
+}
+
+async function _runPromptGeneration(description) {
+  if (!_promptGenBackend || !_promptGenModel) return;
+  const ta = document.getElementById("system-prompt");
+  if (!ta) return;
+
+  const mode = _promptGenMode();
+  const isImprove = mode === "improve";
+
+  // Build the meta-prompt + user payload for the chosen mode.
+  let metaPrompt, userContent, statusVerb, savedOriginal = null;
+  if (isImprove) {
+    savedOriginal = ta.value;  // restore on failure so the user doesn't lose their prompt
+    metaPrompt = _PROMPT_IMPROVE_META_PROMPT;
+    const transcript = _promptImproveTranscript();
+    const sections = [
+      `=== CURRENT SYSTEM PROMPT ===\n${savedOriginal.trim()}`,
+      transcript
+        ? `=== CONVERSATION TRANSCRIPT ===\n${transcript}`
+        : `=== CONVERSATION TRANSCRIPT ===\n(no conversation has been run against this prompt yet)`,
+      `=== IMPROVEMENT REQUEST ===\n${description}`,
+    ];
+    userContent = sections.join("\n\n");
+    statusVerb = "Improving";
+  } else {
+    metaPrompt = _PROMPT_GEN_META_PROMPT;
+    userContent = description;
+    statusVerb = "Generating";
+  }
+
+  _setPromptGenStatus(`${statusVerb} with ${_promptGenModel} on ${_promptGenBackend.name}…`);
+  ta.value = "";
+  ta.disabled = true;
+
+  try {
+    const r = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        backend_id: _promptGenBackend.id,
+        model: _promptGenModel,
+        system_prompt: metaPrompt,
+        messages: [{ role: "user", content: userContent }],
+        // Higher cap than chat default — system prompts can be long.
+        max_tokens: 4000,
+        temperature: 0.5,
+        // Keep model from "thinking" out loud for non-reasoning hosts;
+        // reasoning hosts will ignore the flag.
+        think: false,
+      }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${r.status}`);
+    }
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let done = false;
+    while (!done) {
+      const { value, done: streamDone } = await reader.read();
+      done = streamDone;
+      if (value) {
+        buffer += decoder.decode(value, { stream: !done });
+        // SSE frames are separated by \n\n; keep any partial frame in buffer.
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            const payload = line.slice(6).trim();
+            if (!payload) continue;
+            let evt;
+            try { evt = JSON.parse(payload); } catch { continue; }
+            if (typeof evt.chunk === "string") {
+              ta.value += evt.chunk;
+              ta.scrollTop = ta.scrollHeight;
+            } else if (evt.error) {
+              throw new Error(evt.error);
+            }
+          }
+        }
+      }
+    }
+    // Trim trailing whitespace — the model often appends a stray newline.
+    ta.value = ta.value.replace(/\s+$/, "");
+    // The textarea's `input` listener (saveSettings + scheduleSaveToConversation)
+    // doesn't fire when JS sets `.value` directly, so fire it ourselves to
+    // persist into the active conversation.
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    _setPromptGenStatus("");
+  } catch (e) {
+    // On failure — especially in "improve" mode — restore the prompt the
+    // user already had so they don't lose work to a streaming hiccup.
+    if (isImprove && savedOriginal) ta.value = savedOriginal;
+    const verb = isImprove ? "Improvement" : "Generation";
+    _setPromptGenStatus(`${verb} failed: ${(e && e.message) || e}`, true);
+  } finally {
+    ta.disabled = false;
+    _updatePromptGenAffordance();
+    ta.focus();
+  }
+}
+
+function initPromptGenUI() {
+  const bar = document.getElementById("prompt-gen-bar");
+  if (!bar) return;
+  const toggle = document.getElementById("prompt-gen-toggle");
+  const row = document.getElementById("prompt-gen-input-row");
+  const input = document.getElementById("prompt-gen-input");
+  const submit = document.getElementById("prompt-gen-submit");
+  const cancel = document.getElementById("prompt-gen-cancel");
+
+  const showInput = (show) => {
+    if (!row || !toggle) return;
+    row.hidden = !show;
+    toggle.hidden = show;
+    if (show && input) { input.value = ""; input.focus(); }
+  };
+
+  toggle?.addEventListener("click", () => showInput(true));
+  cancel?.addEventListener("click", () => { showInput(false); _setPromptGenStatus(""); });
+  const fire = () => {
+    const desc = (input?.value || "").trim();
+    if (!desc) { input?.focus(); return; }
+    showInput(false);
+    _runPromptGeneration(desc);
+  };
+  submit?.addEventListener("click", fire);
+  input?.addEventListener("keydown", e => {
+    // Match the chat composer: Enter submits, Shift+Enter inserts a newline.
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); fire(); }
+    else if (e.key === "Escape") { e.preventDefault(); showInput(false); }
+  });
+
+  // Settings → "Prompt Generator" model picker. Option values are encoded
+  // as `<backend_id>::<model>` so we can persist both halves and re-resolve
+  // them after a reload.
+  const modelSelect = document.getElementById("prompt-gen-model-select");
+  modelSelect?.addEventListener("change", () => {
+    const v = modelSelect.value;
+    if (!v) return;
+    const sep = v.indexOf("::");
+    if (sep < 0) return;
+    const backendId = parseInt(v.slice(0, sep), 10);
+    const modelName = v.slice(sep + 2);
+    if (!modelName || Number.isNaN(backendId)) return;
+    const b = _promptGenAllBackends.find(x => x.id === backendId);
+    if (!b) return;
+    _promptGenBackend = b;
+    _promptGenModel = modelName;
+    try {
+      localStorage.setItem(
+        _PROMPT_GEN_CHOICE_KEY,
+        JSON.stringify({ backend_id: backendId, model: modelName }),
+      );
+    } catch {}
+  });
+
+  // Toggle button label flips between "Generate prompt" and "Improve prompt"
+  // depending on whether the system-prompt textarea has content. Hook into
+  // the existing `input` listener pipeline.
+  els.systemPrompt?.addEventListener("input", _updatePromptGenAffordance);
+  _updatePromptGenAffordance();
+
+  // Initial probe + light periodic refresh so the button appears/disappears
+  // as the backend's reachability flips. Same cadence as upgrade-status poll.
+  _refreshPromptGenAvailability();
+  setInterval(_refreshPromptGenAvailability, 60 * 1000);
 }
 
 init();
