@@ -544,6 +544,14 @@ From the Settings page:
 - **Delete** removes a non-built-in endpoint. If any conversation is still bound to it, you get a 409 listing the conversations — rebind them first, then retry.
 - **The built-in Ollama endpoint** can be renamed or have its URL changed (useful if Ollama runs on a different port or host), but can't be deleted.
 
+### Downloading new models from Ollama
+
+Each Ollama endpoint card on the Settings page has a small inline **Download** form (`e.g. qwen3:30b` placeholder). Type a model tag, click **Download**, and the server streams `/api/pull` against that endpoint. A progress row appears underneath showing layer/byte progress; multiple pulls can run in parallel against different endpoints.
+
+The form is **shown by default** for every Ollama endpoint you register, since adding the endpoint implies you administer it. The exception is **known relay providers** that forward `/api/chat` but reject `/api/pull` (e.g. `app.interdataresearch.*`) — those would 403 on every keystroke, so the form is suppressed. The hostname denylist lives at `static/app.js` → `_OLLAMA_PULL_DENY_HOST_FRAGMENTS`; append a substring there to suppress the form for additional relays you might add.
+
+OpenAI-compatible endpoints (LM Studio, vLLM, llama.cpp, real OpenAI) don't expose a pull API at all — managing models there happens in their own UI / CLI, not in MiniClosedAI.
+
 ---
 
 ## Generating system prompts
@@ -1795,13 +1803,22 @@ Two ways to pull the latest from `https://github.com/edantonio505/miniclosedai`.
 
 ### Option 1 — One click in the GUI
 
-When new commits are available on `main`, a small **"Update available"** badge appears in the header (between **API Code** and the theme toggle) showing the count of pending commits. Click it.
+When new commits land on `main`, a small **"Update available"** badge appears in the header (between **API Code** and the theme toggle). Click it.
 
 The modal shows:
 - Current commit short-SHA → latest commit short-SHA
-- The list of commit subjects you'll pick up
+- The list of commit subjects you'll pick up (git installs only)
+- An "Available since &lt;date&gt;" hint when a release has been sitting unupgraded
 - A warning if your working tree has local changes (you'll need to commit, stash, or `git checkout -- .` first)
-- A primary **"Run upgrade"** button
+- A primary **"Run upgrade"** button (git installs) — or rebuild instructions for Docker installs
+
+Detection works in **all install modes**:
+
+| Install | How "behind" is computed | Server log on first detection |
+|---|---|---|
+| Git checkout | `git fetch origin main` + local `git rev-list --count` | `[miniclosedai] update available: <current> → <latest>` once per new SHA |
+| Docker (lite or full) | Build SHA baked at image build via `GIT_SHA` build arg + GitHub REST API call (10-min cached) | Same line, in `docker logs miniclosedai` |
+| Tarball / no `.git` | Not supported — modal explains how to re-clone | n/a |
 
 Clicking **Run upgrade** triggers `upgrade.sh` server-side in a detached shell session. The modal then walks the four phases live:
 
@@ -1841,13 +1858,12 @@ Logs from the upgrade attempt land in `/tmp/miniclosedai-upgrade.log` for postmo
 
 ### When the upgrade button isn't available
 
-Three reasons the button stays hidden / disabled:
-
 | Situation | What you'll see | How to fix |
 |---|---|---|
 | Already on latest | Badge hidden | Nothing to do |
 | Local uncommitted changes | Badge visible, button disabled, modal shows the warning | `git stash` (or commit / discard) first |
-| Docker install | Modal shows the `git pull && docker compose up -d --build` command | Run that from the host, not from inside the container (image tags are built from source — `docker compose pull` will fail with `pull access denied`) |
+| Docker install with **detected** update | Badge visible, modal shows `git pull && docker compose up -d --build` (in-place upgrade off — Docker image tags are built from source, so `docker compose pull` will fail with `pull access denied`) | Run the command on the host. Pass `GIT_SHA=$(git rev-parse HEAD)` so future updates can be detected: `GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build --force-recreate` |
+| Docker install built **without `GIT_SHA`** | Badge hidden — modal hint says "Build SHA not baked into this image" | Rebuild once with the build arg above; thereafter detection works |
 | Tarball download (no `.git/`) | Modal explains in-place upgrades aren't available | Re-clone with git |
 
 ---

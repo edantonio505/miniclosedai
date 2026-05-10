@@ -2037,19 +2037,23 @@ function _renderBackendCard(b) {
   return card;
 }
 
-// Pull only makes sense on Ollama instances you control — typically localhost
-// or a machine on your LAN. Public-hostname Ollama backends (e.g. an
-// authenticating relay like app.interdataresearch.com) generally forward
-// `/api/chat` but reject `/api/pull`, since they don't let you write models
-// onto someone else's disk. Hide the download UI in that case.
+// Hostnames known to forward `/api/chat` but reject `/api/pull` (typically
+// authenticating relays where models live on someone else's disk and only
+// inference is exposed). Substring match so `.com` and `.ai` variants both
+// hit; lowercased before comparison.
+const _OLLAMA_PULL_DENY_HOST_FRAGMENTS = ["app.interdataresearch"];
+
+// Pull is allowed by default for any Ollama backend the user has registered
+// — if they added it, they likely admin the target machine. The denylist
+// above suppresses the form for known relay providers where attempting a
+// pull would 403 on every keystroke.
 function _ollamaAllowsPull(b) {
   let host;
-  try { host = new URL(b.base_url).hostname; } catch { return false; }
-  if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0") return true;
-  if (/^10\./.test(host)) return true;                               // 10.0.0.0/8
-  if (/^192\.168\./.test(host)) return true;                         // 192.168.0.0/16
-  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) return true;         // 172.16.0.0/12
-  return false;  // public hostname / IP — assume no pull capability
+  try { host = new URL(b.base_url).hostname.toLowerCase(); } catch { return false; }
+  for (const frag of _OLLAMA_PULL_DENY_HOST_FRAGMENTS) {
+    if (host.includes(frag)) return false;
+  }
+  return true;
 }
 
 function _renderPullSection(b) {

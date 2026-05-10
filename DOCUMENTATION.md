@@ -778,6 +778,24 @@ Edit `VISION_MODEL_PATTERNS` in `static/app.js` to extend it. The check is purel
 
 Both backend kinds now thread `api_key` (sent as `Authorization: Bearer …`) and any custom `headers` dict through every HTTP call, including `/api/tags`, `/api/chat`, and `/api/pull`. This lets you register a public-IP Ollama (e.g. an authenticating relay sitting in front of `localhost:11434`) as `kind=ollama` and still hit the native `/api/chat` endpoint — which is the only one that honors `"think": false` properly for Qwen3-family models.
 
+### Model pulls and the relay denylist
+
+```
+POST /api/backends/{backend_id}/pull         → start a streaming pull
+GET  /api/pulls                              → poll progress for all in-flight pulls
+```
+
+Body for the start call: `{"name": "qwen3:30b"}`. The server proxies to the backend's `/api/pull` and streams JSONL progress events the GUI surfaces as a per-layer progress row.
+
+The Settings UI gates the **Download** form by hostname — calling pull on a relay-style provider that forwards `/api/chat` but rejects `/api/pull` would 403 on every keystroke. The denylist is a substring match against `URL.hostname.toLowerCase()`:
+
+```js
+// static/app.js
+const _OLLAMA_PULL_DENY_HOST_FRAGMENTS = ["app.interdataresearch"];
+```
+
+Default policy: **allow pull on every Ollama endpoint the user has registered**. Adding the endpoint implies the user administers it (or has permission to write models to it). Append fragments to the array if you discover another known relay where pulls fail. The HTTP endpoint itself doesn't enforce this — it's purely a UI affordance; CLI / programmatic callers can still try the pull, and they'll get the relay's actual error response back.
+
 ### Dependencies
 
 `pypdf` and `python-multipart` are pinned in `requirements.txt`. A standard `pip install -r requirements.txt` is the full setup; users cloning the repo do not need any extra commands to enable file attachments. Image and text-file handling is browser-side and adds no runtime dependencies.
