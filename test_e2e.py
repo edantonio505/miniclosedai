@@ -389,6 +389,51 @@ def _():
         client.delete(f"/api/backends/{bid}")
 
 
+@test("backends: DELETE ?force=true cascades — backend + bound bots gone")
+def _():
+    # Settings → Delete should let users blow away a stale endpoint AND the
+    # bots pinned to it in one shot, after a two-step confirm in the GUI.
+    # The force flag is the server side of that escape hatch.
+    bid = _add_openai_backend()
+    conv1 = client.post("/api/conversations", json={
+        "title": "stale-1", "model": "openai-a-4b", "backend_id": bid,
+    }).json()
+    conv2 = client.post("/api/conversations", json={
+        "title": "stale-2", "model": "openai-a-4b", "backend_id": bid,
+    }).json()
+    # Sanity: force=true succeeds and reports the cascade count.
+    r = client.delete(f"/api/backends/{bid}?force=true")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["deleted_conversations"] == 2, body
+    # Backend gone — verified via the list endpoint since there's no
+    # /api/backends/{id} GET (the path only takes DELETE/PATCH).
+    listed = client.get("/api/backends").json()
+    assert all(b["id"] != bid for b in listed), f"backend {bid} still present: {listed}"
+    # Both conversations gone too.
+    for c in (conv1, conv2):
+        assert client.get(f"/api/conversations/{c['id']}").status_code == 404
+
+
+@test("backends: DELETE ?force=true on built-in still 403")
+def _():
+    # The built-in Ollama is undeletable regardless of force — protects
+    # against the user wiping the only Ollama row by accident in lite mode.
+    r = client.delete("/api/backends/1?force=true")
+    assert r.status_code == 403, r.text
+
+
+@test("backends: DELETE ?force=true with no bound bots is a no-op cascade")
+def _():
+    # Force-delete a clean backend (no bots) — should still succeed and
+    # report 0 deletions, not error or count a phantom bot.
+    bid = _add_openai_backend()
+    r = client.delete(f"/api/backends/{bid}?force=true")
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted_conversations"] == 0
+
+
 @test("backends: /status reports reachable for our fake")
 def _():
     _reseed_builtin_to_fake_ollama()

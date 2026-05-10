@@ -294,7 +294,15 @@ def api_update_backend(backend_id: int, data: BackendUpdate):
 
 
 @app.delete("/api/backends/{backend_id}")
-def api_delete_backend(backend_id: int):
+def api_delete_backend(backend_id: int, force: bool = False):
+    """Delete a backend.
+
+    Default behavior: refuses with 409 when any conversation is still pinned
+    to this backend, returning the bound list so the GUI can offer to rebind
+    them. When `force=true`, also deletes those conversations as a cascade —
+    used by the GUI's "delete the bots too" two-step confirm. Built-in
+    backends are still 403 regardless of `force`.
+    """
     with db.get_conn() as conn:
         row = conn.execute(
             "SELECT id, name, is_builtin FROM backends WHERE id = ?", (backend_id,)
@@ -307,21 +315,29 @@ def api_delete_backend(backend_id: int):
         bound = conn.execute(
             "SELECT id, title FROM conversations WHERE backend_id = ?", (backend_id,)
         ).fetchall()
-        if bound:
+        if bound and not force:
             raise HTTPException(
                 409,
                 {
                     "message": f"Backend {backend_id} is still bound to "
-                               f"{len(bound)} conversation(s). Rebind them first.",
+                               f"{len(bound)} conversation(s). Rebind them first, "
+                               f"or retry with `?force=true` to cascade-delete the bots.",
                     "bound_conversations": [
                         {"id": r["id"], "title": r["title"]} for r in bound
                     ],
                 },
             )
 
+        if force and bound:
+            conn.execute(
+                "DELETE FROM conversations WHERE backend_id = ?", (backend_id,)
+            )
         conn.execute("DELETE FROM backends WHERE id = ?", (backend_id,))
         conn.commit()
-    return {"ok": True}
+    return {
+        "ok": True,
+        "deleted_conversations": len(bound) if force else 0,
+    }
 
 
 class BackendTestRequest(BackendCreate):

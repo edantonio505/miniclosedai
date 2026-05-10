@@ -2394,14 +2394,42 @@ async function deleteBackend(b) {
   if (!confirm(`Delete endpoint "${b.name}"?`)) return;
   try {
     const r = await fetch(`/api/backends/${b.id}`, { method: "DELETE" });
-    if (!r.ok) {
-      const body = await r.json().catch(() => ({}));
-      const msg = (body.detail && body.detail.message) || body.detail || `HTTP ${r.status}`;
-      alert("Delete blocked: " + msg);
+    if (r.ok) {
+      await renderSettingsPage();
+      if (typeof loadModels === "function") await loadModels();
       return;
     }
-    await renderSettingsPage();
-    if (typeof loadModels === "function") await loadModels();
+
+    // Surface the rebind/cascade choice when the server reports 409 with a
+    // bound-conversations list. Other failures fall through to a plain alert.
+    const body = await r.json().catch(() => ({}));
+    const detail = body.detail;
+    const bound = detail && Array.isArray(detail.bound_conversations) ? detail.bound_conversations : null;
+
+    if (r.status === 409 && bound && bound.length) {
+      const titles = bound.slice(0, 8).map(c => `  • ${c.title || `(conv ${c.id})`}`).join("\n");
+      const more = bound.length > 8 ? `\n  …and ${bound.length - 8} more` : "";
+      const cascadeOK = confirm(
+        `"${b.name}" is still pinned by ${bound.length} bot(s):\n\n${titles}${more}\n\n` +
+        `Cancel to rebind those bots manually first (recommended).\n` +
+        `OK to delete the endpoint AND all ${bound.length} bot(s) — cannot be undone.`
+      );
+      if (!cascadeOK) return;
+      // Second confirm guards against accidental OK on the first dialog.
+      if (!confirm(`Really delete ${bound.length} bot(s)? This is permanent.`)) return;
+      const r2 = await fetch(`/api/backends/${b.id}?force=true`, { method: "DELETE" });
+      if (!r2.ok) {
+        const body2 = await r2.json().catch(() => ({}));
+        alert("Force delete failed: " + (body2.detail?.message || body2.detail || `HTTP ${r2.status}`));
+        return;
+      }
+      await renderSettingsPage();
+      if (typeof loadModels === "function") await loadModels();
+      return;
+    }
+
+    const msg = (detail && detail.message) || detail || `HTTP ${r.status}`;
+    alert("Delete blocked: " + msg);
   } catch (e) {
     alert("Delete failed: " + e.message);
   }
