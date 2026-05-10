@@ -2020,13 +2020,14 @@ function _renderBackendCard(b) {
   editBtn.addEventListener("click", () => openBackendModalForEdit(b));
   actions.appendChild(editBtn);
 
-  if (!b.is_builtin) {
-    const deleteBtn = document.createElement("button");
-    deleteBtn.className = "btn btn-small";
-    deleteBtn.textContent = "Delete";
-    deleteBtn.addEventListener("click", () => deleteBackend(b));
-    actions.appendChild(deleteBtn);
-  }
+  // Delete is allowed on every backend now — including the built-in. The
+  // `deleteBackend` helper handles the extra confirms and the `?force=true`
+  // flag the server requires for the built-in case.
+  const deleteBtn = document.createElement("button");
+  deleteBtn.className = "btn btn-small";
+  deleteBtn.textContent = "Delete";
+  deleteBtn.addEventListener("click", () => deleteBackend(b));
+  actions.appendChild(deleteBtn);
 
   top.appendChild(actions);
   card.appendChild(top);
@@ -2391,9 +2392,25 @@ async function saveBackend() {
 }
 
 async function deleteBackend(b) {
-  if (!confirm(`Delete endpoint "${b.name}"?`)) return;
+  // Built-in deletion needs an extra-stern first confirm (the action is
+  // unusual and survives across restarts only when at least one other backend
+  // remains in the table — see `db.init_db`). It also requires `?force=true`
+  // server-side, which we always set for the built-in case below.
+  const isBuiltin = !!b.is_builtin;
+  const opening = isBuiltin
+    ? `Delete the BUILT-IN endpoint "${b.name}"?\n\n` +
+      `It will be re-seeded automatically only if you delete every other backend too.\n` +
+      `In lite mode (or with another backend kept) it stays gone across restarts.`
+    : `Delete endpoint "${b.name}"?`;
+  if (!confirm(opening)) return;
+
+  // For the built-in we always pass force=true (server requires it). For
+  // non-built-ins we try without first to surface the bound-bots 409.
+  const url = (extra) => `/api/backends/${b.id}${extra ? `?force=true` : ``}`;
+
   try {
-    const r = await fetch(`/api/backends/${b.id}`, { method: "DELETE" });
+    const firstUrl = isBuiltin ? url(true) : url(false);
+    const r = await fetch(firstUrl, { method: "DELETE" });
     if (r.ok) {
       await renderSettingsPage();
       if (typeof loadModels === "function") await loadModels();
@@ -2401,7 +2418,8 @@ async function deleteBackend(b) {
     }
 
     // Surface the rebind/cascade choice when the server reports 409 with a
-    // bound-conversations list. Other failures fall through to a plain alert.
+    // bound-conversations list. (Built-in path already used force=true so
+    // it won't hit this branch — its bound bots cascade-delete in one shot.)
     const body = await r.json().catch(() => ({}));
     const detail = body.detail;
     const bound = detail && Array.isArray(detail.bound_conversations) ? detail.bound_conversations : null;
@@ -2415,9 +2433,8 @@ async function deleteBackend(b) {
         `OK to delete the endpoint AND all ${bound.length} bot(s) — cannot be undone.`
       );
       if (!cascadeOK) return;
-      // Second confirm guards against accidental OK on the first dialog.
       if (!confirm(`Really delete ${bound.length} bot(s)? This is permanent.`)) return;
-      const r2 = await fetch(`/api/backends/${b.id}?force=true`, { method: "DELETE" });
+      const r2 = await fetch(url(true), { method: "DELETE" });
       if (!r2.ok) {
         const body2 = await r2.json().catch(() => ({}));
         alert("Force delete failed: " + (body2.detail?.message || body2.detail || `HTTP ${r2.status}`));

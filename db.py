@@ -88,22 +88,29 @@ def init_db() -> None:
                 "ALTER TABLE conversations ADD COLUMN backend_id INTEGER NOT NULL DEFAULT 1"
             )
 
-        # Seed the built-in Ollama backend at id=1 exactly once. `INSERT OR IGNORE`
-        # means running init_db() multiple times (or on a DB where id=1 already
-        # exists) is harmless.
+        # Seed the built-in Ollama backend at id=1, but ONLY when the backends
+        # table is completely empty. The looser `INSERT OR IGNORE` we used to
+        # do here would resurrect the built-in on every restart after the
+        # user deleted it (since the row at id=1 was now free) — defeating
+        # the GUI's "Delete the built-in" affordance. Counting rows instead
+        # of probing id=1 means: a fresh DB gets the seed once, but any DB
+        # with at least one user-managed backend keeps the user's choices
+        # across restarts. (User-deletes-everything still re-seeds — they
+        # need at least one backend to use the app.)
         #
-        # Lite mode: when MINICLOSEDAI_NO_OLLAMA is set, skip the seed entirely
-        # on a fresh DB (so the user registers their own external endpoint via
-        # Settings) and auto-disable any pre-existing built-in row on a DB that
-        # was created in heavy mode (so upgrading doesn't leave a permanently-
+        # Lite mode (MINICLOSEDAI_NO_OLLAMA): skip the seed even on a fresh
+        # DB so the user registers their own external endpoint via Settings,
+        # and auto-disable any pre-existing built-in row on a DB that was
+        # created in heavy mode (upgrading doesn't leave a permanently-
         # unreachable backend in the dropdown).
+        backend_count = conn.execute("SELECT COUNT(*) FROM backends").fetchone()[0]
         if _no_ollama_mode():
             conn.execute(
                 "UPDATE backends SET enabled = 0 WHERE is_builtin = 1 AND kind = 'ollama'"
             )
-        else:
+        elif backend_count == 0:
             conn.execute(
-                """INSERT OR IGNORE INTO backends (id, name, kind, base_url, is_builtin, enabled)
+                """INSERT INTO backends (id, name, kind, base_url, is_builtin, enabled)
                    VALUES (1, 'Ollama (built-in)', 'ollama', ?, 1, 1)""",
                 (_DEFAULT_OLLAMA_URL,),
             )

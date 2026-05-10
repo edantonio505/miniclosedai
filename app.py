@@ -297,11 +297,19 @@ def api_update_backend(backend_id: int, data: BackendUpdate):
 def api_delete_backend(backend_id: int, force: bool = False):
     """Delete a backend.
 
-    Default behavior: refuses with 409 when any conversation is still pinned
-    to this backend, returning the bound list so the GUI can offer to rebind
-    them. When `force=true`, also deletes those conversations as a cascade —
-    used by the GUI's "delete the bots too" two-step confirm. Built-in
-    backends are still 403 regardless of `force`.
+    Three guard clauses, all overridable with `?force=true`:
+
+    - **Built-in backend**: 403 without `force` (the GUI's two-step confirm
+      sets `force=true` after warning the user). The seed logic in `db.py`
+      only re-creates the built-in on a *fully empty* backends table, so
+      once you delete it AND keep at least one other backend, it stays
+      gone across restarts.
+
+    - **Bound conversations**: 409 with the bound list. With `force`, those
+      conversations are deleted in the same transaction.
+
+    - **Both at once** (built-in with bound bots): with `force`, deletes
+      the bots and the backend together.
     """
     with db.get_conn() as conn:
         row = conn.execute(
@@ -309,8 +317,17 @@ def api_delete_backend(backend_id: int, force: bool = False):
         ).fetchone()
         if not row:
             raise HTTPException(404, f"Backend {backend_id} not found")
-        if row["is_builtin"]:
-            raise HTTPException(403, "The built-in backend can't be deleted.")
+        if row["is_builtin"] and not force:
+            raise HTTPException(
+                403,
+                {
+                    "message": "The built-in backend can't be deleted by default. "
+                               "Retry with `?force=true` to confirm — the GUI's "
+                               "Delete button does this automatically after a "
+                               "two-step confirm.",
+                    "is_builtin": True,
+                },
+            )
 
         bound = conn.execute(
             "SELECT id, title FROM conversations WHERE backend_id = ?", (backend_id,)
