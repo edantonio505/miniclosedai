@@ -45,14 +45,36 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 
 ## Requirements
 
-Four supported deployment paths — two methods (Docker / bare-metal) crossed with two modes (heavy / lite). Pick the combination that matches your hardware and use case; the rest of this document applies to all four.
+Five supported deployment paths. The quickest is the **one-line installer** ([Path Z](#path-z--one-line-installer-installsh) — pipe a curl into bash) which automates Path D. The other four are two methods (Docker / bare-metal) crossed with two modes (heavy / lite); pick by hardware + use case.
 
 | | Heavy (with built-in Ollama) | Lite (no Ollama, BYO endpoint) |
 |---|---|---|
 | **Docker** | [Path A](#path-a--docker-recommended-zero-manual-ollama-install) — compose stack, three baked models, ~10.3 GB image, GPU recommended. | [Path C](#path-c--docker-lite-no-built-in-ollama) — single ~160 MB container, zero GPU, no model layers. |
-| **Bare-metal** | [Path B](#path-b--manual-python-venv--host-ollama) — Python venv + host Ollama. | [Path D](#path-d--manual-lite-no-local-ollama) — Python venv only. `MINICLOSEDAI_NO_OLLAMA=1` env var skips the built-in Ollama backend; you register an external endpoint via the Settings page. |
+| **Bare-metal** | [Path B](#path-b--manual-python-venv--host-ollama) — Python venv + host Ollama. | [Path D](#path-d--manual-lite-no-local-ollama) — Python venv only. `MINICLOSEDAI_NO_OLLAMA=1` env var skips the built-in Ollama backend; you register an external endpoint via the Settings page. **Or use [Path Z](#path-z--one-line-installer-installsh) — `curl … | bash` — which does this for you.** |
 
-Lite mode (paths C and D) is the right pick when inference happens on a *different* machine — a remote Ollama relay, an LM Studio on your LAN, vLLM on a GPU box, etc. The local install is just the FastAPI app + SQLite + static frontend.
+Lite mode (paths C, D, and Z) is the right pick when inference happens on a *different* machine — a remote Ollama relay, an LM Studio on your LAN, vLLM on a GPU box, etc. The local install is just the FastAPI app + SQLite + static frontend.
+
+### Path Z — One-line installer (`install.sh`)
+
+The fastest non-Docker route. Effectively a wrapper around Path D — clones the repo, sets up a Python venv, installs deps, optionally starts uvicorn detached.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/edantonio505/miniclosedai/main/install.sh | bash
+```
+
+Behaviorally identical to running the manual lite steps by hand, with the same end state: a `~/miniclosedai` checkout + `.venv` + a uvicorn process bound to `0.0.0.0:8095`. Re-running the same command pulls and reinstalls in place (idempotent). The script's source lives at the repo root for inspection before piping it to bash.
+
+Environment overrides (read by the script):
+
+| Env var | Default | Effect |
+|---|---|---|
+| `MINICLOSEDAI_DIR` | `$HOME/miniclosedai` | Target checkout path. Existing dirs that aren't git checkouts cause an early refusal; existing checkouts get `git pull`-ed instead. |
+| `MINICLOSEDAI_PORT` | `8095` | Bind port for auto-started uvicorn. |
+| `MINICLOSEDAI_START` | `1` | `0` skips the auto-start (script just prints the run command). |
+| `MINICLOSEDAI_BRANCH` | `main` | Useful for testing PRs / feature branches. |
+| `MINICLOSEDAI_REPO` | canonical URL | Fork support. |
+
+Prereq checks (`git`, `python3 ≥ 3.10`) run before any side-effects. On port conflict the script `pkill`s any existing `uvicorn app:app --port $PORT` before starting the new one — re-running the installer is the supported way to apply updates *without* the in-place upgrade machinery (which requires the server to already be answering on `/api/upgrade/run`).
 
 ### Path A — Docker (recommended, zero manual Ollama install)
 
