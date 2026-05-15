@@ -21,7 +21,7 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 
 1. [What it is](#what-it-is)
 2. [Requirements](#requirements)
-3. [Install](#install) · [Docker quick start (with baked models)](#docker-quick-start-with-baked-models)
+3. [Install](#install) · [One-line install](#quickest--one-line-install-macos-linux-wsl) · [Docker quick start (with baked models)](#docker-quick-start-with-baked-models)
 4. [Run](#run)
 5. [Your first bot — 60 seconds](#your-first-bot--60-seconds)
 6. [UI guide](#ui-guide)
@@ -83,6 +83,43 @@ Five Python dependencies — `fastapi`, `uvicorn`, `httpx`, `pypdf`, `python-mul
 ---
 
 ## Install
+
+### Quickest — one-line install (macOS, Linux, WSL)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/edantonio505/miniclosedai/main/install.sh | bash
+```
+
+What it does: clones to `~/miniclosedai`, creates a Python venv, installs the three dependencies, and starts the server detached on port `8095`. When it returns, open <http://localhost:8095>. Re-run the same command later to update — it `git pull`s the latest and reinstalls deps in place.
+
+**No `curl`?** Same thing with `wget`:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/edantonio505/miniclosedai/main/install.sh | bash
+```
+
+**Tunables** (export before piping, or prepend on the same line):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `MINICLOSEDAI_DIR` | `$HOME/miniclosedai` | Where to clone. |
+| `MINICLOSEDAI_PORT` | `8095` | Port to bind. |
+| `MINICLOSEDAI_START` | `1` | `1` = auto-start the server detached, `0` = install only and print the run command. |
+| `MINICLOSEDAI_BRANCH` | `main` | Checkout a feature branch instead. |
+| `MINICLOSEDAI_REPO` | canonical URL | Use a fork. |
+
+Example — install to a custom path, skip auto-start:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/edantonio505/miniclosedai/main/install.sh \
+  | MINICLOSEDAI_DIR=/opt/miniclosedai MINICLOSEDAI_START=0 bash
+```
+
+Requirements the script checks before doing anything: `git`, `python3 ≥ 3.10`. On a fresh macOS, both ship with the developer tools (`xcode-select --install` once if you've never used git). On Debian/Ubuntu, `sudo apt install git python3 python3-venv` covers it. Docker is **not** required — this is the bare-metal lite install.
+
+**Windows:** use WSL (the command above works inside an Ubuntu/Debian WSL shell). Native Windows install is supported via the manual path below — there's no PowerShell installer yet.
+
+### All installation paths
 
 Two methods (**Docker** or **bare-metal**), each with two modes — **heavy** (Ollama + baked models, ~10 GB image) or **lite** (no local Ollama; you point at any external Ollama / OpenAI-compatible endpoint via the Settings page, ~160 MB image, runs on any laptop). Pick whichever combination fits your hardware and use case:
 
