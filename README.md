@@ -1788,9 +1788,16 @@ That's the full curation story: start with demonstrations today; the preference-
 
 ## Automated image labeling — "hot dog / not hot dog"
 
-> **Video walkthrough** (sped up): <https://www.youtube.com/watch?v=yKNebbDbWJE>
->
-> A working example lives in [`docs/examples/hotdog_nothotdog/`](./docs/examples/hotdog_nothotdog/) — 100 sample images, the labeler script, and the CSV it produces.
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=yKNebbDbWJE">
+    <img src="https://img.youtube.com/vi/yKNebbDbWJE/hqdefault.jpg"
+         alt="Video walkthrough — automated image labeling with MiniClosedAI"
+         width="640">
+  </a>
+  <br><em>Sped-up video walkthrough — click to watch on YouTube.</em>
+</p>
+
+A working example lives in [`docs/examples/hotdog_nothotdog/`](./docs/examples/hotdog_nothotdog/) — 100 sample images, the labeler script, and the CSV it produces.
 
 A small worked example of the "every saved chat is a microservice" thesis: stand up a vision classifier bot in MiniClosedAI's GUI, then run a 73-line Python script that POSTs your image folder at the bot and writes a labeled CSV. The bot in the example is the *Silicon Valley* Jian Yang "hot dog / not hot dog" classifier — but the same code labels anything you can describe in a sentence (medical scans, manufacturing-defect photos, food-categories, content-moderation, satellite scenes, retail product SKUs).
 
