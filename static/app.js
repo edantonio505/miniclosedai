@@ -1352,12 +1352,15 @@ curl -X POST ${syncUrl} \\
   // ---- Python ----
   if (tab === "python") {
     if (mode === "stream") {
-      return `import httpx, json
+      return `import json
+import requests
 
 URL = "${streamUrl}"
 
-with httpx.stream("POST", URL, json={"message": "${msg}"}, timeout=None) as r:
-    for line in r.iter_lines():
+with requests.post(URL, json={"message": "${msg}"}, stream=True, timeout=None) as r:
+    for line in r.iter_lines(decode_unicode=True):
+        if not line:
+            continue  # SSE keep-alives are empty lines
         if line.startswith("data:"):
             data = json.loads(line[5:].strip())
             if "chunk" in data:
@@ -1365,11 +1368,11 @@ with httpx.stream("POST", URL, json={"message": "${msg}"}, timeout=None) as r:
             if data.get("end"):
                 break`;
     }
-    return `import httpx
+    return `import requests
 
 URL = "${syncUrl}"
 
-response = httpx.post(URL, json={"message": "${msg}"}, timeout=120).json()
+response = requests.post(URL, json={"message": "${msg}"}, timeout=120).json()
 print(response["response"])`;
   }
 
