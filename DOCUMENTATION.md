@@ -1035,7 +1035,16 @@ The `original_content` field means the database already contains preference trip
 
 ## Worked example — automated image labeling
 
-A complete, runnable example of the per-chat-microservice pattern applied to LLM-assisted dataset labeling. Source: [`docs/examples/hotdog_nothotdog/`](./docs/examples/hotdog_nothotdog/) (script + 100-image dataset + the CSV they produce). Sped-up video walkthrough: <https://www.youtube.com/watch?v=yKNebbDbWJE>.
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=yKNebbDbWJE">
+    <img src="https://img.youtube.com/vi/yKNebbDbWJE/hqdefault.jpg"
+         alt="Sped-up demo of LLM-assisted image labeling"
+         width="640">
+  </a>
+  <br><em>Sped-up walkthrough — click to watch on YouTube.</em>
+</p>
+
+A complete, runnable example of the per-chat-microservice pattern applied to LLM-assisted dataset labeling. Source: [`docs/examples/hotdog_nothotdog/`](./docs/examples/hotdog_nothotdog/) (script + 100-image dataset + the CSV they produce).
 
 ### What the script does
 
