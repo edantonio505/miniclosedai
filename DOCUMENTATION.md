@@ -1036,7 +1036,7 @@ The `original_content` field means the database already contains preference trip
 ## Worked example — automated image labeling
 
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=yKNebbDbWJE">
+  <a href="https://youtu.be/yKNebbDbWJE">
     <img src="https://img.youtube.com/vi/yKNebbDbWJE/hqdefault.jpg"
          alt="Sped-up demo of LLM-assisted image labeling"
          width="640">
