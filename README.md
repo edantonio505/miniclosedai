@@ -1789,7 +1789,7 @@ That's the full curation story: start with demonstrations today; the preference-
 ## Automated image labeling — "hot dog / not hot dog"
 
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=yKNebbDbWJE">
+  <a href="https://youtu.be/yKNebbDbWJE">
     <img src="https://img.youtube.com/vi/yKNebbDbWJE/hqdefault.jpg"
          alt="Video walkthrough — automated image labeling with MiniClosedAI"
          width="640">
