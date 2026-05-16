@@ -33,14 +33,15 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 12. [Recipes — common bot patterns](#recipes--common-bot-patterns)
 13. [Getting good responses from small models](#getting-good-responses-from-small-models)
 14. [Curating fine-tuning data](#curating-fine-tuning-data)
-15. [Sharing bots between instances](#sharing-bots-between-instances)
-16. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
-17. [LAN access](#lan-access)
-18. [Troubleshooting](#troubleshooting)
-19. [Testing](#testing)
-20. [Project layout](#project-layout)
-21. [Security](#security)
-22. [License](#license)
+15. [Automated image labeling — hot dog / not hot dog](#automated-image-labeling--hot-dog--not-hot-dog)
+16. [Sharing bots between instances](#sharing-bots-between-instances)
+17. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
+18. [LAN access](#lan-access)
+19. [Troubleshooting](#troubleshooting)
+20. [Testing](#testing)
+21. [Project layout](#project-layout)
+22. [Security](#security)
+23. [License](#license)
 
 ---
 
@@ -1782,6 +1783,69 @@ Every edited message preserves its *first* stored version under `original_conten
 - **DPO dataset construction.** When you outgrow SFT, you already have `(prompt, chosen=edited_content, rejected=original_content)` triples sitting in your database. A short script over the `messages` JSON emits them as a DPO JSONL file without any new UI work.
 
 That's the full curation story: start with demonstrations today; the preference-data upgrade is a data-transformation away, not a product rebuild.
+
+---
+
+## Automated image labeling — "hot dog / not hot dog"
+
+> **Video walkthrough** (sped up): <https://www.youtube.com/watch?v=yKNebbDbWJE>
+>
+> A working example lives in [`docs/examples/hotdog_nothotdog/`](./docs/examples/hotdog_nothotdog/) — 100 sample images, the labeler script, and the CSV it produces.
+
+A small worked example of the "every saved chat is a microservice" thesis: stand up a vision classifier bot in MiniClosedAI's GUI, then run a 73-line Python script that POSTs your image folder at the bot and writes a labeled CSV. The bot in the example is the *Silicon Valley* Jian Yang "hot dog / not hot dog" classifier — but the same code labels anything you can describe in a sentence (medical scans, manufacturing-defect photos, food-categories, content-moderation, satellite scenes, retail product SKUs).
+
+### Setup, end to end (~3 minutes)
+
+1. **Open MiniClosedAI** → click **+ New Chat** → name it `Hotdog Classifier` (or whatever).
+2. **Pick a vision-capable model** in the dashboard dropdown — anything from `llava:7b`, `gemma4:31b`, `qwen3.6-vl-*`, `pixtral`, `moondream`, `minicpm-v`, `llama3.2-vision`. The image attachment warns you if the picked model isn't visually-aware.
+3. **Set the system prompt.** Click the **✨ Generate prompt** button above the System Prompt textarea, type:
+
+   > *"Image classifier. Look at the photo and answer with exactly one of: `Hotdog` or `not hotdog`. No explanation, no punctuation, just the label."*
+
+   The model writes the actual prompt and streams it into the textarea. Tweak if needed.
+4. **Test it** in the GUI — drag-drop a hot dog photo into the composer, hit Send, confirm the reply is `Hotdog`. Try a non-hotdog photo, confirm it's `not hotdog`.
+5. **Note the conversation ID** — visible in the URL when you open the chat (or `GET /api/conversations`). In the example it's `71`.
+6. **Drop your images** into a folder, e.g. `docs/examples/hotdog_nothotdog/images/`.
+7. **Edit `label_images.py`** — change `URL` to your machine's address + conv ID, change `IMAGES_DIR` if your images live elsewhere.
+8. **Run it:**
+
+   ```bash
+   pip install requests pandas
+   python docs/examples/hotdog_nothotdog/label_images.py
+   ```
+
+   Progress prints per-image; the CSV (`labels.csv`) is written *after every image* so a crash, kill, or power cut loses at most the in-flight one. Re-running over the same images is safe; remove rows you want re-labeled.
+
+The CSV ends up as:
+
+```
+input,output
+images/000035.jpg,Hotdog
+images/hamburger_0012.jpg,not hotdog
+images/tacos_0037.jpg,not hotdog
+images/000018.jpg,Hotdog
+images/pizza_0004.jpg,not hotdog
+```
+
+### Why this works
+
+The labeler script is small (73 LoC) because **MiniClosedAI's conversation endpoint already locks the model, the system prompt, and the sampling params** — the script supplies only the image and a generic `"What is in this image?"` user message. The bot's saved system prompt is what makes the response a label, not a paragraph. Swap the system prompt to get any other classifier; the labeler code doesn't change.
+
+### How to adapt it
+
+| Goal | Change to make |
+|---|---|
+| Different categories (e.g. `cat`, `dog`, `bird`, `other`) | Edit the system prompt in the GUI to list the labels; everything else stays. |
+| Multi-label output (e.g. `["beach", "sunset"]`) | System prompt says "return a JSON array of tags"; parse `output` with `json.loads` after the run. |
+| Confidence scores | System prompt requests `{"label": "Hotdog", "confidence": 0.87}` JSON. Same parsing trick. |
+| Bounding boxes (vision-capable models) | System prompt requests `{"bbox": [x, y, w, h], "label": "..."}`. The example's wire format already carries the image in full. |
+| Hundreds of thousands of images | Run the script behind `xargs -P` or split the image list across N parallel workers — each saved bot endpoint is independently callable. |
+| Calling a remote MiniClosedAI | Change the `URL` to point at the remote host:port + the conv ID on that instance. Auth-token support: append `headers={"Authorization": "Bearer ..."}` to the `requests.post(...)` call. |
+| Plug into `docs/examples/` as a template | Copy the whole `hotdog_nothotdog/` folder, swap the images and the URL/conv-id, change the prompt in the GUI. The script is one file with no other dependencies. |
+
+### Cost of running this
+
+Local-only — there is no per-call charge. The example labeled 100 images in roughly 2 minutes on a consumer GPU running a 7B vision-capable model. Scale linearly: 10k images is ~3.5 hours on the same hardware. Run it overnight against your archive.
 
 ---
 

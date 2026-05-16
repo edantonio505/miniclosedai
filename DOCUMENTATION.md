@@ -32,14 +32,15 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 9. [Thinking / reasoning control](#thinking--reasoning-control)
 10. [Stopping generation](#stopping-generation)
 11. [Fine-tuning data export](#fine-tuning-data-export)
-12. [Bot import / export](#bot-import--export)
-13. [Self-upgrade](#self-upgrade)
-14. [Prompt generator](#prompt-generator)
-15. [Database](#database)
-16. [Configuration](#configuration)
-17. [File layout](#file-layout)
-18. [Security](#security)
-19. [Troubleshooting](#troubleshooting)
+12. [Worked example — automated image labeling](#worked-example--automated-image-labeling)
+13. [Bot import / export](#bot-import--export)
+14. [Self-upgrade](#self-upgrade)
+15. [Prompt generator](#prompt-generator)
+16. [Database](#database)
+17. [Configuration](#configuration)
+18. [File layout](#file-layout)
+19. [Security](#security)
+20. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -1029,6 +1030,75 @@ print(df["label"].value_counts())
 ### From SFT to DPO
 
 The `original_content` field means the database already contains preference triples whenever you've edited a message: `(prompt, chosen=edited content, rejected=original_content)`. A short script reading the raw `messages` JSON produces a DPO JSONL file with no UI changes required. This is the intended upgrade path when your demonstration dataset stops improving the model (typically many thousands of pairs in).
+
+---
+
+## Worked example — automated image labeling
+
+A complete, runnable example of the per-chat-microservice pattern applied to LLM-assisted dataset labeling. Source: [`docs/examples/hotdog_nothotdog/`](./docs/examples/hotdog_nothotdog/) (script + 100-image dataset + the CSV they produce). Sped-up video walkthrough: <https://www.youtube.com/watch?v=yKNebbDbWJE>.
+
+### What the script does
+
+[`label_images.py`](./docs/examples/hotdog_nothotdog/label_images.py) is 73 lines. For every image in `IMAGES_DIR` it:
+
+1. Reads the file, base64-encodes, builds a `data:<mime>;base64,...` URL.
+2. POSTs `/api/conversations/{id}/chat` with the multimodal payload:
+   ```json
+   {
+     "message": "What is in this image?",
+     "attachments": [{
+       "name": "<filename>",
+       "kind": "image",
+       "mime": "image/jpeg",
+       "data_url": "data:image/jpeg;base64,..."
+     }]
+   }
+   ```
+3. Reads the model's `response` field — a single short label (`Hotdog` / `not hotdog` in the example, because that's what the bot's *system prompt* — set once in the GUI — instructs).
+4. Appends `(input=images/<filename>, output=<label>)` to a `pandas.DataFrame` and writes the whole frame to `labels.csv` *after every image*. The CSV is the source of truth at every step; a crash, kill, or power cut loses at most the one in-flight call.
+
+That's the entire labeler: no auth, no batching framework, no queue, no streaming. It depends on `requests` + `pandas` and nothing else.
+
+### Why it's small
+
+The labeling logic itself — "what makes this output a label rather than a paragraph?" — lives entirely in the saved conversation's `system_prompt` column. The HTTP call doesn't carry any classifier-defining context; the server reads the bot config from SQLite and injects it into every chat call. Consequences:
+
+- **The same script labels anything.** Change the bot's system prompt in the GUI (or use the **✨ Generate prompt** button to author it from a one-sentence description) and the same `label_images.py` produces fundamentally different output — multi-label tags, JSON with confidence, bounding boxes, free-text captions. Zero code change to the labeler.
+- **Per-conversation overrides are impossible from this caller.** The endpoint **ignores** caller-supplied `model` / `temperature` / `system_prompt` fields on the per-conversation `/chat` route — that's the [microservice config lock](#per-chat-microservice-pattern). The labeler can't accidentally degrade output by passing wrong sampling params. This is by design.
+- **Reproducibility.** Two months later, re-running the same conversation against the same images produces the same labels, because the model + system prompt + params are pinned in the DB. To version the labeling task itself: [export the bot config](#bot-import--export) to a `.miniclosed-bot.json` and check it into git.
+
+### Pre-conditions on the bot
+
+Just two:
+
+| Required | Why |
+|---|---|
+| The picked model is **vision-capable** | otherwise the `image_url` content part is silently dropped by Ollama / OpenAI-compat servers. MiniClosedAI's [vision-model heuristic](#vision-model-heuristic) shows a soft-warn banner in the GUI; programmatic callers don't see it but the model just returns text-only guesses. |
+| The system prompt **constrains output to a known label set** | "Reply with only `Hotdog` or `not hotdog`" — without this the bot answers in prose ("This appears to be a delicious hot dog with mustard…") and post-processing has to extract the label every time. Prompt-engineer the constraint once, in the GUI; the script doesn't normalize anything. |
+
+### Crash safety / resumability
+
+The script writes the entire `pandas.DataFrame` to CSV every loop iteration (`df.to_csv(OUTPUT_CSV, index=False)`). On crash:
+
+- The CSV reflects every successfully-labeled image up to the failure.
+- To resume: read the existing CSV, filter `image_files` to skip already-labeled filenames, run again. The example doesn't ship this filter (intentionally — it'd add 10 lines and the user might want a re-label semantics instead), but it's a 3-line addition.
+
+A more aggressive design (one this example deliberately doesn't take): SQLite-backed checkpoint, per-row retry budget, exponential backoff on transient HTTP failures. None of that is needed for the typical case — local Ollama doesn't have transient failures, and 100% throughput on 100k images is not the goal.
+
+### Scale notes
+
+- **Sequential by default.** ~1 request/sec on a 7B vision model, GPU-bound. 100 images in 1–2 minutes; 10k in 3–4 hours. Run it overnight.
+- **Parallelize via `xargs -P N`** or split `image_files` into N shards across N processes — each MiniClosedAI endpoint serves concurrent requests independently. Ollama / LM Studio / vLLM each handle concurrent inference differently; vLLM batches efficiently, Ollama queues.
+- **Network locality matters.** The example POSTs to `192.168.0.110:8095` — a LAN-local MiniClosedAI. Public-internet round-trip latency dominates per-call cost at scale; co-locate the labeler with the server.
+
+### When *not* to use this
+
+- **High-volume production labeling at >1k req/sec sustained** — at that point, talk directly to the model server (skip MiniClosedAI's HTTP layer) or use a batch API like vLLM's `/v1/chat/completions` with concurrency tuned at the model layer.
+- **Cases where you want streaming labels** — this example uses the non-streaming `/chat` endpoint because each label is short. For long structured outputs (full paragraphs, large JSON), use `/chat/stream` and consume the SSE chunks like the [README's streaming snippet](./README.md#chat).
+
+### What to clone from this
+
+The [`docs/examples/hotdog_nothotdog/`](./docs/examples/hotdog_nothotdog/) folder is meant to be copied wholesale: rename, swap the images, swap the system prompt in the GUI, swap the URL + conversation ID in the script. The structure (a single Python file + an `images/` folder + a `labels.csv` output) is the template. Future examples added under `docs/examples/` should follow the same shape so users can recognize the pattern by filename.
 
 ---
 
