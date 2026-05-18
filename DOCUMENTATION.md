@@ -1634,6 +1634,8 @@ The app does not ship with HTTPS. `navigator.clipboard` requires HTTPS or `local
 | Port 8095 already in use | `uvicorn app:app --port 8096` |
 | Clipboard "Copy" button does nothing on LAN | Expected pre-fix; current code falls back to legacy copy automatically. If it still fails, select the code manually and Ctrl+C. |
 | Can't access from phone on same WiFi | Bind to `0.0.0.0`: `uvicorn app:app --host 0.0.0.0 --port 8095`. Also allow the port in your host firewall (`sudo ufw allow 8095/tcp`). |
+| Browser devtools floods with `ERR_CONNECTION_REFUSED` on `/api/pulls`, `/api/models`, `/api/logs` | Browser can't reach the FastAPI server. **Most common cause:** browser running on a different machine than the server, but URL bar still says `localhost:8095` (which means *the browser's* machine, not the server's). Switch to `http://<server-lan-ip>:8095`. **Confirm:** from the *server's* shell, `curl http://127.0.0.1:8095/api/logs` should return JSON — if it does, the server is healthy and the problem is networking/URL; if it doesn't, the uvicorn process isn't running. |
+| Logs page renders empty even though chats are happening | Open devtools Network tab and watch the `/api/logs` request. A 200 with `{"logs": []}` means the page is fine — there's just no activity in *this* server's buffer (e.g. you're sending chats to a different host, or the server was restarted recently and lost the buffer). A failed request means a connection problem — see the row above. |
 
 ---
 
