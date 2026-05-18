@@ -32,6 +32,7 @@ import pypdf
 
 import db
 import llm
+import logs as chat_logs
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -535,6 +536,34 @@ def api_list_pulls():
         reverse=True,
     )
     return {"pulls": items}
+
+
+# ---------- LLM request/response logs ----------
+# In-memory ring buffer of chat calls — the GUI's Logs page polls this every
+# few seconds to display recent activity (request metadata + response preview),
+# LM-Studio-style. Buffer is reset on server restart by design.
+
+@app.get("/api/logs")
+def api_list_logs(limit: int | None = None, since_id: int | None = None):
+    """Return chat log entries, newest first.
+
+    Query params:
+      - `limit`: cap the number of entries returned (default: all in buffer).
+      - `since_id`: only entries with `id > since_id` — supports cheap incremental
+        polling, the GUI sends the max id it's already seen on each tick.
+    """
+    items = chat_logs.get_all()
+    if since_id is not None:
+        items = [e for e in items if e.get("id", 0) > since_id]
+    if limit is not None and limit > 0:
+        items = items[:limit]
+    return {"logs": items}
+
+
+@app.delete("/api/logs")
+def api_clear_logs():
+    chat_logs.clear()
+    return {"ok": True}
 
 
 @app.delete("/api/backends/{backend_id}/pulls/{name:path}")
@@ -1382,21 +1411,30 @@ async def api_import_conversation_bot(req: BotImportRequest):
 @app.post("/api/chat")
 async def api_chat(req: ChatRequest):
     backend = _load_backend(req.backend_id)
+    messages = _build_messages(req)
+    params = {"temperature": req.temperature, "max_tokens": req.max_tokens,
+              "top_p": req.top_p, "top_k": req.top_k, "think": req.think}
+    t0 = time.perf_counter()
     try:
         text = await llm.chat(
-            backend,
-            req.model,
-            _build_messages(req),
-            temperature=req.temperature,
-            max_tokens=req.max_tokens,
-            top_p=req.top_p,
-            top_k=req.top_k,
-            think=req.think,
+            backend, req.model, messages,
+            temperature=req.temperature, max_tokens=req.max_tokens,
+            top_p=req.top_p, top_k=req.top_k, think=req.think,
         )
-    except httpx.ConnectError:
-        raise HTTPException(503, _backend_err(backend))
-    except RuntimeError as e:
+    except (httpx.ConnectError, RuntimeError) as e:
+        chat_logs.record_chat(
+            endpoint="/api/chat", kind="sync", backend=backend, model=req.model,
+            messages=messages, params=params, status="error", error=str(e),
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
+        if isinstance(e, httpx.ConnectError):
+            raise HTTPException(503, _backend_err(backend))
         raise HTTPException(502, str(e))
+    chat_logs.record_chat(
+        endpoint="/api/chat", kind="sync", backend=backend, model=req.model,
+        messages=messages, params=params, response_text=text,
+        latency_ms=int((time.perf_counter() - t0) * 1000),
+    )
     _persist_turn(req, text, backend)
     return {"response": text}
 
@@ -1582,6 +1620,9 @@ def _persist_conv_chat_turn(
 async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
     """Call the saved conversation as a configured function (non-streaming)."""
     conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
+    attachments = [a.name for a in (req.attachments or [])] if req.attachments else []
+    endpoint = f"/api/conversations/{conv_id}/chat"
+    t0 = time.perf_counter()
     try:
         text = await llm.chat(
             backend,
@@ -1590,10 +1631,22 @@ async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
             top_p=eff["top_p"], top_k=eff["top_k"],
             think=eff["think"],
         )
-    except httpx.ConnectError:
-        raise HTTPException(503, _backend_err(backend))
-    except RuntimeError as e:
+    except (httpx.ConnectError, RuntimeError) as e:
+        chat_logs.record_chat(
+            endpoint=endpoint, kind="sync", backend=backend, model=eff["model"],
+            messages=messages, params=eff, attachments=attachments,
+            status="error", error=str(e),
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
+        if isinstance(e, httpx.ConnectError):
+            raise HTTPException(503, _backend_err(backend))
         raise HTTPException(502, str(e))
+    chat_logs.record_chat(
+        endpoint=endpoint, kind="sync", backend=backend, model=eff["model"],
+        messages=messages, params=eff, attachments=attachments,
+        response_text=text,
+        latency_ms=int((time.perf_counter() - t0) * 1000),
+    )
 
     if req.persist:
         if req.message is not None:
@@ -1618,12 +1671,16 @@ async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
 async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
     """Call the saved conversation as a configured function (SSE streaming)."""
     conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
+    attachments = [a.name for a in (req.attachments or [])] if req.attachments else []
+    endpoint = f"/api/conversations/{conv_id}/chat/stream"
 
     async def event_stream():
         collected: list[str] = []
+        thinking_collected: list[str] = []
         think_count = 0
         max_think = eff.get("max_thinking_tokens")
         truncated = False
+        t0 = time.perf_counter()
         try:
             async for ev in llm.chat_stream(
                 backend,
@@ -1636,6 +1693,7 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
                     collected.append(ev["content"])
                     yield f"data: {json.dumps({'chunk': ev['content']})}\n\n"
                 elif "thinking" in ev:
+                    thinking_collected.append(ev["thinking"])
                     think_count += 1
                     if max_think and think_count > max_think:
                         # Soft cap: stop emitting *visible* reasoning to the UI
@@ -1647,12 +1705,29 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
                             yield f"data: {json.dumps({'thinking_truncated': True, 'reason': 'max_thinking_tokens', 'limit': max_think})}\n\n"
                         continue
                     yield f"data: {json.dumps({'thinking': ev['thinking']})}\n\n"
-        except httpx.ConnectError:
-            yield f"data: {json.dumps({'error': _backend_err(backend)})}\n\n"
+        except (httpx.ConnectError, Exception) as e:
+            chat_logs.record_chat(
+                endpoint=endpoint, kind="stream", backend=backend, model=eff["model"],
+                messages=messages, params=eff, attachments=attachments,
+                response_text="".join(collected) or None,
+                thinking_text="".join(thinking_collected) or None,
+                status="error", error=str(e),
+                latency_ms=int((time.perf_counter() - t0) * 1000),
+            )
+            if isinstance(e, httpx.ConnectError):
+                yield f"data: {json.dumps({'error': _backend_err(backend)})}\n\n"
+            else:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            return
+
+        full_response = "".join(collected)
+        chat_logs.record_chat(
+            endpoint=endpoint, kind="stream", backend=backend, model=eff["model"],
+            messages=messages, params=eff, attachments=attachments,
+            response_text=full_response,
+            thinking_text="".join(thinking_collected) or None,
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
 
         # Persist whenever we actually produced a response. Truncated-thinking
         # is no longer a persistence-blocker because generation completed.
@@ -1664,7 +1739,7 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
                 user_msgs = [_build_user_message(req.message, attachments_raw)]
             else:
                 user_msgs = [m.model_dump() for m in req.messages]
-            _persist_conv_chat_turn(conv_id, user_msgs, "".join(collected), eff, backend)
+            _persist_conv_chat_turn(conv_id, user_msgs, full_response, eff, backend)
 
         yield f"data: {json.dumps({'end': True, 'truncated': truncated})}\n\n"
 
@@ -1679,12 +1754,16 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
 async def api_chat_stream(req: ChatRequest):
     backend = _load_backend(req.backend_id)
     messages = _build_messages(req)
+    params = {"temperature": req.temperature, "max_tokens": req.max_tokens,
+              "top_p": req.top_p, "top_k": req.top_k, "think": req.think}
 
     async def event_stream():
         collected: list[str] = []
+        thinking_collected: list[str] = []
         think_count = 0
         max_think = req.max_thinking_tokens
         truncated = False
+        t0 = time.perf_counter()
         try:
             async for ev in llm.chat_stream(
                 backend,
@@ -1700,6 +1779,7 @@ async def api_chat_stream(req: ChatRequest):
                     collected.append(ev["content"])
                     yield f"data: {json.dumps({'chunk': ev['content']})}\n\n"
                 elif "thinking" in ev:
+                    thinking_collected.append(ev["thinking"])
                     think_count += 1
                     if max_think and think_count > max_think:
                         # Soft cap — truncate visible reasoning, keep the stream open.
@@ -1708,14 +1788,30 @@ async def api_chat_stream(req: ChatRequest):
                             yield f"data: {json.dumps({'thinking_truncated': True, 'reason': 'max_thinking_tokens', 'limit': max_think})}\n\n"
                         continue
                     yield f"data: {json.dumps({'thinking': ev['thinking']})}\n\n"
-        except httpx.ConnectError:
-            yield f"data: {json.dumps({'error': _backend_err(backend)})}\n\n"
-            return
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        except (httpx.ConnectError, Exception) as e:
+            chat_logs.record_chat(
+                endpoint="/api/chat/stream", kind="stream", backend=backend, model=req.model,
+                messages=messages, params=params,
+                response_text="".join(collected) or None,
+                thinking_text="".join(thinking_collected) or None,
+                status="error", error=str(e),
+                latency_ms=int((time.perf_counter() - t0) * 1000),
+            )
+            if isinstance(e, httpx.ConnectError):
+                yield f"data: {json.dumps({'error': _backend_err(backend)})}\n\n"
+            else:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
             return
 
-        _persist_turn(req, "".join(collected), backend)
+        full_response = "".join(collected)
+        chat_logs.record_chat(
+            endpoint="/api/chat/stream", kind="stream", backend=backend, model=req.model,
+            messages=messages, params=params,
+            response_text=full_response,
+            thinking_text="".join(thinking_collected) or None,
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
+        _persist_turn(req, full_response, backend)
         yield f"data: {json.dumps({'end': True, 'truncated': truncated})}\n\n"
 
     return StreamingResponse(
@@ -1801,6 +1897,8 @@ async def openai_chat_completions(req: OAICompletionRequest):
     if req.stream:
         async def event_stream():
             sent_any = False
+            collected: list[str] = []
+            t0 = time.perf_counter()
             try:
                 async for ev in llm.chat_stream(
                     backend,
@@ -1811,6 +1909,7 @@ async def openai_chat_completions(req: OAICompletionRequest):
                 ):
                     if "content" not in ev:
                         continue
+                    collected.append(ev["content"])
                     delta = {"content": ev["content"]}
                     if not sent_any:
                         delta["role"] = "assistant"
@@ -1827,15 +1926,30 @@ async def openai_chat_completions(req: OAICompletionRequest):
                         }],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
-            except httpx.ConnectError:
-                err = {"error": {"message": _backend_err(backend),
-                                 "type": "upstream_unavailable"}}
+            except (httpx.ConnectError, Exception) as e:
+                chat_logs.record_chat(
+                    endpoint="/v1/chat/completions", kind="stream",
+                    backend=backend, model=effective["model"],
+                    messages=ollama_messages, params=effective,
+                    response_text="".join(collected) or None,
+                    status="error", error=str(e),
+                    latency_ms=int((time.perf_counter() - t0) * 1000),
+                )
+                if isinstance(e, httpx.ConnectError):
+                    err = {"error": {"message": _backend_err(backend),
+                                     "type": "upstream_unavailable"}}
+                else:
+                    err = {"error": {"message": str(e), "type": "server_error"}}
                 yield f"data: {json.dumps(err)}\n\n"
                 return
-            except Exception as e:
-                err = {"error": {"message": str(e), "type": "server_error"}}
-                yield f"data: {json.dumps(err)}\n\n"
-                return
+
+            chat_logs.record_chat(
+                endpoint="/v1/chat/completions", kind="stream",
+                backend=backend, model=effective["model"],
+                messages=ollama_messages, params=effective,
+                response_text="".join(collected),
+                latency_ms=int((time.perf_counter() - t0) * 1000),
+            )
 
             final = {
                 "id": completion_id,
@@ -1854,6 +1968,7 @@ async def openai_chat_completions(req: OAICompletionRequest):
         )
 
     # Non-streaming
+    t0 = time.perf_counter()
     try:
         text = await llm.chat(
             backend,
@@ -1862,10 +1977,24 @@ async def openai_chat_completions(req: OAICompletionRequest):
             top_p=effective["top_p"], top_k=effective["top_k"],
             think=effective["think"],
         )
-    except httpx.ConnectError:
-        raise HTTPException(503, _backend_err(backend))
-    except RuntimeError as e:
+    except (httpx.ConnectError, RuntimeError) as e:
+        chat_logs.record_chat(
+            endpoint="/v1/chat/completions", kind="sync",
+            backend=backend, model=effective["model"],
+            messages=ollama_messages, params=effective,
+            status="error", error=str(e),
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
+        if isinstance(e, httpx.ConnectError):
+            raise HTTPException(503, _backend_err(backend))
         raise HTTPException(502, str(e))
+    chat_logs.record_chat(
+        endpoint="/v1/chat/completions", kind="sync",
+        backend=backend, model=effective["model"],
+        messages=ollama_messages, params=effective,
+        response_text=text,
+        latency_ms=int((time.perf_counter() - t0) * 1000),
+    )
 
     return {
         "id": completion_id,

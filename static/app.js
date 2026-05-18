@@ -2533,8 +2533,9 @@ function initBackendsUI() {
 // without unmounting anything. Chat streams keep running across switches.
 const ACTIVE_PAGE_KEY = "miniclosedai:activePage";
 
+const VALID_PAGES = new Set(["dashboard", "settings", "logs"]);
 function applyActivePage(page) {
-  const p = (page === "settings") ? "settings" : "dashboard";
+  const p = VALID_PAGES.has(page) ? page : "dashboard";
   document.body.dataset.page = p;
   document.querySelectorAll(".activity-bar .nav-item").forEach(btn => {
     btn.classList.toggle("active", btn.dataset.page === p);
@@ -2542,6 +2543,11 @@ function applyActivePage(page) {
   try { localStorage.setItem(ACTIVE_PAGE_KEY, p); } catch (_) {}
   if (p === "settings" && typeof renderSettingsPage === "function") {
     renderSettingsPage();
+  }
+  if (p === "logs" && typeof onLogsPageEntered === "function") {
+    onLogsPageEntered();
+  } else if (typeof onLogsPageLeft === "function") {
+    onLogsPageLeft();
   }
 }
 
@@ -3049,6 +3055,271 @@ function initImportBotUI() {
   });
 }
 
+// =====================================================================
+// Logs page — LM-Studio-style request/response viewer.
+//
+// Pull-polls `/api/logs?since_id=N` every 2 s while the page is visible,
+// merges new entries into a client-side buffer, renders newest-first. Each
+// entry is a collapsed one-liner (status pill, endpoint, model, latency,
+// timestamp); clicking expands to show params + the message preview +
+// response body + thinking trace if present. Filter input does an in-memory
+// substring match across endpoint / model / message text.
+// =====================================================================
+
+const LOGS_POLL_INTERVAL_MS = 2000;
+const LOGS_MAX_CLIENT_ENTRIES = 500;
+
+const _logsState = {
+  buffer: [],          // newest-first list of entries
+  expanded: new Set(), // entry ids the user has clicked open
+  filter: "",
+  paused: false,
+  maxSeenId: 0,
+  pollTimer: null,
+  active: false,       // is the Logs page currently displayed?
+};
+
+function _logsFmtLatency(ms) {
+  if (ms == null) return "";
+  if (ms < 1000) return `${ms} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
+
+function _logsFmtTs(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.valueOf())) return iso;
+  // HH:MM:SS — date is implicit (logs are within the current session).
+  return d.toLocaleTimeString();
+}
+
+function _logsMatchesFilter(entry, q) {
+  if (!q) return true;
+  const haystack = [
+    entry.endpoint || "",
+    entry.model || "",
+    entry.backend_name || "",
+    (entry.response && entry.response.preview) || "",
+    ...(entry.messages || []).map(m => m.content_preview || ""),
+  ].join(" ").toLowerCase();
+  return haystack.includes(q);
+}
+
+function _logsRenderEntry(entry) {
+  const wrap = document.createElement("div");
+  wrap.className = `log-entry ${entry.status === "error" ? "error" : "ok"}`;
+  wrap.dataset.id = String(entry.id);
+  if (_logsState.expanded.has(entry.id)) wrap.classList.add("open");
+
+  const header = document.createElement("div");
+  header.className = "log-entry-header";
+  header.innerHTML = `
+    <span class="log-entry-pill">${entry.status === "error" ? "error" : entry.kind}</span>
+    <span class="log-entry-endpoint" title="${entry.endpoint || ""}">${entry.endpoint || ""}</span>
+    <span class="log-entry-model" title="backend: ${entry.backend_name || "—"}">${entry.model || "—"}</span>
+    <span class="log-entry-latency">${_logsFmtLatency(entry.latency_ms)}</span>
+    <span class="log-entry-ts">${_logsFmtTs(entry.ts)}</span>
+  `;
+  header.addEventListener("click", () => {
+    if (_logsState.expanded.has(entry.id)) {
+      _logsState.expanded.delete(entry.id);
+      wrap.classList.remove("open");
+    } else {
+      _logsState.expanded.add(entry.id);
+      wrap.classList.add("open");
+    }
+  });
+  wrap.appendChild(header);
+
+  // Body is built lazily-ish — always present in DOM but only rendered when
+  // open via CSS. Keep entry HTML small to avoid hammering the DOM on every
+  // 2s tick when the list is long.
+  const body = document.createElement("div");
+  body.className = "log-entry-body";
+
+  // Params
+  const params = entry.params || {};
+  const paramBits = Object.entries(params)
+    .filter(([k, v]) => v != null && v !== "" && !(typeof v === "number" && Number.isNaN(v)))
+    .map(([k, v]) => `${k}=<code>${typeof v === "object" ? JSON.stringify(v) : v}</code>`);
+  if (paramBits.length || entry.backend_name) {
+    const meta = document.createElement("div");
+    meta.className = "log-entry-section";
+    meta.innerHTML = `
+      <div class="log-entry-section-title">Backend &amp; params</div>
+      <div class="log-entry-params">
+        <span>backend: <code>${entry.backend_name || "—"}</code> (${entry.backend_kind || "—"})</span>
+        ${paramBits.map(b => `<span>${b}</span>`).join("")}
+      </div>
+    `;
+    body.appendChild(meta);
+  }
+
+  // Messages
+  if (entry.messages && entry.messages.length) {
+    const msgs = document.createElement("div");
+    msgs.className = "log-entry-section";
+    const escape = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+    msgs.innerHTML = `
+      <div class="log-entry-section-title">Request (last ${entry.messages.length} message${entry.messages.length === 1 ? "" : "s"})</div>
+      ${entry.messages.map(m => `
+        <div class="log-entry-msg ${m.role || "user"}">
+          <div class="log-entry-msg-role">${m.role || "?"}</div>
+          <div>${escape(m.content_preview)}</div>
+        </div>
+      `).join("")}
+      ${entry.attachments && entry.attachments.length ? `
+        <div class="log-entry-params" style="margin-top:6px">
+          <span>attachments: ${entry.attachments.map(a => `<code>${a}</code>`).join(" ")}</span>
+        </div>
+      ` : ""}
+    `;
+    body.appendChild(msgs);
+  }
+
+  // Response preview
+  if (entry.response && (entry.response.preview || entry.response.char_count)) {
+    const resp = document.createElement("div");
+    resp.className = "log-entry-section";
+    const trunc = entry.response.truncated
+      ? `<div class="log-entry-truncated">Truncated — first 2000 chars of a ${entry.response.char_count}-char response.</div>`
+      : "";
+    resp.innerHTML = `
+      <div class="log-entry-section-title">Response (${entry.response.char_count} chars)</div>
+      <pre class="log-entry-pre"></pre>
+      ${trunc}
+    `;
+    // Use textContent to safely render whatever the model returned, including
+    // backticks / HTML / JSON without re-escaping in a template literal.
+    resp.querySelector("pre").textContent = entry.response.preview;
+    body.appendChild(resp);
+  }
+
+  // Thinking trace
+  if (entry.thinking && entry.thinking.preview) {
+    const th = document.createElement("div");
+    th.className = "log-entry-section";
+    const trunc = entry.thinking.truncated
+      ? `<div class="log-entry-truncated">Truncated — first 1000 chars of a ${entry.thinking.char_count}-char trace.</div>`
+      : "";
+    th.innerHTML = `
+      <div class="log-entry-section-title">Thinking trace (${entry.thinking.char_count} chars)</div>
+      <pre class="log-entry-pre"></pre>
+      ${trunc}
+    `;
+    th.querySelector("pre").textContent = entry.thinking.preview;
+    body.appendChild(th);
+  }
+
+  if (entry.error) {
+    const err = document.createElement("div");
+    err.className = "log-entry-section";
+    err.innerHTML = `<div class="log-entry-section-title">Error</div><pre class="log-entry-pre"></pre>`;
+    err.querySelector("pre").textContent = entry.error;
+    body.appendChild(err);
+  }
+
+  wrap.appendChild(body);
+  return wrap;
+}
+
+function _logsRender() {
+  const listEl = document.getElementById("logs-list");
+  const emptyEl = document.getElementById("logs-empty");
+  const countEl = document.getElementById("logs-count");
+  if (!listEl) return;
+
+  const q = _logsState.filter.trim().toLowerCase();
+  const filtered = q
+    ? _logsState.buffer.filter(e => _logsMatchesFilter(e, q))
+    : _logsState.buffer;
+
+  listEl.innerHTML = "";
+  for (const entry of filtered) {
+    listEl.appendChild(_logsRenderEntry(entry));
+  }
+  if (countEl) {
+    countEl.textContent = q
+      ? `${filtered.length} of ${_logsState.buffer.length} entries`
+      : `${_logsState.buffer.length} ${_logsState.buffer.length === 1 ? "entry" : "entries"}`;
+  }
+  if (emptyEl) emptyEl.style.display = filtered.length === 0 ? "block" : "none";
+}
+
+async function _logsPoll() {
+  if (_logsState.paused || !_logsState.active) return;
+  try {
+    const url = _logsState.maxSeenId > 0
+      ? `/api/logs?since_id=${_logsState.maxSeenId}`
+      : `/api/logs`;
+    const r = await fetch(url);
+    if (!r.ok) return;
+    const data = await r.json();
+    const incoming = data.logs || [];
+    if (!incoming.length) return;
+    // Server returns newest-first; merge into the front of the client buffer.
+    _logsState.buffer = incoming.concat(_logsState.buffer);
+    if (_logsState.buffer.length > LOGS_MAX_CLIENT_ENTRIES) {
+      _logsState.buffer.length = LOGS_MAX_CLIENT_ENTRIES;
+    }
+    const newMax = Math.max(...incoming.map(e => e.id || 0), _logsState.maxSeenId);
+    _logsState.maxSeenId = newMax;
+    _logsRender();
+  } catch {
+    // network blips are fine — next tick retries
+  }
+}
+
+function onLogsPageEntered() {
+  _logsState.active = true;
+  // Force a full refresh on entry — server may have been restarted, in which
+  // case our cached entries are stale and `since_id` would miss everything.
+  if (_logsState.maxSeenId === 0) {
+    _logsRender();
+  }
+  _logsPoll();
+  if (!_logsState.pollTimer) {
+    _logsState.pollTimer = setInterval(_logsPoll, LOGS_POLL_INTERVAL_MS);
+  }
+}
+
+function onLogsPageLeft() {
+  _logsState.active = false;
+  if (_logsState.pollTimer) {
+    clearInterval(_logsState.pollTimer);
+    _logsState.pollTimer = null;
+  }
+}
+
+function initLogsUI() {
+  const filterEl = document.getElementById("logs-filter");
+  const pauseEl = document.getElementById("logs-pause-toggle");
+  const clearEl = document.getElementById("logs-clear-btn");
+  if (filterEl) {
+    filterEl.addEventListener("input", () => {
+      _logsState.filter = filterEl.value || "";
+      _logsRender();
+    });
+  }
+  if (pauseEl) {
+    pauseEl.addEventListener("change", () => { _logsState.paused = !!pauseEl.checked; });
+  }
+  if (clearEl) {
+    clearEl.addEventListener("click", async () => {
+      if (!confirm("Clear all log entries? Affects this server's in-memory buffer.")) return;
+      try {
+        await fetch("/api/logs", { method: "DELETE" });
+        _logsState.buffer = [];
+        _logsState.expanded.clear();
+        _logsState.maxSeenId = 0;
+        _logsRender();
+      } catch (e) {
+        alert("Clear failed: " + e.message);
+      }
+    });
+  }
+}
+
 async function init() {
   initTheme();
   initSidebarToggle();
@@ -3062,6 +3333,7 @@ async function init() {
   initHSplitter();
   initSuggestionChips();
   if (typeof initBackendsUI === "function") initBackendsUI();
+  initLogsUI();
   startPullPoller();
   initUpgradeUI();
   initImportBotUI();

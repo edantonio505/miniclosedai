@@ -2444,6 +2444,128 @@ def _():
     assert r.status_code == 400, r.text
 
 
+# ---- LLM request/response log buffer ----
+
+@test("logs: chat calls are recorded with status, latency, response preview")
+def _():
+    import logs as chat_logs
+    _reseed_builtin_to_fake_ollama()
+    chat_logs.clear()
+    c = client.post("/api/conversations", json={
+        "title": "logged", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        # Drive one non-streaming call so a log entry lands.
+        r = client.post(f"/api/conversations/{c['id']}/chat", json={"message": "ping"})
+        assert r.status_code == 200, r.text
+        items = client.get("/api/logs").json()["logs"]
+        assert items, "expected at least one log entry"
+        e = items[0]
+        assert e["status"] == "ok", e
+        assert e["kind"] == "sync", e
+        assert e["model"] == "ollama-a:3b"
+        assert e["endpoint"].endswith(f"/conversations/{c['id']}/chat"), e
+        assert isinstance(e["latency_ms"], int) and e["latency_ms"] >= 0
+        assert e["response"]["char_count"] > 0, e
+        # Last user message is included in the summary.
+        roles = [m["role"] for m in e["messages"]]
+        assert "user" in roles, e
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        chat_logs.clear()
+
+
+@test("logs: streaming endpoint records full accumulated response after stream ends")
+def _():
+    import logs as chat_logs
+    _reseed_builtin_to_fake_ollama()
+    chat_logs.clear()
+    c = client.post("/api/conversations", json={
+        "title": "streamlog", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        with client.stream("POST", f"/api/conversations/{c['id']}/chat/stream",
+                           json={"message": "hi"}) as r:
+            for _ in r.iter_bytes():
+                pass
+        items = client.get("/api/logs").json()["logs"]
+        assert items, "expected at least one log entry"
+        e = items[0]
+        assert e["kind"] == "stream", e
+        assert e["status"] == "ok", e
+        # Streamed response was aggregated and persisted to the log.
+        assert e["response"]["char_count"] > 0, e
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        chat_logs.clear()
+
+
+@test("logs: since_id query param returns only newer entries")
+def _():
+    import logs as chat_logs
+    _reseed_builtin_to_fake_ollama()
+    chat_logs.clear()
+    c = client.post("/api/conversations", json={
+        "title": "since-test", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        client.post(f"/api/conversations/{c['id']}/chat", json={"message": "one"})
+        first = client.get("/api/logs").json()["logs"]
+        assert len(first) >= 1
+        cutoff = first[0]["id"]
+        # Same-id check should return empty.
+        again = client.get(f"/api/logs?since_id={cutoff}").json()["logs"]
+        assert again == [], f"expected empty list, got {again}"
+        # New call should appear.
+        client.post(f"/api/conversations/{c['id']}/chat", json={"message": "two"})
+        after = client.get(f"/api/logs?since_id={cutoff}").json()["logs"]
+        assert len(after) == 1, after
+        assert after[0]["id"] > cutoff
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        chat_logs.clear()
+
+
+@test("logs: DELETE /api/logs empties the buffer")
+def _():
+    import logs as chat_logs
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "clear-test", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        client.post(f"/api/conversations/{c['id']}/chat", json={"message": "x"})
+        assert client.get("/api/logs").json()["logs"], "expected entries before clear"
+        r = client.delete("/api/logs")
+        assert r.status_code == 200 and r.json().get("ok") is True
+        assert client.get("/api/logs").json()["logs"] == []
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        chat_logs.clear()
+
+
+@test("logs: long responses are truncated with the truncated flag set")
+def _():
+    # Hand-construct an entry so we don't have to coerce a fake to emit 2000+ chars.
+    import logs as chat_logs
+    chat_logs.clear()
+    long_text = "x" * 5000
+    chat_logs.record_chat(
+        endpoint="/api/test", kind="sync",
+        backend={"id": 1, "name": "fake", "kind": "ollama"},
+        model="m", messages=[{"role": "user", "content": "hi"}],
+        params={"temperature": 0.5},
+        response_text=long_text, latency_ms=10,
+    )
+    items = client.get("/api/logs").json()["logs"]
+    assert items
+    e = items[0]
+    assert e["response"]["truncated"] is True
+    assert e["response"]["char_count"] == 5000
+    assert len(e["response"]["preview"]) < len(long_text)
+    chat_logs.clear()
+
+
 # ==================================================================
 # Main
 # ==================================================================
