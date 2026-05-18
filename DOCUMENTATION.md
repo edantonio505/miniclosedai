@@ -36,11 +36,12 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 13. [Bot import / export](#bot-import--export)
 14. [Self-upgrade](#self-upgrade)
 15. [Prompt generator](#prompt-generator)
-16. [Database](#database)
-17. [Configuration](#configuration)
-18. [File layout](#file-layout)
-19. [Security](#security)
-20. [Troubleshooting](#troubleshooting)
+16. [Activity logs](#activity-logs)
+17. [Database](#database)
+18. [Configuration](#configuration)
+19. [File layout](#file-layout)
+20. [Security](#security)
+21. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -385,6 +386,10 @@ Two draggable dividers persist to `localStorage`:
 
 The sidebar's scrollbar is hidden across all browsers; scrolling still works via wheel / trackpad / keyboard.
 
+### Logs page
+
+Vertical-nav button (terminal icon, between Dashboard and Settings) opens the LLM activity viewer. Implementation detail in [Activity logs](#activity-logs) below; from a user's perspective it's a per-call row showing status / endpoint / model / latency / timestamp, click-to-expand for params + messages + response. Polling auto-pauses when the page isn't visible.
+
 ---
 
 ## Worked example — connecting Bonsai (1-bit 8B)
@@ -710,6 +715,17 @@ POST /api/extract-pdf       → multipart/form-data, field name `file`
 ```
 
 Server-side wrapper around `pypdf` for PDF text extraction. Caps: 10 MB raw, 50 pages, 30 000 chars output. Returns `{filename, page_count, char_count, truncated, text}`. The frontend uses this transparently when a `.pdf` is dropped in the paperclip picker; external callers can use it directly to populate the `text` field of a `pdf`-kind attachment before chatting.
+
+### Activity logs
+
+```
+GET    /api/logs                    → newest-first list of chat-call records
+GET    /api/logs?since_id=N         → only entries with id > N
+GET    /api/logs?limit=M            → cap to M entries
+DELETE /api/logs                    → wipe the buffer
+```
+
+Read-only listing of recent chat calls — backs the GUI's [Logs page](#logs-page) and the [Activity logs](#activity-logs) architecture section. Entry shape and buffer semantics documented there.
 
 ### SSE event format
 
@@ -1437,6 +1453,67 @@ The streaming loop wraps the whole flow in `try/catch`. Any error (network, back
 
 ---
 
+## Activity logs
+
+LM-Studio-style request/response viewer surfaced via the **Logs** nav button and the `/api/logs` endpoint. Every chat call across every endpoint records one entry; the GUI polls it on a 2-second tick.
+
+### Architecture
+
+```
+Chat endpoints ──► chat_logs.record_chat(...) ──► deque(maxlen=500)
+                                                          │
+                                                          ▼
+                              GET /api/logs   ──►  newest-first JSON list
+                              DELETE /api/logs ─►  wipes the deque
+```
+
+A single in-process `collections.deque(maxlen=500)` in [`logs.py`](./logs.py) holds the most-recent entries. Thread-safe via one `threading.Lock` since FastAPI may dispatch sync handlers from worker threads. Lifetime is process-bound — restart wipes it. The buffer is intentionally **not** persisted to SQLite or any file: this is a debugging surface, not an audit log; persistence would push memory-grade IO patterns onto disk and conflict with the "drop entries when full" semantic the `maxlen` deque provides for free.
+
+### Instrumented endpoints
+
+All five chat-call paths emit a log entry exactly once per call (success or error):
+
+| Endpoint | Kind | Instrumentation site |
+|---|---|---|
+| `POST /api/chat` | `sync` | After `llm.chat` returns (or in the `except`). |
+| `POST /api/chat/stream` | `stream` | At end-of-stream (with the accumulated `collected` text), or in the `except` mid-stream. |
+| `POST /api/conversations/{id}/chat` | `sync` | Same shape as `/api/chat`, plus the `attachments` filename list. |
+| `POST /api/conversations/{id}/chat/stream` | `stream` | At end-of-stream with both `collected` content and `thinking_collected`. |
+| `POST /v1/chat/completions` | `sync` / `stream` | Both branches recorded; the stream variant accumulates content into a local `collected` list so the log gets the full output, not just metadata. |
+
+The `latency_ms` field measures from the function entry point to the moment the LLM call completes (or errors). For stream endpoints that's the time-to-last-token, not time-to-first-token — chosen because a partial stream that fails mid-flight should still show how far the model got.
+
+### Truncation and size discipline
+
+```python
+_RESPONSE_PREVIEW_CHARS = 2000   # per response
+_THINKING_PREVIEW_CHARS = 1000   # per thinking trace
+_PER_MESSAGE_PREVIEW   = 500     # per message
+_MESSAGES_TAIL         = 3       # only the last N messages survive into the entry
+```
+
+Each truncation point also records the original length so the UI can show *"first 2000 chars of a 17,432-char response."* Multimodal `content` arrays are flattened to text parts joined with spaces plus a `[+N image(s)]` suffix — base64 image bytes are **never** stored in the log buffer, both for memory and for usefulness (a 30 KB log entry full of base64 is unreadable).
+
+### Polling protocol
+
+The GUI uses `since_id` for cheap incremental polling:
+
+```
+First tick:        GET /api/logs                    → all entries
+Subsequent ticks:  GET /api/logs?since_id=<max>     → only new entries
+```
+
+`since_id` filtering happens server-side after the buffer snapshot, so the client always sees a consistent view (no race where an entry could appear in two consecutive `since_id` responses). When the polling resumes after a Pause or after returning from another nav tab, the next tick fetches everything newer than the highest id the client has cached — at most 500 entries on a wraparound, typically a handful.
+
+### What it deliberately doesn't do
+
+- **No persistence.** Server restart = empty buffer. Use the uvicorn stdout / `journalctl` if you need a true audit trail.
+- **No authentication on the read.** Same security model as the rest of the app — local-only / trusted-LAN by default. Don't expose `/api/logs` to a hostile network; the previews can contain user input.
+- **No filtering by backend or endpoint server-side.** The GUI does in-memory substring search across the buffer it already has. At 500 entries this is cheap; if the buffer ever grows server-side filtering becomes worthwhile.
+- **No webhook / SSE push.** Polling is simpler and the latency cost (2 seconds) doesn't matter for a debugging view. SSE would also require keeping connections open per tab; the polling approach gracefully handles tab close, page navigate, and laptop sleep.
+
+---
+
 ## Database
 
 Single SQLite file `miniclosedai.db`, auto-created at startup. One table:
@@ -1491,6 +1568,7 @@ miniclosedai/
 ├── app.py                     # FastAPI routes (models, conversations, chat, SSE)
 ├── llm.py                     # Client: Ollama + OpenAI-compat, think support
 ├── db.py                      # SQLite schema + helpers (MINICLOSEDAI_DB_PATH override)
+├── logs.py                    # In-memory ring buffer for the Logs page (chat req/resp records)
 ├── requirements.txt           # fastapi, uvicorn, httpx, pypdf, python-multipart
 ├── upgrade.sh                 # in-place upgrade with auto-rollback (CLI + GUI button trigger)
 ├── test_e2e.py                # 39-test single-file suite, no pytest

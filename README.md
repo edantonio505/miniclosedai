@@ -357,12 +357,13 @@ That's the whole loop: **configure → save → call**.
 
 ### Activity bar (left edge)
 
-Vertical nav with two icons — clicking swaps the main content area without navigating:
+Vertical nav with three icons — clicking swaps the main content area without navigating:
 
 - **Dashboard** (top, grid icon) — the chat + sidebar you use for authoring and running bots. This is where you land.
+- **Logs** (middle, terminal icon) — live LM-Studio-style viewer of every chat request and response across all endpoints. See [Logs page](#logs-page) below.
 - **Settings** (bottom, gear icon) — register and manage LLM endpoints (see [Connecting LM Studio and other endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)).
 
-Your selection persists across reloads. Streaming chats keep playing when you flip to Settings and back — the DOM is never unmounted.
+Your selection persists across reloads. Streaming chats keep playing when you flip between tabs — the DOM is never unmounted, and the Logs polling auto-pauses on the other tabs so it doesn't burn cycles when invisible.
 
 ### Header (Dashboard)
 
@@ -452,6 +453,24 @@ Copy button works on both HTTPS/localhost (via `navigator.clipboard`) and plain-
        width="820">
   <br><em>Every saved chat is a microservice. Copy the snippet as cURL, Python, or JavaScript — native or OpenAI-SDK-compatible.</em>
 </p>
+
+### Logs page
+
+Click the **terminal icon** in the activity bar (between Dashboard and Settings) to open the LLM-activity viewer — same intent as LM Studio's "Server logs" panel. Every chat call across every endpoint shows up here:
+
+- `POST /api/chat` (legacy)
+- `POST /api/chat/stream` (legacy SSE)
+- `POST /api/conversations/{id}/chat` (per-bot)
+- `POST /api/conversations/{id}/chat/stream` (per-bot SSE)
+- `POST /v1/chat/completions` (OpenAI-SDK)
+
+**One row per call.** The collapsed view shows: status pill (sync / stream / error), endpoint path, model name, latency, timestamp. Click a row to expand and see the backend used, sampling params, the last three message previews, the response body (first 2 KB), the thinking trace if any, and the error message if it failed. Multimodal turns show attachment filenames; image bytes are never inlined into log entries.
+
+**Controls.** A filter input does in-memory substring matching across endpoint, model, backend name, and message content. A **Pause** toggle freezes the polling without losing what's already in the buffer. **Clear** wipes both client and server state. Polling auto-suspends when you navigate away from the page — only the visible Logs tab burns the 2-second tick.
+
+**Buffer semantics.** The server keeps the **most recent 500 entries** in memory. Reset on server restart by design — this is a debugging surface for "what just happened?", not an audit log. Long responses are truncated to 2 KB with a `truncated: true` flag and an accurate `char_count` so you can tell the response was longer than what's shown. Thinking traces are capped at 1 KB.
+
+**Why it exists.** Quickly answer the questions you actually have during development: *"is my external SDK call even reaching the server?"*, *"which backend is this bot actually routing to?"*, *"how long is the model taking on this prompt?"*, *"what did the OpenAI-SDK client send me?"*. Without the Logs page you'd need to tail uvicorn output and decode SSE frames by hand.
 
 ---
 
@@ -1197,6 +1216,45 @@ POST /api/chat/stream
 ```
 
 These require the full config in the request body (model, system_prompt, all sampling params). Kept for advanced cases; prefer the per-conversation endpoints for everything else.
+
+### LLM activity logs
+
+```
+GET    /api/logs                       → list recent chat calls, newest first
+GET    /api/logs?since_id=N            → only entries with id > N (cheap incremental polling)
+GET    /api/logs?limit=M               → cap to M entries
+DELETE /api/logs                       → wipe the buffer
+```
+
+The GUI's **Logs** page polls `GET /api/logs?since_id=…` every 2 seconds to drive the LM-Studio-style activity viewer. The endpoint is public read (no auth — same security model as the rest of the app) so external observability tools can scrape it too.
+
+**Entry shape:**
+
+```json
+{
+  "id": 42,
+  "ts": "2026-05-18T19:56:23.234650+00:00",
+  "endpoint": "/api/conversations/3/chat/stream",
+  "kind": "stream",
+  "backend_id": 1,
+  "backend_name": "Ollama (built-in)",
+  "backend_kind": "ollama",
+  "model": "qwen3:8b",
+  "params": {"temperature": 0.7, "max_tokens": 2048, "top_p": 0.9, "top_k": 40, "think": false},
+  "messages": [
+    {"role": "system", "content_preview": "You are…"},
+    {"role": "user",   "content_preview": "What's the weather…"}
+  ],
+  "attachments": ["photo.png"],
+  "response": {"preview": "The weather…", "truncated": false, "char_count": 87},
+  "thinking": null,
+  "status": "ok",
+  "error": null,
+  "latency_ms": 1234
+}
+```
+
+Buffer size: **500 most-recent entries**, in-memory, reset on server restart. Response previews capped at 2 KB; thinking traces at 1 KB; per-message previews at 500 chars. Multimodal `content` arrays are flattened to text + `[+N image(s)]` so base64 image payloads never appear in logs.
 
 ---
 
@@ -2104,6 +2162,7 @@ miniclosedai/
 ├── app.py                     # FastAPI routes (native + OpenAI-compat, multi-backend)
 ├── llm.py                     # Kind-dispatched client: Ollama + OpenAI-compat
 ├── db.py                      # SQLite schema + MINICLOSEDAI_DB_PATH env override
+├── logs.py                    # In-memory chat request/response buffer for the Logs page
 ├── requirements.txt           # fastapi, uvicorn, httpx, pypdf, python-multipart
 ├── upgrade.sh                 # in-place upgrade: git pull + reinstall + restart with auto-rollback
 ├── static/
