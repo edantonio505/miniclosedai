@@ -2566,6 +2566,122 @@ def _():
     chat_logs.clear()
 
 
+# ---- Relay auto-route override ----
+
+def _reset_relay_cache():
+    """Reset the in-process relay-model cache so tests don't bleed into each other."""
+    import app as app_mod
+    app_mod._relay_model_cache["backend_id"] = None
+    app_mod._relay_model_cache["models"] = set()
+    app_mod._relay_model_cache["last_fetched"] = 0.0
+
+
+@test("relay override: no relay registered → original backend wins")
+def _():
+    # Sanity: with no `app.interdataresearch` backend, the override is a no-op.
+    import asyncio, app as app_mod
+    _reset_relay_cache()
+    original = {"id": 1, "name": "local", "kind": "ollama", "base_url": "http://localhost:11434"}
+    result = asyncio.run(app_mod._maybe_override_to_relay(original, "any-model"))
+    assert result is original, "expected pass-through when no relay registered"
+
+
+@test("relay override: model on relay → route to relay")
+def _():
+    import asyncio, app as app_mod
+    from unittest.mock import patch
+    _reset_relay_cache()
+    # Register a relay backend ad-hoc.
+    bid = client.post("/api/backends", json={
+        "name": "test-relay", "kind": "ollama",
+        "base_url": "https://app.interdataresearch.example.com",
+    }).json()["id"]
+    try:
+        async def fake_list(_backend):
+            return [{"name": "claimed-by-relay:1b"}, {"name": "another:7b"}]
+        with patch("app.llm.list_models", side_effect=fake_list):
+            original = {"id": 1, "name": "local", "kind": "ollama", "base_url": "http://localhost:11434"}
+            result = asyncio.run(app_mod._maybe_override_to_relay(original, "claimed-by-relay:1b"))
+        assert result["id"] == bid, f"expected override to relay id={bid}, got {result}"
+        assert "interdataresearch" in result["base_url"]
+    finally:
+        # Cleanup: force-delete the test relay (no convs bound, so no cascade needed).
+        client.delete(f"/api/backends/{bid}?force=true")
+        _reset_relay_cache()
+
+
+@test("relay override: model NOT on relay → original backend wins")
+def _():
+    import asyncio, app as app_mod
+    from unittest.mock import patch
+    _reset_relay_cache()
+    bid = client.post("/api/backends", json={
+        "name": "test-relay-2", "kind": "ollama",
+        "base_url": "https://app.interdataresearch.example.com",
+    }).json()["id"]
+    try:
+        async def fake_list(_backend):
+            return [{"name": "only-this:1b"}]
+        with patch("app.llm.list_models", side_effect=fake_list):
+            original = {"id": 1, "name": "local", "kind": "ollama", "base_url": "http://localhost:11434"}
+            result = asyncio.run(app_mod._maybe_override_to_relay(original, "nope:7b"))
+        assert result is original, "expected pass-through when relay doesn't serve the model"
+    finally:
+        client.delete(f"/api/backends/{bid}?force=true")
+        _reset_relay_cache()
+
+
+@test("relay override: probe failure → original backend wins (no silent route to dead relay)")
+def _():
+    # If the relay's /api/tags is unreachable, the override must NOT silently
+    # redirect — the chat would fail. Fall back to whatever the conversation
+    # was originally pinned to.
+    import asyncio, app as app_mod
+    from unittest.mock import patch
+    _reset_relay_cache()
+    bid = client.post("/api/backends", json={
+        "name": "test-relay-3", "kind": "ollama",
+        "base_url": "https://app.interdataresearch.example.com",
+    }).json()["id"]
+    try:
+        async def boom(_backend):
+            raise ConnectionError("relay is down")
+        with patch("app.llm.list_models", side_effect=boom):
+            original = {"id": 1, "name": "local", "kind": "ollama", "base_url": "http://localhost:11434"}
+            result = asyncio.run(app_mod._maybe_override_to_relay(original, "any-model"))
+        assert result is original, "expected pass-through on probe failure"
+    finally:
+        client.delete(f"/api/backends/{bid}?force=true")
+        _reset_relay_cache()
+
+
+@test("relay override: already on relay → no-op (skip the probe)")
+def _():
+    # Hot-path optimization: if the caller is ALREADY targeting the relay,
+    # don't bother probing — return immediately.
+    import asyncio, app as app_mod
+    from unittest.mock import patch
+    _reset_relay_cache()
+    bid = client.post("/api/backends", json={
+        "name": "test-relay-4", "kind": "ollama",
+        "base_url": "https://app.interdataresearch.example.com",
+    }).json()["id"]
+    try:
+        called = {"n": 0}
+        async def counting_list(_backend):
+            called["n"] += 1
+            return [{"name": "any:1b"}]
+        with patch("app.llm.list_models", side_effect=counting_list):
+            relay_backend = {"id": bid, "name": "test-relay-4", "kind": "ollama",
+                             "base_url": "https://app.interdataresearch.example.com"}
+            result = asyncio.run(app_mod._maybe_override_to_relay(relay_backend, "any:1b"))
+        assert result is relay_backend, "should return input unchanged"
+        assert called["n"] == 0, "should not have probed when already on the relay"
+    finally:
+        client.delete(f"/api/backends/{bid}?force=true")
+        _reset_relay_cache()
+
+
 # ==================================================================
 # Main
 # ==================================================================

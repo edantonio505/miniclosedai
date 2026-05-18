@@ -209,6 +209,84 @@ def _load_backend(backend_id: int | None) -> dict:
     return db.row_to_dict(row)
 
 
+# ---------- Relay auto-route override ----------
+#
+# When a chat's model is one served by an "authoritative" remote relay
+# (currently any enabled backend with `app.interdataresearch` in its
+# base_url), we override whichever backend the conversation is technically
+# pinned to and send the request through the relay instead. Goal: the
+# relay's request_logs become the source of truth for that model's usage,
+# regardless of which group in the dashboard's model dropdown the user
+# happened to click. Without this, two backends advertising the same model
+# name silently divide the traffic — and any side-channel logging the
+# relay does only sees its share.
+#
+# Cache the relay's model list briefly (60 s) so we're not probing
+# `/api/tags` on every chat call. Cache invalidates on backend change
+# (id mismatch).
+
+_RELAY_HOST_FRAGMENTS = ("app.interdataresearch",)
+_RELAY_MODEL_CACHE_TTL_S = 60.0
+_relay_model_cache: dict = {"backend_id": None, "models": set(), "last_fetched": 0.0}
+
+
+def _find_relay_backend() -> dict | None:
+    """First enabled backend whose `base_url` contains a relay host fragment.
+    Returns the full backend dict (including api_key for client auth) or None
+    if no relay is registered or all relay candidates are disabled."""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM backends WHERE enabled = 1 ORDER BY id"
+        ).fetchall()
+    for r in rows:
+        d = db.row_to_dict(r)
+        url = (d.get("base_url") or "").lower()
+        if any(frag in url for frag in _RELAY_HOST_FRAGMENTS):
+            return d
+    return None
+
+
+async def _maybe_override_to_relay(backend: dict, model_name: str) -> dict:
+    """If a relay is registered, enabled, and serves `model_name`, return the
+    relay backend dict instead of the caller-supplied one. Otherwise return
+    `backend` unchanged.
+
+    Probe failure (network error, 4xx, malformed response) returns the
+    original backend — never silently breaks chat by routing to an
+    unreachable relay.
+    """
+    if not model_name:
+        return backend
+    relay = _find_relay_backend()
+    if not relay:
+        return backend
+    # Don't override if we're already on the relay — would be a wasted check
+    # in the hot path of every relay-bound conversation.
+    if backend.get("id") == relay["id"]:
+        return backend
+
+    now = time.time()
+    fresh = (
+        _relay_model_cache["backend_id"] == relay["id"]
+        and (now - _relay_model_cache["last_fetched"]) < _RELAY_MODEL_CACHE_TTL_S
+    )
+    if not fresh:
+        try:
+            models = await llm.list_models(relay)
+            _relay_model_cache["models"] = {
+                m.get("name") for m in (models or []) if m and m.get("name")
+            }
+            _relay_model_cache["last_fetched"] = now
+            _relay_model_cache["backend_id"] = relay["id"]
+        except Exception:
+            # Relay unreachable — keep original routing rather than fail.
+            return backend
+
+    if model_name in _relay_model_cache["models"]:
+        return relay
+    return backend
+
+
 def _scrub_backend(b: dict) -> dict:
     """Public-safe view of a backend row (hide api_key, show only api_key_set)."""
     out = {k: v for k, v in b.items() if k != "api_key"}
@@ -1411,6 +1489,7 @@ async def api_import_conversation_bot(req: BotImportRequest):
 @app.post("/api/chat")
 async def api_chat(req: ChatRequest):
     backend = _load_backend(req.backend_id)
+    backend = await _maybe_override_to_relay(backend, req.model)
     messages = _build_messages(req)
     params = {"temperature": req.temperature, "max_tokens": req.max_tokens,
               "top_p": req.top_p, "top_k": req.top_k, "think": req.think}
@@ -1620,6 +1699,7 @@ def _persist_conv_chat_turn(
 async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
     """Call the saved conversation as a configured function (non-streaming)."""
     conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
+    backend = await _maybe_override_to_relay(backend, eff["model"])
     attachments = [a.name for a in (req.attachments or [])] if req.attachments else []
     endpoint = f"/api/conversations/{conv_id}/chat"
     t0 = time.perf_counter()
@@ -1671,6 +1751,7 @@ async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
 async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
     """Call the saved conversation as a configured function (SSE streaming)."""
     conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
+    backend = await _maybe_override_to_relay(backend, eff["model"])
     attachments = [a.name for a in (req.attachments or [])] if req.attachments else []
     endpoint = f"/api/conversations/{conv_id}/chat/stream"
 
@@ -1753,6 +1834,7 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
 @app.post("/api/chat/stream")
 async def api_chat_stream(req: ChatRequest):
     backend = _load_backend(req.backend_id)
+    backend = await _maybe_override_to_relay(backend, req.model)
     messages = _build_messages(req)
     params = {"temperature": req.temperature, "max_tokens": req.max_tokens,
               "top_p": req.top_p, "top_k": req.top_k, "think": req.think}
@@ -1882,6 +1964,7 @@ async def openai_chat_completions(req: OAICompletionRequest):
         "top_k": saved.get("top_k", 40),
         "think": saved.get("think"),
     }
+    backend = await _maybe_override_to_relay(backend, effective["model"])
 
     # Bot's system prompt wins; drop caller-supplied system messages.
     ollama_messages = [{"role": "system", "content": conv["system_prompt"]}]
