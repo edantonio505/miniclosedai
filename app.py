@@ -228,6 +228,11 @@ def _load_backend(backend_id: int | None) -> dict:
 _RELAY_HOST_FRAGMENTS = ("app.interdataresearch",)
 _RELAY_MODEL_CACHE_TTL_S = 60.0
 _relay_model_cache: dict = {"backend_id": None, "models": set(), "last_fetched": 0.0}
+# Emergency stop. Set `MINICLOSEDAI_DISABLE_RELAY_AUTO_ROUTE=1` to bypass the
+# override entirely while debugging a degraded relay. With this set, chats
+# follow the conversation's pinned `backend_id` strictly. Restart the server
+# after toggling (the env var is read once per-call so re-export is enough
+# — but uvicorn caches the process env at startup).
 
 
 def _find_relay_backend() -> dict | None:
@@ -254,7 +259,13 @@ async def _maybe_override_to_relay(backend: dict, model_name: str) -> dict:
     Probe failure (network error, 4xx, malformed response) returns the
     original backend — never silently breaks chat by routing to an
     unreachable relay.
+
+    Env-var emergency stop: `MINICLOSEDAI_DISABLE_RELAY_AUTO_ROUTE=1` short-
+    circuits the entire override so chats follow the conv's pinned
+    `backend_id` strictly. Useful while debugging a degraded relay.
     """
+    if os.environ.get("MINICLOSEDAI_DISABLE_RELAY_AUTO_ROUTE") == "1":
+        return backend
     if not model_name:
         return backend
     relay = _find_relay_backend()
@@ -276,11 +287,16 @@ async def _maybe_override_to_relay(backend: dict, model_name: str) -> dict:
             _relay_model_cache["models"] = {
                 m.get("name") for m in (models or []) if m and m.get("name")
             }
-            _relay_model_cache["last_fetched"] = now
-            _relay_model_cache["backend_id"] = relay["id"]
         except Exception:
-            # Relay unreachable — keep original routing rather than fail.
-            return backend
+            # Relay unreachable — cache an empty set so we don't re-probe on
+            # every chat call while the relay is down. With a 5 s probe
+            # timeout, the un-cached failure path would add 5 s to every
+            # request. Empty-set caching → at most one probe per TTL window.
+            _relay_model_cache["models"] = set()
+        # Always advance the cache window, even on failure. A relay that
+        # comes back up gets re-detected after the next TTL boundary.
+        _relay_model_cache["last_fetched"] = now
+        _relay_model_cache["backend_id"] = relay["id"]
 
     if model_name in _relay_model_cache["models"]:
         return relay

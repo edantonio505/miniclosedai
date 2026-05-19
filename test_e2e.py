@@ -2655,6 +2655,66 @@ def _():
         _reset_relay_cache()
 
 
+@test("relay override: MINICLOSEDAI_DISABLE_RELAY_AUTO_ROUTE=1 disables the override")
+def _():
+    # Emergency stop for when the relay is degraded and the user wants
+    # chats to follow conv.backend_id strictly. Test confirms the override
+    # never probes when the env var is set.
+    import asyncio, os, app as app_mod
+    from unittest.mock import patch
+    _reset_relay_cache()
+    bid = client.post("/api/backends", json={
+        "name": "test-relay-disable", "kind": "ollama",
+        "base_url": "https://app.interdataresearch.example.com",
+    }).json()["id"]
+    try:
+        call_count = {"n": 0}
+        async def fake_list(_backend):
+            call_count["n"] += 1
+            return [{"name": "would-have-redirected:1b"}]
+        with patch.dict(os.environ, {"MINICLOSEDAI_DISABLE_RELAY_AUTO_ROUTE": "1"}), \
+             patch("app.llm.list_models", side_effect=fake_list):
+            original = {"id": 1, "name": "local", "kind": "ollama", "base_url": "http://localhost:11434"}
+            result = asyncio.run(app_mod._maybe_override_to_relay(original, "would-have-redirected:1b"))
+        assert result is original, "env-var disable should keep original backend"
+        assert call_count["n"] == 0, "env-var disable should skip the probe entirely"
+    finally:
+        client.delete(f"/api/backends/{bid}?force=true")
+        _reset_relay_cache()
+
+
+@test("relay override: probe failure is cached — second call skips re-probe")
+def _():
+    # Without this caching, every chat during a relay outage would eat the
+    # 5-second probe timeout. The fix: failure caches an empty model set
+    # for the same TTL as success, so re-probes happen at most once per
+    # TTL window even when the relay stays down.
+    import asyncio, app as app_mod
+    from unittest.mock import patch
+    _reset_relay_cache()
+    bid = client.post("/api/backends", json={
+        "name": "test-relay-5", "kind": "ollama",
+        "base_url": "https://app.interdataresearch.example.com",
+    }).json()["id"]
+    try:
+        call_count = {"n": 0}
+        async def boom(_backend):
+            call_count["n"] += 1
+            raise ConnectionError("timeout")
+        with patch("app.llm.list_models", side_effect=boom):
+            original = {"id": 1, "name": "local", "kind": "ollama", "base_url": "http://localhost:11434"}
+            # First call → probes, fails, caches empty set.
+            r1 = asyncio.run(app_mod._maybe_override_to_relay(original, "any-model"))
+            # Second call → cache is fresh (even though empty), should NOT re-probe.
+            r2 = asyncio.run(app_mod._maybe_override_to_relay(original, "any-model"))
+            r3 = asyncio.run(app_mod._maybe_override_to_relay(original, "different-model"))
+        assert r1 is original and r2 is original and r3 is original
+        assert call_count["n"] == 1, f"expected exactly 1 probe (cached failure), got {call_count['n']}"
+    finally:
+        client.delete(f"/api/backends/{bid}?force=true")
+        _reset_relay_cache()
+
+
 @test("relay override: already on relay → no-op (skip the probe)")
 def _():
     # Hot-path optimization: if the caller is ALREADY targeting the relay,
