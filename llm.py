@@ -207,7 +207,12 @@ def _ollama_headers(backend: dict) -> dict:
 
 async def _ollama_is_running(backend: dict) -> bool:
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
+        # 15 s — generous because relays in front of Ollama clusters can
+        # take 5-10 s to answer `/api/tags` under load (proxying to
+        # upstream + cold cache). Local Ollamas still return in <100 ms,
+        # so the longer cap only matters for false negatives on slow
+        # remotes — better than blocking users from seeing real backends.
+        async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(
                 f"{_base_url(backend)}/api/tags",
                 headers=_ollama_headers(backend),
@@ -222,7 +227,11 @@ async def _ollama_is_running(backend: dict) -> bool:
 
 async def _ollama_list_models(backend: dict) -> list[dict]:
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        # 20 s — same rationale as `_ollama_is_running`, with extra
+        # margin because list_models is called less often (dashboard
+        # refresh) so the cost of a long wait is paid by the user
+        # actively waiting at most.
+        async with httpx.AsyncClient(timeout=20.0) as client:
             r = await client.get(
                 f"{_base_url(backend)}/api/tags",
                 headers=_ollama_headers(backend),
@@ -336,7 +345,10 @@ async def _openai_is_running(backend: dict) -> bool:
     `/v1` suffix).
     """
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
+        # 15 s — same rationale as the Ollama equivalent. LM Studio / vLLM
+        # on localhost respond in tens of ms; relays / public APIs with
+        # real network hops sometimes take many seconds.
+        async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(
                 f"{_base_url(backend)}/models", headers=_openai_headers(backend)
             )
@@ -354,7 +366,7 @@ async def _openai_list_models(backend: dict) -> list[dict]:
     so Ollama-side doesn't need a branch.
     """
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             r = await client.get(
                 f"{_base_url(backend)}/models", headers=_openai_headers(backend)
             )
