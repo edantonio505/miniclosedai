@@ -1,0 +1,714 @@
+<!--
+  MiniClosedAI — web chatbot template
+
+  A single self-contained HTML file that turns any saved MCAi conversation
+  into an embeddable chat widget. Designed to be dropped into a marketing
+  page, a kiosk, an internal admin tool, or whatever else needs a chat
+  surface — copy this file, edit the two configuration lines marked
+  TODO, drop it on a webserver (or open it locally), done.
+
+  How to use:
+    1. Run MiniClosedAI somewhere reachable from this page's origin.
+       MCAi already ships with `allow_origins=["*"]`, so file:// works.
+    2. In MCAi's GUI, create a conversation from one of the recipes
+       (Hotel Reservations, Doctor's Office, Restaurant, Dentist, your own).
+    3. Note the conversation id (visible in the URL when you open the
+       chat, or via `GET /api/conversations`).
+    4. Edit the two `TODO` constants in the script block below.
+    5. Open index.html in any modern browser.
+
+  What it does:
+    - Streams the bot's reply token-by-token into a chat bubble.
+    - Hides the JSON action block from the chat bubble while it streams.
+    - Shows "Extracting information…" the moment the bot starts the
+      action block.
+    - When the stream completes and the action parses, renders the
+      structured data as a labeled summary card and disables the
+      composer (conversation ended).
+
+  Works with any conversational MCAi recipe — the fence-detection and
+  JSON-extraction are generic.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MiniClosedAI chatbot</title>
+  <style>
+    /* ---------- Design tokens ---------- */
+    :root {
+      --bg:           #f6f7f9;
+      --surface:      #ffffff;
+      --surface-alt:  #f0f2f5;
+      --border:       #e4e7ec;
+      --text:         #1a1f2c;
+      --text-muted:   #6b7382;
+      --accent:       #5b6cff;
+      --accent-soft:  #eef0ff;
+      --success:      #2eb872;
+      --r:            12px;
+      --r-sm:         8px;
+      --shadow:       0 4px 18px rgba(20, 24, 40, 0.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg:           #0e0f13;
+        --surface:      #181a21;
+        --surface-alt:  #20242e;
+        --border:       #2a2f3a;
+        --text:         #e8eaef;
+        --text-muted:   #97a0b3;
+        --accent:       #8896ff;
+        --accent-soft:  #1f2548;
+        --success:      #4cd28b;
+        --shadow:       0 6px 26px rgba(0,0,0,0.45);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font: 14.5px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI",
+            Roboto, "Helvetica Neue", Arial, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    /* ---------- Layout ---------- */
+    .chat-app {
+      width: 100%;
+      max-width: 620px;
+      height: min(720px, 92vh);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      box-shadow: var(--shadow);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .chat-header {
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .chat-header h1 {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 600;
+    }
+    .chat-header .sub {
+      margin-left: auto;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      box-shadow: 0 0 0 3px rgba(0,0,0,0.04);
+    }
+    .status-dot.ok { background: var(--success); }
+
+    .messages {
+      flex: 1 1 auto;
+      overflow-y: auto;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .bubble {
+      max-width: 80%;
+      padding: 9px 13px;
+      border-radius: var(--r);
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      animation: pop-in 160ms ease-out;
+    }
+    .bubble.user {
+      align-self: flex-end;
+      background: var(--accent);
+      color: white;
+      border-bottom-right-radius: 4px;
+    }
+    .bubble.bot {
+      align-self: flex-start;
+      background: var(--surface-alt);
+      color: var(--text);
+      border-bottom-left-radius: 4px;
+    }
+    /* Markdown rendered inside a bot bubble — kept narrow on purpose
+       so chat output stays compact. The renderer below only emits these
+       five element types, so no other rules are needed. */
+    .bubble.bot strong { font-weight: 600; }
+    .bubble.bot em     { font-style: italic; }
+    .bubble.bot code {
+      background: rgba(0, 0, 0, 0.06);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 92%;
+    }
+    @media (prefers-color-scheme: dark) {
+      .bubble.bot code { background: rgba(255,255,255,0.08); }
+    }
+    .bubble.bot ul, .bubble.bot ol {
+      margin: 6px 0;
+      padding-left: 22px;
+    }
+    .bubble.bot li { margin: 2px 0; }
+    .bubble.bot p:first-child { margin-top: 0; }
+    .bubble.bot p:last-child  { margin-bottom: 0; }
+    @keyframes pop-in {
+      from { opacity: 0; transform: translateY(2px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .indicator {
+      align-self: flex-start;
+      color: var(--text-muted);
+      font-size: 13px;
+      font-style: italic;
+      padding: 4px 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .indicator .spinner {
+      width: 12px; height: 12px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .composer {
+      padding: 12px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 8px;
+      background: var(--surface);
+    }
+    .composer textarea {
+      flex: 1 1 auto;
+      resize: none;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: var(--r-sm);
+      font: inherit;
+      font-size: 14px;
+      line-height: 1.4;
+      min-height: 40px;
+      max-height: 120px;
+    }
+    .composer textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: var(--surface);
+    }
+    .composer button {
+      background: var(--accent);
+      color: white;
+      border: 0;
+      border-radius: var(--r-sm);
+      padding: 0 18px;
+      font: inherit;
+      font-weight: 500;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .composer button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .composer button:not(:disabled):hover { opacity: 0.9; }
+
+    /* ---------- Extracted-info card ---------- */
+    .extracted {
+      margin: 6px 0;
+      padding: 14px 16px;
+      background: var(--accent-soft);
+      border: 1px solid var(--accent);
+      border-radius: var(--r);
+      align-self: stretch;
+    }
+    .extracted h3 {
+      margin: 0 0 10px;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .extracted .check {
+      width: 16px; height: 16px;
+      border-radius: 50%;
+      background: var(--success);
+      color: white;
+      font-size: 11px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .extracted dl {
+      margin: 0;
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      gap: 4px 14px;
+      font-size: 13.5px;
+    }
+    .extracted dt {
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+    .extracted dd {
+      margin: 0;
+      color: var(--text);
+    }
+    .extracted .section-h {
+      grid-column: 1 / -1;
+      margin-top: 10px;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      color: var(--accent);
+      padding-top: 8px;
+      border-top: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+    }
+    .extracted .section-h:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+  </style>
+</head>
+<body>
+  <div class="chat-app" id="app">
+    <div class="chat-header">
+      <span class="status-dot ok" id="status-dot"></span>
+      <h1>Hotel Reservations</h1>
+      <span class="sub" id="status-sub">Powered by MiniClosedAI</span>
+    </div>
+
+    <div class="messages" id="messages" aria-live="polite"></div>
+
+    <form class="composer" id="composer">
+      <textarea id="input" placeholder="Type a message…" rows="2" autofocus></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+  </div>
+
+  <script>
+  // =========================================================================
+  // Configuration.
+  //
+  // MCAI_BASE_URL is auto-derived: same hostname as the page, MCAi's
+  // default port (8095). This means dropping the file on any web server
+  // — port 9000, your marketing site, an iframe widget — works as long
+  // as the visitor's browser can also reach MCAi on the same hostname
+  // at 8095. To point at a different MCAi host entirely:
+  //   const MCAI_BASE_URL = "http://my-mcai-host.example.com:8095";
+  // CONV_ID is the saved-conversation id (visible in /api/conversations).
+  // =========================================================================
+  const MCAI_BASE_URL =
+    window.location.protocol === "file:"
+      ? "http://localhost:8095"   // sensible default for `file://` testing
+      : `${window.location.protocol}//${window.location.hostname}:8095`;
+  const CONV_ID = 39;  // TODO: your saved conv id
+
+  // =========================================================================
+  // No edits needed below this line.
+  // =========================================================================
+
+  const STREAM_URL = `${MCAI_BASE_URL}/api/conversations/${CONV_ID}/chat/stream`;
+
+  const els = {
+    messages: document.getElementById("messages"),
+    composer: document.getElementById("composer"),
+    input:    document.getElementById("input"),
+    send:     document.getElementById("send"),
+    dot:      document.getElementById("status-dot"),
+    sub:      document.getElementById("status-sub"),
+  };
+
+  const history = [];
+
+  // -------------------------------------------------------------------------
+  // Minimal markdown renderer for chat bubbles.
+  //
+  // The LLM commonly returns prose with **bold**, *italic*, `inline code`,
+  // numbered lists (1. 2. 3.), and bullet lists (- item or * item). Bare
+  // textContent would render those as literal asterisks/dashes. This
+  // renderer converts them to safe HTML.
+  //
+  // Security model: every character is HTML-escaped FIRST, then markdown
+  // patterns are applied to the already-escaped text. The only HTML this
+  // function inserts is the five element types it controls — <strong>,
+  // <em>, <code>, <ol>/<ul>, <li>. LLM output cannot break out into
+  // <script>, event handlers, or other unsafe constructs because every
+  // `<`, `>`, and `&` in the source becomes `&lt;`/`&gt;`/`&amp;` before
+  // any pattern matching.
+  // -------------------------------------------------------------------------
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  function renderMarkdown(text) {
+    let html = escapeHtml(text);
+
+    // Inline transforms. Order matters: bold before italic so `**foo**`
+    // isn't mangled by the italic pattern. Backtick code spans first so
+    // emphasis inside code blocks is preserved as literal characters.
+    html = html
+      .replace(/`([^`\n]+?)`/g, "<code>$1</code>")
+      .replace(/\*\*([^\n*]+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/(?<![*\w])\*([^\n*]+?)\*(?![*\w])/g, "<em>$1</em>");
+
+    // List handling. Walk line-by-line, opening/closing <ol>/<ul> as we
+    // enter and leave runs of list items. Non-list lines pass through.
+    const lines = html.split("\n");
+    const out = [];
+    let inOL = false, inUL = false;
+    const closeLists = () => {
+      if (inOL) { out.push("</ol>"); inOL = false; }
+      if (inUL) { out.push("</ul>"); inUL = false; }
+    };
+    for (const line of lines) {
+      const ol = line.match(/^\s*\d+\.\s+(.*)$/);
+      const ul = line.match(/^\s*[-*]\s+(.*)$/);
+      if (ol) {
+        if (inUL) { out.push("</ul>"); inUL = false; }
+        if (!inOL) { out.push("<ol>"); inOL = true; }
+        out.push(`<li>${ol[1]}</li>`);
+      } else if (ul) {
+        if (inOL) { out.push("</ol>"); inOL = false; }
+        if (!inUL) { out.push("<ul>"); inUL = true; }
+        out.push(`<li>${ul[1]}</li>`);
+      } else {
+        closeLists();
+        out.push(line);
+      }
+    }
+    closeLists();
+    return out.join("\n");
+  }
+
+  // -------------------------------------------------------------------------
+  // FenceSuppressor — JS twin of the Python script's class.
+  // Streams chunks into a target element, but hides everything between
+  // ```...``` markers. Fires `onFenceOpen` exactly once per instance the
+  // moment the first fence opens (so the caller can swap in an
+  // "Extracting information…" indicator while the suppressed JSON streams).
+  //
+  // Visible text is accumulated as a string (`this.visible`) and the
+  // target's innerHTML is re-rendered via `renderMarkdown()` on every
+  // mutation. This handles streaming naturally — incomplete markdown
+  // patterns at the buffer tail (e.g. `**fo` waiting for `o**`) render
+  // as literal asterisks until the closing marker arrives, then snap
+  // into <strong> on the next chunk. No flicker, no partial DOM updates.
+  // -------------------------------------------------------------------------
+  class FenceSuppressor {
+    constructor(target, onFenceOpen) {
+      this.target = target;
+      this.onFenceOpen = onFenceOpen;
+      this.fired = false;
+      this.buf = "";       // streaming input buffer (raw chunks)
+      this.visible = "";   // accumulated visible text (rendered as markdown)
+      this.inFence = false;
+    }
+    // Append to the visible accumulator and re-render the bubble.
+    // Re-rendering on every chunk is cheap (typical bubble is <2 KB and
+    // the markdown regex passes are O(n)) and dodges the streaming-
+    // markdown problem entirely — incomplete patterns at the tail just
+    // render as literal characters until the closing marker shows up.
+    _appendVisible(text) {
+      if (!text) return;
+      this.visible += text;
+      this.target.innerHTML = renderMarkdown(this.visible);
+    }
+    feed(chunk) {
+      if (!chunk) return;
+      this.buf += chunk;
+      while (true) {
+        if (this.inFence) {
+          const idx = this.buf.indexOf("```");
+          if (idx < 0) {
+            // Keep the last 3 chars in case the closing marker straddles
+            // the next chunk; drop the rest (suppressed anyway).
+            this.buf = this.buf.length > 3 ? this.buf.slice(-3) : this.buf;
+            return;
+          }
+          this.buf = this.buf.slice(idx + 3).replace(/^\n/, "");
+          this.inFence = false;
+        } else {
+          const idx = this.buf.indexOf("```");
+          if (idx < 0) {
+            // Hold back the last 2 chars in case they're the start of ```.
+            if (this.buf.length > 2) {
+              this._appendVisible(this.buf.slice(0, -2));
+              this.buf = this.buf.slice(-2);
+            }
+            return;
+          }
+          this._appendVisible(this.buf.slice(0, idx));
+          // Skip the fence opener + optional language tag (```json\n).
+          const rest = this.buf.slice(idx + 3);
+          const langMatch = rest.match(/^\w*\n?/);
+          this.buf = langMatch ? rest.slice(langMatch[0].length) : rest;
+          this.inFence = true;
+          if (!this.fired && this.onFenceOpen) {
+            this.fired = true;
+            try { this.onFenceOpen(); } catch {}
+          }
+        }
+      }
+    }
+    flush() {
+      if (!this.inFence && this.buf) {
+        this._appendVisible(this.buf);
+        this.buf = "";
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Action extraction (matches the Python helper). Returns the first parseable
+  // JSON object found in any fenced code block, or null if none exists.
+  // -------------------------------------------------------------------------
+  function extractAction(text) {
+    const re = /```(?:json)?\s*(\{[\s\S]*?\})\s*```/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      try { return JSON.parse(m[1]); } catch {}
+    }
+    return null;
+  }
+
+  // -------------------------------------------------------------------------
+  // DOM helpers — bubbles, indicators, the extracted-info card.
+  //
+  // `scrollToBottom()` is the only scroll primitive used anywhere on this
+  // page. Each helper that mutates the DOM calls it after the change. This
+  // matters specifically during fence-suppression: while the bot streams
+  // the (invisible) JSON action block, no new chunk is appended to the
+  // bubble — but the "Extracting information…" indicator below it is now
+  // the bottom-most element. Scrolling to a specific element (the way the
+  // earlier version did with `bubble.scrollIntoView`) would scroll back UP
+  // to the bubble each time a suppressed chunk arrived, hiding the
+  // indicator off-viewport. Pinning to scrollHeight avoids that entirely.
+  // -------------------------------------------------------------------------
+  function scrollToBottom() {
+    els.messages.scrollTop = els.messages.scrollHeight;
+  }
+
+  function addBubble(role, text) {
+    const div = document.createElement("div");
+    div.className = `bubble ${role}`;
+    div.textContent = text;
+    els.messages.appendChild(div);
+    scrollToBottom();
+    return div;
+  }
+
+  function addIndicator(label) {
+    const div = document.createElement("div");
+    div.className = "indicator";
+    div.innerHTML = `<span class="spinner"></span><span>${label}…</span>`;
+    els.messages.appendChild(div);
+    scrollToBottom();
+    return div;
+  }
+
+  // Render the extracted action as a labeled list. Generic over any
+  // recipe — walks the dict, indents nested objects, skips empties.
+  function renderAction(action) {
+    const card = document.createElement("div");
+    card.className = "extracted";
+    card.innerHTML = `<h3><span class="check">✓</span> Information extracted</h3>`;
+
+    const dl = document.createElement("dl");
+    const labelize = k => k.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+    const isEmpty = v =>
+      v === null || v === undefined || v === "" ||
+      (Array.isArray(v) && v.length === 0) ||
+      (v && typeof v === "object" && Object.keys(v).length === 0);
+    const fmt = v => {
+      if (typeof v === "boolean") return v ? "yes" : "no";
+      if (Array.isArray(v)) return v.join(", ");
+      return String(v);
+    };
+
+    const walk = (obj, isRoot) => {
+      const scalars = Object.entries(obj).filter(([_, v]) => !isEmpty(v) && (typeof v !== "object" || Array.isArray(v)));
+      const nested = Object.entries(obj).filter(([_, v]) => v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length);
+      for (const [k, v] of scalars) {
+        const dt = document.createElement("dt"); dt.textContent = labelize(k);
+        const dd = document.createElement("dd"); dd.textContent = fmt(v);
+        dl.appendChild(dt); dl.appendChild(dd);
+      }
+      for (const [k, v] of nested) {
+        const h = document.createElement("div");
+        h.className = "section-h";
+        h.textContent = labelize(k);
+        dl.appendChild(h);
+        walk(v, false);
+      }
+    };
+    walk(action, true);
+    card.appendChild(dl);
+
+    els.messages.appendChild(card);
+    scrollToBottom();
+  }
+
+  // -------------------------------------------------------------------------
+  // The streaming call. Sends one user message, builds a bot bubble that
+  // populates as chunks arrive, swaps in "Extracting information…" the
+  // moment the bot starts a fenced block.
+  // -------------------------------------------------------------------------
+  async function sendMessage(userText) {
+    addBubble("user", userText);
+    history.push({ role: "user", content: userText });
+
+    let thinkingEl = addIndicator("Thinking");
+    let botBubble = null;     // created when first chunk arrives
+    let extractingEl = null;  // created when a fence opens
+    const onFenceOpen = () => {
+      extractingEl = addIndicator("Extracting information");
+    };
+    const fullChunks = [];
+    let suppressor = null;
+
+    try {
+      // We send the full conversation from the client's in-memory `history`
+      // (built up turn-by-turn in this page session). This keeps the chat
+      // stateless from MCAi's perspective:
+      //   - Page refresh ⇒ `history` is empty ⇒ next chat starts fresh,
+      //     with no carryover from a prior visitor's flow.
+      //   - We DON'T pass `include_history: true` (which would replay the
+      //     conv's persisted messages from SQLite — leaking the previous
+      //     test conversation into the new one).
+      //   - We DON'T pass `persist: true` (default false), so this session
+      //     never writes back to the conv's stored messages either. The
+      //     "Hotel Reservations Bot" conversation row in MCAi's DB stays
+      //     pristine; only its config (system prompt + params) is read.
+      // The bot's system prompt is prepended server-side from the saved
+      // conv row, so the bot still has its identity / instructions even
+      // though we're not echoing it from the client.
+      const resp = await fetch(STREAM_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: history }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        // SSE events are separated by blank lines (\n\n).
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          if (!frame.startsWith("data: ")) continue;
+          let payload;
+          try { payload = JSON.parse(frame.slice(6).trim()); } catch { continue; }
+
+          if (typeof payload.chunk === "string") {
+            if (botBubble === null) {
+              thinkingEl.remove();
+              thinkingEl = null;
+              botBubble = addBubble("bot", "");
+              suppressor = new FenceSuppressor(botBubble, onFenceOpen);
+            }
+            fullChunks.push(payload.chunk);
+            suppressor.feed(payload.chunk);
+            // Pin to bottom on every chunk so the latest content (bubble,
+            // indicator, or anything that came after) stays visible —
+            // critical once the "Extracting information…" indicator is
+            // shown, since the chunks that follow are suppressed and
+            // wouldn't otherwise force a scroll.
+            scrollToBottom();
+          } else if (payload.error) {
+            throw new Error(payload.error);
+          } else if (payload.end) {
+            // Stream complete; loop will exit on next read() returning done=true.
+          }
+        }
+      }
+    } catch (e) {
+      if (thinkingEl) thinkingEl.remove();
+      if (extractingEl) extractingEl.remove();
+      addBubble("bot", `[Error: ${e.message || e}]`);
+      history.pop();
+      return;
+    }
+
+    if (suppressor) suppressor.flush();
+    if (extractingEl) extractingEl.remove();
+    if (thinkingEl) thinkingEl.remove();
+
+    const fullReply = fullChunks.join("");
+    history.push({ role: "assistant", content: fullReply });
+
+    const action = extractAction(fullReply);
+    if (action) {
+      renderAction(action);
+      endConversation();
+    }
+  }
+
+  function endConversation() {
+    els.input.disabled = true;
+    els.send.disabled = true;
+    els.input.placeholder = "Conversation ended — information extracted.";
+    els.sub.textContent = "Done — refresh to start over.";
+  }
+
+  // -------------------------------------------------------------------------
+  // Wire up the composer. Enter sends, Shift+Enter inserts a newline,
+  // empty submissions are ignored, the Send button locks during the call.
+  // -------------------------------------------------------------------------
+  els.composer.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const text = els.input.value.trim();
+    if (!text) return;
+    els.input.value = "";
+    els.send.disabled = true;
+    try {
+      await sendMessage(text);
+    } finally {
+      // sendMessage may have endConversation()'d, leaving send disabled —
+      // only re-enable when the conversation is still open.
+      if (!els.input.disabled) {
+        els.send.disabled = false;
+        els.input.focus();
+      }
+    }
+  });
+  els.input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      els.composer.requestSubmit();
+    }
+  });
+  </script>
+</body>
+</html>

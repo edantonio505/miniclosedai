@@ -34,14 +34,15 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 13. [Getting good responses from small models](#getting-good-responses-from-small-models)
 14. [Curating fine-tuning data](#curating-fine-tuning-data)
 15. [Automated image labeling — hot dog / not hot dog](#automated-image-labeling--hot-dog--not-hot-dog)
-16. [Sharing bots between instances](#sharing-bots-between-instances)
-17. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
-18. [LAN access](#lan-access)
-19. [Troubleshooting](#troubleshooting)
-20. [Testing](#testing)
-21. [Project layout](#project-layout)
-22. [Security](#security)
-23. [License](#license)
+16. [Building a chatbot against a saved bot](#building-a-chatbot-against-a-saved-bot)
+17. [Sharing bots between instances](#sharing-bots-between-instances)
+18. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
+19. [LAN access](#lan-access)
+20. [Troubleshooting](#troubleshooting)
+21. [Testing](#testing)
+22. [Project layout](#project-layout)
+23. [Security](#security)
+24. [License](#license)
 
 ---
 
@@ -1911,6 +1912,134 @@ The labeler script is small (73 LoC) because **MiniClosedAI's conversation endpo
 ### Cost of running this
 
 Local-only — there is no per-call charge. The example labeled 100 images in roughly 2 minutes on a consumer GPU running a 7B vision-capable model. Scale linearly: 10k images is ~3.5 hours on the same hardware. Run it overnight against your archive.
+
+---
+
+## Building a chatbot against a saved bot
+
+Two runnable templates in [`docs/examples/`](./docs/examples/) — one Python CLI, one drop-in HTML widget — both backed by the same per-conversation endpoint. Pick whichever matches your delivery surface (terminal tool / kiosk / web page / internal admin) and edit two lines to point it at your bot.
+
+Both share the same lifecycle:
+
+1. Stream the bot's reply token-by-token into a chat surface.
+2. Detect when the bot starts emitting a fenced JSON action block (the recipe's "I have enough info to act" signal).
+3. Suppress the JSON from the visible chat while it streams in (the user shouldn't see the raw JSON).
+4. Show a loading indicator while the action streams.
+5. When the stream ends, parse the JSON, render it as a labeled summary, and end the conversation.
+
+### Python CLI — [`docs/examples/hotel_chatbot/chat.py`](./docs/examples/hotel_chatbot/chat.py)
+
+A single 250-line Python file that talks to the Hotel Reservations Bot recipe (or any conversational MCAi bot — the fence/action handling is generic).
+
+**Setup:**
+
+```bash
+pip install openai
+
+# Make sure MCAi is running and the Hotel Reservations Bot is saved
+.venv/bin/python docs/examples/hotel_chatbot/chat.py
+```
+
+The script auto-discovers any conversation whose title contains `"hotel"`. Override via env vars:
+
+```bash
+MCAI_CONV_ID=39 python chat.py                              # pin specific conv
+MCAI_BASE_URL=http://192.168.0.110:8095/v1 python chat.py   # remote MCAi
+```
+
+**What you'll see** — the bot streams its prose into the terminal, a spinner appears the moment it starts emitting `\`\`\`json`, and the spinner is replaced by a labeled summary when the action parses:
+
+```
+you ▸ Yes, book it.
+
+⠹ Thinking…
+bot ▸ Booked! You'll get a confirmation email shortly.
+⠼ Extracting information…
+
+──────────────────────────────────────────────────────────────────────
+Conversation ended — information extracted
+──────────────────────────────────────────────────────────────────────
+  Type      create_booking
+  Guest:
+    Name   Jane Doe
+    Email  jane@example.com
+  Stay:
+    Check In   2026-07-15
+    Check Out  2026-07-17
+    Adults     2
+    Room Type  Classic King
+──────────────────────────────────────────────────────────────────────
+```
+
+**Why the `openai` SDK** — MCAi exposes `/v1/chat/completions` 1:1, so the official SDK works against it with no adapter. Same idiom you'd use against `api.openai.com`; just a different `base_url`. One dependency, 250 lines including the spinner and JSON-suppression machinery.
+
+### HTML drop-in widget — [`docs/examples/web_chatbot/index.html`](./docs/examples/web_chatbot/index.html)
+
+A self-contained single-file HTML page (~560 lines, no dependencies) that turns the same saved bot into a polished chat widget. Drop it on any web server, an internal admin tool, a kiosk, or just open it locally — copy the file, edit two `TODO` constants at the top of the `<script>` block, done.
+
+```html
+<!-- index.html — line ~310 -->
+const MCAI_BASE_URL = "http://localhost:8095";  // TODO: your MCAi instance
+const CONV_ID       = 39;                       // TODO: your saved conv id
+```
+
+**Features baked in:**
+
+- Modern chat-bubble UI, responsive layout, automatic dark mode via `prefers-color-scheme`.
+- Streams the bot's reply via `fetch()` + `ReadableStream`, parses the SSE frames inline.
+- Same fence-suppression and one-shot fence-open hook as the Python script — the JSON action block never appears in the chat bubble.
+- **Inline markdown rendering** in bot bubbles: `**bold**`, `*italic*`, `` `inline code` ``, numbered lists (`1. 2. 3.`), and bullet lists (`- item`). All HTML-escaped before rendering, so LLM output cannot inject `<script>` or other unsafe HTML. User bubbles stay plain text.
+- "Thinking…" indicator before the first token; "Extracting information…" indicator the moment a fence opens.
+- When the action parses, a styled summary card renders with a green checkmark, the key/value pairs labeled, and the composer disabled (conversation ended).
+- Each page-load is a fresh session: chat history lives only in client-side JS; refreshing the tab wipes it without touching the bot's saved state in MCAi.
+- Works against `file://` URLs because MCAi's CORS config allows all origins.
+
+**Use it as-is or as a template** — the entire styling lives in a `<style>` block at the top of the file (CSS custom properties for theme tokens). Swap the colors / fonts / layout to match your product. The JS is structured as discrete helpers (`FenceSuppressor`, `extractAction`, `renderAction`, `sendMessage`, `addBubble`, `addIndicator`) you can lift into your own bundle if you'd rather not ship a standalone page.
+
+**Markdown supported in bot replies.** The bot's chat bubble runs a tiny ~25-line markdown renderer with deliberately minimal grammar:
+
+| Source | Renders as |
+|---|---|
+| `**bold**` | **bold** |
+| `*italic*` | *italic* |
+| `` `code` `` | `code` |
+| `1. item\n2. item` | numbered list |
+| `- item\n- item` (or `* item`) | bulleted list |
+| Anything else | plain text |
+
+Order of operations is escape-first: every `<`, `>`, `&` becomes its HTML entity *before* any markdown pattern matching. The renderer's output can only contain `<strong>`, `<em>`, `<code>`, `<ol>`, `<ul>`, `<li>` — no other elements are possible, so LLM output can't introduce `<script>`, event handlers, or other unsafe HTML. User-typed input stays as plain text (via `textContent`) — if a user types `**hi**`, they see `**hi**`, not bold. If you need full markdown (headers, links, tables), drop in [marked](https://marked.js.org/) + [DOMPurify](https://github.com/cure53/DOMPurify) and swap `renderMarkdown` with `DOMPurify.sanitize(marked.parse(text))`.
+
+**MCAi-URL auto-detection.** The page derives its `MCAi_BASE_URL` from `window.location.hostname` + port `8095`. Concretely:
+
+| Page served from | The page calls MCAi at |
+|---|---|
+| `file:///…/index.html` | `http://localhost:8095` (explicit fallback) |
+| `http://localhost:8095/static/web_chatbot/index.html` (same-origin) | `http://localhost:8095` |
+| `http://192.168.0.110:9000/index.html` (separate static server) | `http://192.168.0.110:8095` — same host, MCAi's port |
+| Anywhere else (a remote marketing site) | Hardcode `MCAI_BASE_URL` to an explicit URL |
+
+So the same HTML file works whether you serve it from MCAi itself, from a separate static server on a different port, or just open the file locally — no edit needed.
+
+**Hosting options:**
+
+| Where | How to set it up | Suitable for |
+|---|---|---|
+| **Open the file directly** (`file://`) | Double-click `index.html` in your file browser. | Quick demo / test on the same machine as MCAi |
+| **Same-origin via MCAi** | `cp docs/examples/web_chatbot/index.html static/web_chatbot/`<br>visit `http://<host>:8095/static/web_chatbot/index.html` | Permanent internal-tool deployment, one process |
+| **Separate static server** (`python3 -m http.server`) | `cd docs/examples/web_chatbot && python3 -m http.server 9000 --bind 0.0.0.0`<br>visit `http://<host>:9000/index.html` | Demoing the "third-party site embedding MCAi" pattern; useful for LAN walkthroughs |
+| **Your real web app / CDN** (nginx, Caddy, S3+CloudFront, Vercel) | Drop `index.html` into the static-asset folder of your existing site | Production. Pair with a reverse proxy that adds auth in front of MCAi. |
+| **Customer's browser → public-IP MCAi (no auth)** | Don't. | MCAi ships with zero auth; exposing `/api/*` lets anyone read/modify/delete your bots. |
+
+The single-file design plus origin auto-detection means you can move the file between these without code changes — only the runtime URL changes.
+
+### Adapting either template to a different recipe
+
+Both examples are recipe-agnostic — the fence-detection and action-extraction look for any fenced JSON block, not just `create_booking`. To talk to the Doctor's Office Bot, Restaurant Reservations Bot, Dentist Appointment Bot, or any custom conversational bot of yours, you only need to change:
+
+1. **The conversation id** (`MCAI_CONV_ID` for Python, `CONV_ID` for HTML).
+2. **The system prompt of that conversation** — set in MCAi's GUI, defines what the bot collects and what action it emits.
+
+The renderers (`render_action` in Python, `renderAction` in JS) walk the dict generically with `snake_case → "Title Case"` labels and nested-section grouping, so a `create_appointment` from the doctor's recipe renders just as cleanly as a `create_booking` from the hotel's.
 
 ---
 
