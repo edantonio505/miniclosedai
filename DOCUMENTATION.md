@@ -33,15 +33,16 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 10. [Stopping generation](#stopping-generation)
 11. [Fine-tuning data export](#fine-tuning-data-export)
 12. [Worked example — automated image labeling](#worked-example--automated-image-labeling)
-13. [Bot import / export](#bot-import--export)
-14. [Self-upgrade](#self-upgrade)
-15. [Prompt generator](#prompt-generator)
-16. [Activity logs](#activity-logs)
-17. [Database](#database)
-18. [Configuration](#configuration)
-19. [File layout](#file-layout)
-20. [Security](#security)
-21. [Troubleshooting](#troubleshooting)
+13. [Worked example — chatbot frontends (Python CLI + HTML widget)](#worked-example--chatbot-frontends-python-cli--html-widget)
+14. [Bot import / export](#bot-import--export)
+15. [Self-upgrade](#self-upgrade)
+16. [Prompt generator](#prompt-generator)
+17. [Activity logs](#activity-logs)
+18. [Database](#database)
+19. [Configuration](#configuration)
+20. [File layout](#file-layout)
+21. [Security](#security)
+22. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -1124,6 +1125,181 @@ A more aggressive design (one this example deliberately doesn't take): SQLite-ba
 ### What to clone from this
 
 The [`docs/examples/hotdog_nothotdog/`](./docs/examples/hotdog_nothotdog/) folder is meant to be copied wholesale: rename, swap the images, swap the system prompt in the GUI, swap the URL + conversation ID in the script. The structure (a single Python file + an `images/` folder + a `labels.csv` output) is the template. Future examples added under `docs/examples/` should follow the same shape so users can recognize the pattern by filename.
+
+---
+
+## Worked example — chatbot frontends (Python CLI + HTML widget)
+
+Two reference implementations of "consume a conversational MCAi bot as an end-user surface". Both back-end on the same `/api/conversations/{id}/chat/stream` endpoint (the HTML) or `/v1/chat/completions` (the Python script via the OpenAI SDK) and demonstrate the same five-stage lifecycle:
+
+1. **Stream** the bot's reply token-by-token.
+2. **Suppress** any fenced code block (the recipe's action JSON) from the user-visible surface.
+3. **Signal** the moment a fence opens (transition from "bot writing prose" to "bot writing JSON").
+4. **Render** a structured summary of the parsed action.
+5. **End** the conversation cleanly so the user can't keep typing after action capture.
+
+Source folders:
+
+- [`docs/examples/hotel_chatbot/chat.py`](./docs/examples/hotel_chatbot/chat.py) — terminal CLI, 250 LOC, `openai` SDK.
+- [`docs/examples/web_chatbot/index.html`](./docs/examples/web_chatbot/index.html) — self-contained HTML page, 560 LOC including styles, zero dependencies.
+
+### Architecture, identical in both languages
+
+```
+                         ┌──────────────┐
+   user types in input ──►  "Thinking…" │ ← indicator while waiting for token 1
+                         └──────┬───────┘
+                                │ POST /chat/stream (or /v1/chat/completions)
+                                ▼
+                       ┌─────────────────┐
+   stream of chunks ←──┤  MCAi server    │
+                       │  + relay route  │
+                       └─────────────────┘
+                                │
+                                ▼ each chunk:
+                       ┌──────────────────────┐
+                       │  FenceSuppressor     │
+                       │  ── inside fence? ───┼──── yes ──► drop (suppress JSON)
+                       │  └─ first ``` seen ──┼──── fire `on_fence_open` ──┐
+                       └──────────────────────┘                           │
+                                │                                         ▼
+                                ▼ outside fence content              ┌─────────────────────────┐
+                       ┌──────────────────┐                          │ "Extracting information…"│
+                       │   chat bubble    │                          └─────────────────────────┘
+                       │   or terminal    │
+                       └──────────────────┘
+                                │
+                                ▼ stream ends
+                       ┌──────────────────────────────┐
+                       │  extractAction() → JSON dict │
+                       └──────────────┬───────────────┘
+                                      ▼
+                       ┌──────────────────────────────────┐
+                       │  renderAction() → labeled table  │
+                       │  composer disabled                │
+                       └──────────────────────────────────┘
+```
+
+### The `FenceSuppressor` class — present in both files
+
+Both implementations share the same algorithm, line for line:
+
+- Maintain a small lookbehind buffer (2 chars when outside a fence, 3 when inside).
+- When outside a fence: emit everything except the trailing 2 chars (in case they're the start of `` ``` `` arriving across chunk boundaries).
+- When `` ``` `` is found: skip it + any language tag + the trailing newline, transition into "inside fence" mode, fire the `on_fence_open` callback **exactly once** per instance (one-shot — even if the bot emits multiple action blocks in a single reply, the indicator only appears once).
+- When inside a fence: drop everything until the next `` ``` ``, then transition back out.
+- The callback site is wrapped in try/except so a faulty callback doesn't break the streamer.
+
+Python: [`FenceSuppressingStreamer`](./docs/examples/hotel_chatbot/chat.py). JS: `class FenceSuppressor` at the top of the `<script>` block in the HTML.
+
+### Why the Python uses OpenAI SDK and the HTML uses native MCAi
+
+| | Python | HTML |
+|---|---|---|
+| Endpoint | `POST /v1/chat/completions` | `POST /api/conversations/{id}/chat/stream` |
+| SSE shape | OpenAI `chat.completion.chunk` (`choices[0].delta.content`) | MCAi-native (`{"chunk": "..."}` / `{"end": true}`) |
+| Library | `openai` (1 dep) | none (`fetch` + `ReadableStream`) |
+| Why | The official SDK is the most-installed LLM library on PyPI; using it here makes the script a portable template that works against api.openai.com with one URL change. | Hand-rolling SSE parsing in 30 lines is cheaper than including a 50 KB SDK; native MCAi's shape is simpler to parse client-side; CORS works out of the box. |
+
+### Generic action renderer — used by both
+
+The recipe bots emit different action shapes (`create_booking`, `create_appointment`, `create_reservation`, etc.). Both renderers walk the parsed dict generically:
+
+- Convert `snake_case` keys to `Title Case` labels.
+- Skip `null` / `""` / `[]` / `{}` values (recipe placeholders for unfilled fields).
+- Render booleans as `yes` / `no`.
+- Group nested objects under a section header indented one level.
+
+Python: `render_action()`. JS: `renderAction()`. Output is structurally identical (a `<dl>` in HTML, a labeled key/value table in the CLI).
+
+### Adapting to a different recipe
+
+Neither file references "hotel" or `create_booking` in the chat-handling code path — the fence-detection and action-extraction look for **any** fenced JSON block. To repoint at another recipe:
+
+1. Change the conversation id (`MCAI_CONV_ID` env var for Python; `CONV_ID` constant in HTML).
+2. Edit the system prompt of that conversation in MCAi's GUI to define what gets collected and what action emits.
+
+Nothing else changes. The Doctor's `create_appointment`, the Restaurant's `create_reservation`, a custom bot of yours emitting `{"type": "place_order", ...}` — all render the same way and trigger the same lifecycle.
+
+### Deployment surfaces — HTML widget
+
+The HTML's CORS-friendliness (MCAi ships `allow_origins=["*"]`) plus its auto-derived `MCAI_BASE_URL` makes it work in five useful contexts:
+
+| Deployment | Setup | Notes |
+|---|---|---|
+| **Local file** (`file://`) | Just open `index.html` | The page falls back to `http://localhost:8095` for `MCAi_BASE_URL` since `window.location.hostname` is empty under `file://`. Fastest test / demo. |
+| **Same-origin** — served by MCAi itself | `cp docs/examples/web_chatbot/index.html static/web_chatbot/`, visit `http://<host>:8095/static/web_chatbot/index.html` | One port. No CORS preflight. Easiest internal deployment. |
+| **Different port on same host** — simulates a separate web app | `cd docs/examples/web_chatbot && python3 -m http.server 9000 --bind 0.0.0.0`, visit `http://<host>:9000/index.html` | Two ports, two processes, exact mimic of a third-party site embedding the chatbot. The page derives `http://<host>:8095` for MCAi from `window.location.hostname`; the browser does a CORS preflight that MCAi accepts because of `allow_origins=["*"]`. |
+| **Different host entirely** — your marketing site fetches the widget | Replace `MCAI_BASE_URL` constant with an explicit URL: `"https://chat.example.com"` | MCAi must be network-reachable from every visitor's browser. Usually means putting MCAi behind a reverse proxy with TLS + auth. |
+| **Public-internet** — chatbot served, MCAi reachable | **Don't, without auth in front.** MCAi has zero auth by default. | Anyone reaching `/api/*` can read, modify, or delete your bots. Always front MCAi with nginx + bearer-token auth (or OAuth proxy) before exposing publicly. |
+
+### MCAi-URL auto-detection — how the HTML decides where to call
+
+```js
+const MCAI_BASE_URL =
+  window.location.protocol === "file:"
+    ? "http://localhost:8095"
+    : `${window.location.protocol}//${window.location.hostname}:8095`;
+```
+
+| Page loaded from… | `window.location.hostname` | Result |
+|---|---|---|
+| `file:///path/to/index.html` | `""` (empty) | `http://localhost:8095` (the explicit fallback) |
+| `http://localhost:8095/static/web_chatbot/index.html` | `localhost` | `http://localhost:8095` |
+| `http://192.168.0.110:8095/static/...` | `192.168.0.110` | `http://192.168.0.110:8095` |
+| `http://192.168.0.110:9000/index.html` (separate static server) | `192.168.0.110` | `http://192.168.0.110:8095` — same host, MCAi's port |
+| `https://my-site.com/chat/` | `my-site.com` | `https://my-site.com:8095` — likely **wrong**; hardcode `MCAI_BASE_URL` for production |
+
+The default is right for "host both pieces on the same LAN box, possibly on different ports." For any other topology, edit the constant directly.
+
+### Scroll behavior during fence suppression
+
+A subtle UX bug to keep an eye on if you fork this widget: while the bot streams a suppressed fenced block, `addBubble`-then-grow doesn't add visible content, but new DOM elements (like the "Extracting information…" indicator) *do* land below the bubble. If you naively call `bubble.scrollIntoView({block:"end"})` on every chunk, those still-arriving chunks scroll the viewport back UP to the bubble — burying the indicator off-screen.
+
+The widget uses a single `scrollToBottom()` primitive that pins to `messages.scrollHeight` on every DOM-changing event, instead of scrolling individual elements into view. Whatever's at the bottom of the container — bubble, indicator, or extracted-card — stays visible.
+
+### Per-session memory model
+
+Conversation history is owned entirely by the client (a `const history = []` array in the JS module) and shipped on every chat request as the `messages: [...]` field:
+
+```js
+body: JSON.stringify({ messages: history })
+```
+
+The widget deliberately does **not** use `include_history: true` (which would replay the bot's persisted messages from the SQLite row) or `persist: true` (which would write back). Consequences:
+
+- **Page refresh = brand-new visitor.** JS state resets; the bot has no idea who came before. Perfect for kiosk-style retesting.
+- **The bot's saved DB row stays pristine.** Only its config (system prompt, model, sampling params) is read; the `messages` column is never touched.
+- **Multiple browser tabs share nothing.** Each tab has its own JS `history`. Two visitors testing simultaneously can't interfere with each other.
+
+If you want cross-session persistence (e.g. a logged-in user resuming yesterday's chat), build a server-side conversation-per-user mapping and pass the right `messages: [...]` from your backend; don't lean on MCAi's `persist: true` mechanism unless you want the dashboard's view of the bot polluted with end-user transcripts.
+
+### Markdown rendering in bot bubbles
+
+Bot replies typically contain `**bold**`, numbered lists, and inline `` `code` ``. The widget includes a ~25-line `renderMarkdown(text)` function with deliberately minimal grammar — just the patterns the recipes actually emit:
+
+| Grammar | Output element |
+|---|---|
+| `**…**` | `<strong>` |
+| `*…*` (not inside word boundary) | `<em>` |
+| `` `…` `` | `<code>` |
+| Lines starting `N. ` | `<ol><li>` |
+| Lines starting `- ` or `* ` | `<ul><li>` |
+| Everything else | text node |
+
+**Security model.** Every character is HTML-escaped first (`&`/`<`/`>` → `&amp;`/`&lt;`/`&gt;`) *before* any markdown pattern matches the escaped text. The function's output can only contain the six element types above — no `<script>`, no event handlers, no `<iframe>`. LLM output is treated as untrusted; the escape-then-transform order guarantees nothing the model can emit (intentionally or by manipulation) reaches the DOM as executable HTML.
+
+**Streaming-friendliness.** `FenceSuppressor` accumulates visible text in `this.visible` (a string) and re-renders the entire bubble via `target.innerHTML = renderMarkdown(this.visible)` on every chunk. Incomplete patterns at the buffer tail (e.g. `**fo` waiting for `o**`) render as literal characters until the closing marker arrives, then snap into the formatted element on the next chunk — no flicker, no partial DOM updates, no separate "streaming-aware" parser needed. Re-parsing is cheap (linear in bubble length, typically <2 KB).
+
+**User bubbles stay plain.** `addBubble("user", text)` uses `textContent`, not `innerHTML`. If a user types `**hi**` they see literal asterisks — preventing surprise formatting on visitor input.
+
+**When to swap for a real parser.** This renderer is intentionally limited to what the recipes use. If you need headers, tables, links, fenced code blocks (the action JSON is *suppressed*, not displayed), or any other CommonMark feature, drop in [marked](https://marked.js.org/) for parsing and [DOMPurify](https://github.com/cure53/DOMPurify) for sanitization — both single-file CDN drops. Replace `renderMarkdown(s)` with `DOMPurify.sanitize(marked.parse(s))`. Trade-off: ~30 KB of vendor JS added; harder to audit than the ~25 lines in the widget today.
+
+### Out of scope
+
+- **Authentication.** Neither example includes auth headers. MCAi is local-first; if you front it with a reverse proxy that requires a bearer token, add an `Authorization` header to both clients (~1 line each).
+- **Multi-turn persistence beyond the script's lifetime.** Both clients keep history in-memory only. Reload the page (or rerun the script) and you start with a fresh `history`. To carry context across sessions, set `persist: true` in the Python call (and use `/api/conversations/{id}/chat` rather than the OpenAI-compat endpoint) or maintain history client-side and resend it on every request.
+- **Production hardening.** No retry-on-network-failure, no abort-controller for streaming, no rate-limiting. Add these in your production fork — the templates are deliberately readable above optimized.
 
 ---
 
