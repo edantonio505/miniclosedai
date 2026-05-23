@@ -477,7 +477,7 @@ Click the **terminal icon** in the activity bar (between Dashboard and Settings)
 
 ## Connecting LM Studio and other OpenAI-compatible endpoints
 
-MiniClosedAI ships with **Ollama as a built-in endpoint** and lets you register any number of additional **OpenAI-compatible** servers alongside it: [LM Studio](https://lmstudio.ai), [vLLM](https://docs.vllm.ai), `llama.cpp`'s `server` binary, [Text Generation WebUI](https://github.com/oobabooga/text-generation-webui)'s OpenAI extension, or the real OpenAI API itself if you want.
+MiniClosedAI ships with **Ollama as a built-in endpoint** and lets you register any number of additional servers alongside it: **OpenAI-compatible** ones like [LM Studio](https://lmstudio.ai), [vLLM](https://docs.vllm.ai), `llama.cpp`'s `server` binary, [Text Generation WebUI](https://github.com/oobabooga/text-generation-webui)'s OpenAI extension, or the real OpenAI API itself, **plus Ollama-compatible cloud services** such as [Interdata Lab](https://interdataresearch.ai) that expose a remote Ollama at a public URL.
 
 Each saved conversation picks one endpoint + one model; the Dashboard's model dropdown groups everything into a single OpenWebUI-style `<optgroup>` picker so you can chat with a Qwen3.6 on LM Studio and a Llama3.2 on Ollama in separate tabs without swapping anything.
 
@@ -562,6 +562,38 @@ The per-conv microservice pattern applies unchanged: `POST /api/conversations/{i
 - **Server-side sampling defaults** (set in `start_llama_server.sh`): `temp=0.5`, `top-p=0.85`, `top-k=20`, `min-p=0`. MiniClosedAI's per-conversation sliders override these on every request, so tune per-chat as usual.
 - **Pitfall — wrong port = feedback loop.** If you accidentally set Bonsai's Base URL to `http://localhost:8095/v1` (MiniClosedAI's own port), the endpoint's `/v1/models` call loops back and returns *MiniClosedAI's saved conversations as "models"*. The model dropdown will show conversation IDs (e.g. `"30"`) under the Bonsai optgroup; picking one sends the chat through that conversation's bot instead of Bonsai, producing nonsensically on-topic responses (the Lead Qualifier's JSON, etc.). Fix: edit the endpoint, change the port to **`8080`**.
 - **Stop the server** when you're done: `kill $(lsof -ti TCP:8080)` (or `Ctrl+C` in the terminal you started it in).
+
+### Adding Interdata Lab (cloud GPU) — step by step
+
+For when you want to keep MiniClosedAI's UI on your laptop but offload inference to a GPU server. [Interdata Lab](https://interdataresearch.ai) is one such Ollama-compatible cloud service; the same procedure works for any remote Ollama deployment that issues API keys.
+
+<p align="center">
+  <a href="https://youtu.be/mFnFpPlbgSE">
+    <img src="https://img.youtube.com/vi/mFnFpPlbgSE/hqdefault.jpg"
+         alt="Video walkthrough — connecting MiniClosedAI to Interdata Lab"
+         width="640">
+  </a>
+  <br><em>Sped-up walkthrough — click to watch on YouTube.</em>
+</p>
+
+1. **In your Interdata Lab account**, open **API Keys**.
+2. Click **+ New key**, give it a label (e.g. `MiniClosedAI laptop`), then **Generate**.
+3. Copy both the **base URL** (`https://app.interdataresearch.ai`) and the **API key** you just generated.
+4. In MiniClosedAI, click the **⚙️ gear icon** (Settings) → **+ Add endpoint**.
+5. Fill in:
+   - **Name**: anything readable (e.g. `Interdata Lab`)
+   - **Kind**: `Ollama` *(important — Interdata speaks the native `/api/chat` protocol, not OpenAI-compatible `/v1/chat/completions`)*
+   - **Base URL**: `https://app.interdataresearch.ai`
+   - **API Key**: paste the key from step 3
+6. Click **Test connection** — you should see *"Reachable · N model(s)"* with the count of models the service serves.
+
+After registration, a few things happen automatically:
+
+- **Models appear in the Dashboard dropdown** under their own `<optgroup>` so you can pin any saved bot to them with one click.
+- **The model-download form is suppressed** for this endpoint. Cloud services don't let you `ollama pull` against them, so MiniClosedAI hides the UI that would 403 on every keystroke (the denylist lives at `static/app.js:_OLLAMA_PULL_DENY_HOST_FRAGMENTS` — append a substring there for additional relays).
+- **Auto-route**: a conversation whose model name matches one the cloud service advertises automatically routes there even if the conversation was originally pinned to a different backend. You see the actual routing in the Logs page's `backend_name` field. Override with `MINICLOSEDAI_DISABLE_RELAY_AUTO_ROUTE=1` if you ever need strict per-bot pinning.
+
+**Free during alpha.** Interdata Lab is in design-partner mode while we shape it — no billing, no rate caps. See [interdataresearch.ai](https://interdataresearch.ai) if you'd like compute for development work in exchange for feedback.
 
 ### Using it
 

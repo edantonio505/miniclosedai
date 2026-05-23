@@ -842,6 +842,8 @@ Edit `VISION_MODEL_PATTERNS` in `static/app.js` to extend it. The check is purel
 
 Both backend kinds now thread `api_key` (sent as `Authorization: Bearer …`) and any custom `headers` dict through every HTTP call, including `/api/tags`, `/api/chat`, and `/api/pull`. This lets you register a public-IP Ollama (e.g. an authenticating relay sitting in front of `localhost:11434`) as `kind=ollama` and still hit the native `/api/chat` endpoint — which is the only one that honors `"think": false` properly for Qwen3-family models.
 
+The canonical real-world example of this pattern is [Interdata Lab](https://interdataresearch.ai), which runs Ollama deployments on cloud GPUs and exposes them at `https://app.interdataresearch.ai` with per-account API keys. Same wire format as a localhost Ollama, just a Bearer token added to every request via `_ollama_headers()`. See [Worked example — connecting Interdata Lab](#worked-example--connecting-interdata-lab-cloud-gpu) below for the registration walkthrough; the auto-route override and pull denylist (next subsection) both special-case `app.interdataresearch*` because of this integration.
+
 ### Model pulls and the relay denylist
 
 ```
@@ -859,6 +861,41 @@ const _OLLAMA_PULL_DENY_HOST_FRAGMENTS = ["app.interdataresearch"];
 ```
 
 Default policy: **allow pull on every Ollama endpoint the user has registered**. Adding the endpoint implies the user administers it (or has permission to write models to it). Append fragments to the array if you discover another known relay where pulls fail. The HTTP endpoint itself doesn't enforce this — it's purely a UI affordance; CLI / programmatic callers can still try the pull, and they'll get the relay's actual error response back.
+
+### Worked example — connecting Interdata Lab (cloud GPU)
+
+[Interdata Lab](https://interdataresearch.ai) is a cloud Ollama deployment with API-key auth, hosted at `app.interdataresearch.ai`. It's the canonical "remote `kind=ollama` backend with bearer auth" that the previous two subsections describe, and the example most users will encounter — the auto-route override (`_maybe_override_to_relay` in [`app.py`](./app.py)) and the pull denylist ([`static/app.js`](./static/app.js)) both single it out by hostname fragment.
+
+#### What you're plugging into
+
+| Field | Value | Why |
+|---|---|---|
+| **Kind** | `ollama` | Service speaks the native Ollama `/api/chat` JSONL stream, not OpenAI-compatible `/v1/chat/completions`. Same dispatcher (`_impl(backend)["chat_stream"]` in `llm.py`) as a localhost Ollama. |
+| **Base URL** | `https://app.interdataresearch.ai` | Substring match on `app.interdataresearch` triggers both the auto-route override and the pull denylist (both TLD-agnostic). |
+| **API key** | per-account, from the service's "API Keys" page | Sent as `Authorization: Bearer <key>` by `_ollama_headers(backend)`. Stored in the `backends.api_key` SQLite column, scrubbed from `GET /api/backends` responses. |
+| **Headers** | `{}` (default) | Add custom ones via the Settings modal if your deployment needs them — threaded through the same way as the Bearer header. |
+
+No new code path. The same six chat call sites (`llm.chat`, `llm.chat_stream`) that talk to a local Ollama talk to Interdata Lab with no branching.
+
+#### Setup procedure
+
+The user-facing 5-step walkthrough lives in [README — Adding Interdata Lab](./README.md#adding-interdata-lab-cloud-gpu--step-by-step) (with video). From an architectural angle the procedure boils down to: create an API key in the service's dashboard, paste it plus the base URL into MCAi's Settings → + Add endpoint modal, kind=ollama, Test connection. The Test button's call path is `POST /api/backends/test` → `llm.is_running(backend)` → `GET <base_url>/api/tags` with the bearer header. A 200 with a non-empty `models` array means everything's working.
+
+#### Integration with the relay auto-route
+
+Once Interdata Lab is registered and enabled, `_maybe_override_to_relay()` (in `app.py`, called by every chat endpoint after backend resolution) does the following on each chat call:
+
+1. Look up the conversation's pinned backend the usual way.
+2. If a registered backend's `base_url` matches `_RELAY_HOST_FRAGMENTS = ("app.interdataresearch",)` and that backend's `list_models` includes the conversation's model name, override the resolved backend to the relay.
+3. Cache the relay's model list for `_RELAY_MODEL_CACHE_TTL_S = 60` so the probe doesn't fire on every chat call.
+
+Operational effect: a conversation pinned to local Ollama whose model name (e.g. `qwen3.6:35b`, `gemma4:31b`) also exists on Interdata Lab will route through Interdata Lab automatically — without editing the conversation's `backend_id`. The MCAi Logs page reports the actual backend used (`backend_name: interdatalab`); the relay's own request log (if it keeps one) sees the same call.
+
+To disable the override per-process, set `MINICLOSEDAI_DISABLE_RELAY_AUTO_ROUTE=1` in the environment and restart. The override falls back to the conversation's pinned backend whenever the relay is unreachable, so a brief relay outage doesn't break local chats — it transparently silos them locally for the duration.
+
+#### Free during alpha
+
+Interdata Lab is in design-partner mode at the time of writing — free for early users in exchange for feedback. See [interdataresearch.ai](https://interdataresearch.ai). If you'd rather run your own cloud Ollama, the same procedure works — only the host fragment in `_RELAY_HOST_FRAGMENTS` needs to change (or you can leave the override off and just chat against your remote endpoint like any other backend).
 
 ### Dependencies
 
