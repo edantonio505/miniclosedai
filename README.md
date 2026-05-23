@@ -15,6 +15,8 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 
 > The defining idea: **each saved conversation is an addressable microservice.** You craft a system prompt + sampling params once in the UI, and that chat becomes a stable URL you can call from anything that speaks HTTP — including any OpenAI SDK.
 
+<sub>*If MiniClosedAI saves you a SaaS bill or just makes a fun afternoon, a quick ⭐ on [GitHub](https://github.com/edantonio505/miniclosedai) helps others find it. No pressure — but it's the whole ask.*</sub>
+
 ---
 
 ## Table of contents
