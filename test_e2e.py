@@ -851,15 +851,33 @@ def _():
     assert 'class="page page-bots"' in body
     assert 'class="page page-settings"' in body
     assert 'id="breadcrumb-back"' in body
+    # API Code modal grew a "Bot #N" copy pill in the header.
+    assert 'id="copy-bot-id"' in body
+    assert 'id="modal-bot-id"' in body
+    # Bots page has its own filter input + list container.
+    assert 'id="bots-filter"' in body
+    assert 'id="bots-list"' in body
 
 
 @test("static: app.js is served and contains recent helpers")
 def _():
     r = client.get("/static/app.js")
     assert r.status_code == 200
-    for needle in ("initActivityBar", "loadBackends", "prettifyJSONInMarkdown",
-                   "_selectModelOption", "flushPendingSave",
-                   "openInlineEditor", "_appendEditButton"):
+    needles = [
+        # Pre-existing helpers
+        "initActivityBar", "loadBackends", "prettifyJSONInMarkdown",
+        "_selectModelOption", "flushPendingSave",
+        "openInlineEditor", "_appendEditButton",
+        # Bots-page + nav drill-in
+        "renderBotsPage", "renderBreadcrumb", "applyActivePage",
+        "_BOTS_AREA", "onBotsPageEntered", "initBotsUI",
+        # Unread / streaming indicator state machine
+        "_streaming", "_unread",
+        "_refreshUnreadUI", "_onStreamStart", "_onStreamEnd", "_markConvViewed",
+        # Row actions on bot cards + scoped API code modal
+        "deleteConvById", "openApiCodeForConv", "_modalConvId",
+    ]
+    for needle in needles:
         assert needle in r.text, f"missing {needle} in served app.js"
 
 

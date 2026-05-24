@@ -374,10 +374,11 @@ Your selection persists across reloads. Streaming chats keep playing when you fl
 
 ### Bots page (home)
 
-Single full-page surface listing every saved conversation, newest first. Each card shows title · model · backend · relative last-updated time. The toolbar has a live filter that matches across all four fields (substring, case-insensitive). The **+ New bot** button at the top-right prompts for a name, creates the conversation, and drills straight into chat.
+Single full-page surface listing every saved conversation, newest first. Each card shows title · model · backend · relative last-updated time. The toolbar (search input + bot count) **stays pinned to the top via `position: sticky`** while the cards scroll under it — you can filter without losing your place. The **+ New bot** button at the top-right prompts for a name, creates the conversation, and drills straight into chat.
 
 - **Click a card** → spatial slide-in animation, you land in that chat with full history.
 - **Card with a pulse dot** → that bot has a streaming reply in progress OR a completed reply you haven't viewed yet. Clicking the card clears the dot.
+- **Hover a card → row actions appear** on the right: **`</>` API code** (opens the snippet modal scoped to that bot without disturbing your current open chat) and **🗑 Delete** (confirms with the bot's actual title, drops the id from the unread/streaming sets so a stale dot doesn't linger, and falls back to the Bots empty state if it was the last bot). Both buttons stop event propagation so clicking them doesn't also open the chat. A gradient mask fades the title/meta text underneath into the card background so the buttons feel like an intentional overlay, not a crash-on-top.
 - **Quick-switch shortcut**: `⌘K` / `Ctrl+K` from anywhere, or `/` when you're not in a text field, jumps to the Bots page and focuses the filter.
 
 ### Chat view — topbar
@@ -463,6 +464,10 @@ Three independent toggles produce **12 snippet variants**:
 - **Mode**: Streaming · Non-streaming
 - **Style**: Native · OpenAI-compat
 
+A clickable **"Bot #N" pill** sits in the modal header next to the title. One click copies just the raw conversation id (e.g. `42`) to the clipboard — useful when your microservice config only needs the id, not the full URL or code. The pill briefly flashes "Copied!" in accent color, then fades back. Disabled (greyed) when no conversation has been created yet.
+
+The modal can be opened from two places: the chat topbar's `</>` icon (scopes to the currently-open bot), OR a bot card's row `</>` action on the Bots list (scopes to that specific bot without changing your current open chat). The pill always reflects whichever conversation the modal is currently scoped to.
+
 Copy button works on both HTTPS/localhost (via `navigator.clipboard`) and plain-HTTP LAN (falls back to `document.execCommand("copy")`).
 
 <p align="center">
@@ -474,7 +479,7 @@ Copy button works on both HTTPS/localhost (via `navigator.clipboard`) and plain-
 
 ### Logs page
 
-Click the **terminal icon** in the activity bar (between Dashboard and Settings) to open the LLM-activity viewer — same intent as LM Studio's "Server logs" panel. Every chat call across every endpoint shows up here:
+Click the **terminal icon** in the activity bar (between Bots and Settings) to open the LLM-activity viewer — same intent as LM Studio's "Server logs" panel. Every chat call across every endpoint shows up here:
 
 - `POST /api/chat` (legacy)
 - `POST /api/chat/stream` (legacy SSE)
@@ -484,7 +489,7 @@ Click the **terminal icon** in the activity bar (between Dashboard and Settings)
 
 **One row per call.** The collapsed view shows: status pill (sync / stream / error), endpoint path, model name, latency, timestamp. Click a row to expand and see the backend used, sampling params, the last three message previews, the response body (first 2 KB), the thinking trace if any, and the error message if it failed. Multimodal turns show attachment filenames; image bytes are never inlined into log entries.
 
-**Controls.** A filter input does in-memory substring matching across endpoint, model, backend name, and message content. A **Pause** toggle freezes the polling without losing what's already in the buffer. **Clear** wipes both client and server state. Polling auto-suspends when you navigate away from the page — only the visible Logs tab burns the 2-second tick.
+**Controls.** A filter input does in-memory substring matching across endpoint, model, backend name, and message content. The toolbar (filter + entry count) **stays pinned to the top via `position: sticky`** while the rows scroll under it — same behavior as the Bots page. A **Pause** toggle freezes the polling without losing what's already in the buffer. **Clear** wipes both client and server state. Polling auto-suspends when you navigate away from the page — only the visible Logs tab burns the 2-second tick.
 
 **Buffer semantics.** The server keeps the **most recent 500 entries** in memory. Reset on server restart by design — this is a debugging surface for "what just happened?", not an audit log. Long responses are truncated to 2 KB with a `truncated: true` flag and an accurate `char_count` so you can tell the response was longer than what's shown. Thinking traces are capped at 1 KB.
 

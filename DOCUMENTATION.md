@@ -351,7 +351,8 @@ See [Security](#security) and the README's [LAN access](./README.md#lan-access) 
 
 The UI is a **list/detail** pattern, not flat tabs. The activity bar has three icons — **Bots** (home, message-square), **Logs** (terminal), **Settings** (gear). The "Dashboard" page still exists internally (it's the chat surface) but has no nav button; you reach it by drilling into a bot from the list.
 
-- **Bots page** — searchable cards; click to enter that chat. Slide-in animation. `⌘K` / `Ctrl+K` from anywhere (or `/` outside a text field) jumps here and focuses the filter.
+- **Bots page** — searchable cards; click to enter that chat. Slide-in animation. The toolbar (filter input + bot count) is `position: sticky; top: 0; z-index: 10` with `background: var(--bg)` so it pins to the top of the scrolling `.page-bots` container while cards scroll underneath. `⌘K` / `Ctrl+K` from anywhere (or `/` outside a text field) jumps here and focuses the filter.
+- **Bot card row actions** — appear on `:hover` / `:focus-within` only. Two icon buttons live in `.bot-card-actions` (an absolutely-positioned strip on the right edge with a gradient mask fade): `</>` API code and 🗑 Delete. Both call `e.stopPropagation()` so clicking them doesn't fire the card's open-bot handler. The card itself gets `z-index: 5` on hover so the actions and their tooltips can paint over the next card's border (`.bot-card-actions` uses `transform`, which creates a local stacking context, so the tooltip's `z-index: 9999` only competes within that subtree). Delete is wired to `deleteConvById(id, { title })`, which prunes the id from `_streaming` / `_unread` so stale dots don't linger, then falls back to opening the next-most-recent bot (or the Bots empty state if none remain). API code is wired to `openApiCodeForConv(id)` (see below) which scopes the modal to that id without disturbing `state.conversationId`.
 - **Topbar `<` back button** — leftmost element of the chat topbar; returns to the Bots list with a reverse slide. `Esc` is the keyboard equivalent (skipped when a modal is open).
 - **Pulse dot** on the Bots icon AND on individual bot cards — driven by two sets:
   - `_streaming` — convs whose chat stream is currently in flight.
@@ -369,7 +370,7 @@ The UI is a **list/detail** pattern, not flat tabs. The activity bar has three i
 - **🧹 Clear** — wipes messages in the current conversation (keeps config).
 - **Download** (tray) — popover with 5 export formats (CSV / multimodal ZIP / classification ZIP / bot-config JSON / bot-config-with-history JSON).
 - **🗑 Delete** — deletes the current conversation. If it was the last bot, the UI auto-returns to the Bots list.
-- **`</>` API Code** (icon-only) — opens the snippet modal with cURL / Python / JavaScript variants.
+- **`</>` API Code** (icon-only) — opens the snippet modal with cURL / Python / JavaScript variants. The modal header carries a **`Bot #N` copy pill** that copies just the raw conversation id (helpful when your microservice config only needs the id, not the full URL or snippet). The pill flashes "Copied!" in accent color for 1.2s on success. When the modal is opened from a bot card's row `</>` action via `openApiCodeForConv(id)`, the module-level `_modalConvId` overrides `state.conversationId` for snippet rendering and the pill — without mutating `state`. `closeModal()` clears `_modalConvId` so the next topbar open reverts to live conversation state.
 
 ### Sidebar
 
@@ -404,7 +405,7 @@ The sidebar's scrollbar is hidden across all browsers; scrolling still works via
 
 ### Logs page
 
-Vertical-nav button (terminal icon, between Bots and Settings in the activity bar) opens the LLM activity viewer. Implementation detail in [Activity logs](#activity-logs) below; from a user's perspective it's a per-call row showing status / endpoint / model / latency / timestamp, click-to-expand for params + messages + response. Polling auto-pauses when the page isn't visible.
+Vertical-nav button (terminal icon, between Bots and Settings in the activity bar) opens the LLM activity viewer. Implementation detail in [Activity logs](#activity-logs) below; from a user's perspective it's a per-call row showing status / endpoint / model / latency / timestamp, click-to-expand for params + messages + response. The toolbar (filter input + entry count) is `position: sticky` at top of the scrolling container — same treatment as the Bots page — so the filter stays visible while rows scroll under it. Polling auto-pauses when the page isn't visible.
 
 ---
 
