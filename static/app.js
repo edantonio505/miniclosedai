@@ -2,7 +2,15 @@
 
 const els = {
   modelSelect: document.getElementById("model-select"),
-  convSelect: document.getElementById("conversation-select"),
+  // The conversation dropdown was replaced by the Bots tab + a topbar
+  // breadcrumb ("← Bots / <Bot name>"). See `renderBreadcrumb()`.
+  breadcrumbBack: document.getElementById("breadcrumb-back"),
+  breadcrumbCurrent: document.getElementById("breadcrumb-current"),
+  botsList: document.getElementById("bots-list"),
+  botsFilter: document.getElementById("bots-filter"),
+  botsCount: document.getElementById("bots-count"),
+  botsEmpty: document.getElementById("bots-empty"),
+  botsNewBtn: document.getElementById("bots-new-btn"),
   newChatBtn: document.getElementById("new-chat-btn"),
   clearChatBtn: document.getElementById("clear-chat-btn"),
   downloadCsvBtn: document.getElementById("download-csv-btn"),
@@ -315,6 +323,12 @@ async function loadModels() {
   els.modelSelect.innerHTML = "";
 
   const backends = data.backends || [];
+
+  // The Bots page renders human-readable backend names (e.g. "Ollama (built-in)")
+  // instead of raw backend_ids. Refresh the lookup here on every model reload
+  // so newly-added endpoints are reflected next time the bots page renders.
+  _botsState.backendNames = new Map(backends.map(b => [b.id, b.name]));
+
   let totalModels = 0;
   let reachableCount = 0;
 
@@ -410,18 +424,305 @@ function setStatus(kind, text) {
   els.statusLine.textContent = text;
 }
 
+// ─── Bots page ───────────────────────────────────────────────
+// Replaces the legacy topbar `<select id="conversation-select">` with a
+// dedicated activity-bar tab that lists all saved bots with live search.
+const _botsState = {
+  cache: [],               // last list returned by /api/conversations (newest first)
+  filter: "",              // current search input value
+  backendNames: new Map(), // backend_id → display name, populated by loadModels()
+};
+
+// "2 hours ago", "yesterday", "just now" — matches the relative-time style
+// elsewhere in the UI. Falls back to the raw ISO if anything looks off.
+function _formatRelative(iso) {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return iso;
+  const diffSec = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (diffSec < 45) return "just now";
+  if (diffSec < 90) return "1 minute ago";
+  const diffMin = Math.round(diffSec / 60);
+  if (diffMin < 45) return `${diffMin} minutes ago`;
+  if (diffMin < 90) return "1 hour ago";
+  const diffHr = Math.round(diffMin / 60);
+  if (diffHr < 24) return `${diffHr} hours ago`;
+  if (diffHr < 48) return "yesterday";
+  const diffDay = Math.round(diffHr / 24);
+  if (diffDay < 30) return `${diffDay} days ago`;
+  const diffMo = Math.round(diffDay / 30);
+  if (diffMo < 12) return `${diffMo} months ago`;
+  return `${Math.round(diffMo / 12)} years ago`;
+}
+
+function _backendNameOf(id) {
+  if (id == null) return "(no backend)";
+  return _botsState.backendNames.get(id) || `(unknown #${id})`;
+}
+
+function _botMatchesFilter(c, q) {
+  if (!q) return true;
+  const hay = `${c.title || ""} ${c.model || ""} ${_backendNameOf(c.backend_id)}`.toLowerCase();
+  return hay.includes(q);
+}
+
+function renderBotsPage() {
+  if (!els.botsList) return; // page not in DOM yet
+  const q = _botsState.filter.trim().toLowerCase();
+  const all = _botsState.cache || [];
+  const filtered = all.filter(c => _botMatchesFilter(c, q));
+
+  els.botsList.innerHTML = "";
+  for (const c of filtered) {
+    const card = document.createElement("div");
+    card.className = "bot-card";
+    if (c.id === state.conversationId) card.classList.add("active");
+    if (_streaming.has(c.id) || _unread.has(c.id)) card.classList.add("has-pending");
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+
+    const title = document.createElement("div");
+    title.className = "bot-card-title";
+    title.textContent = c.title || "(untitled)";
+
+    const meta = document.createElement("div");
+    meta.className = "bot-card-meta";
+    const parts = [
+      c.model || "(no model)",
+      _backendNameOf(c.backend_id),
+      _formatRelative(c.updated_at),
+    ];
+    parts.forEach((p, i) => {
+      if (i > 0) {
+        const sep = document.createElement("span");
+        sep.className = "sep";
+        sep.textContent = "·";
+        meta.appendChild(sep);
+      }
+      const span = document.createElement("span");
+      span.textContent = p;
+      meta.appendChild(span);
+    });
+
+    card.appendChild(title);
+    card.appendChild(meta);
+
+    // Row actions — hidden until hover/focus. Each button stops propagation so
+    // clicking it doesn't also fire the card's "open this bot" handler.
+    const actions = document.createElement("div");
+    actions.className = "bot-card-actions";
+
+    const codeBtn = document.createElement("button");
+    codeBtn.type = "button";
+    codeBtn.className = "bot-card-action";
+    codeBtn.setAttribute("aria-label", `API code for ${c.title}`);
+    codeBtn.dataset.tooltip = "API code";
+    codeBtn.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>';
+    codeBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      openApiCodeForConv(c.id);
+    });
+
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "bot-card-action danger";
+    delBtn.setAttribute("aria-label", `Delete ${c.title}`);
+    delBtn.dataset.tooltip = "Delete bot";
+    delBtn.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>';
+    delBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      deleteConvById(c.id, { title: c.title });
+    });
+
+    actions.appendChild(codeBtn);
+    actions.appendChild(delBtn);
+    card.appendChild(actions);
+
+    const open = () => {
+      applyActivePage("dashboard");
+      openConversation(c.id);
+    };
+    card.addEventListener("click", open);
+    card.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        open();
+      }
+    });
+
+    els.botsList.appendChild(card);
+  }
+
+  if (els.botsCount) {
+    const total = all.length;
+    const shown = filtered.length;
+    els.botsCount.textContent = q
+      ? `${shown} of ${total} bot${total === 1 ? "" : "s"}`
+      : `${total} bot${total === 1 ? "" : "s"}`;
+  }
+  if (els.botsEmpty) {
+    if (!all.length) {
+      els.botsEmpty.textContent = "No bots yet. Click + New bot to create one.";
+      els.botsEmpty.hidden = false;
+    } else if (!filtered.length) {
+      els.botsEmpty.textContent = "No bots match your filter.";
+      els.botsEmpty.hidden = false;
+    } else {
+      els.botsEmpty.hidden = true;
+    }
+  }
+}
+
+// Drives the topbar breadcrumb ("← Bots / <name>"). The nav-icon pulse dot
+// is NOT driven from here anymore — see _refreshUnreadUI below, which lights
+// the dot only when a conv has unread/streaming activity the user hasn't seen.
+function renderBreadcrumb() {
+  const c = _botsState.cache.find(x => x.id === state.conversationId);
+  if (els.breadcrumbCurrent) {
+    if (c) {
+      els.breadcrumbCurrent.textContent = c.title;
+      els.breadcrumbCurrent.classList.remove("is-empty");
+    } else {
+      els.breadcrumbCurrent.textContent = "(no bot selected)";
+      els.breadcrumbCurrent.classList.add("is-empty");
+    }
+  }
+}
+
+// ─── Unread / streaming indicator ───────────────────────────────────────
+// Two sets drive the pulse dots:
+//   _streaming — convs whose chat stream is currently in flight
+//   _unread    — convs whose stream finished while the user wasn't watching
+// The nav-icon dot lights when EITHER set has an entry the user isn't currently
+// viewing. Bot cards get an inline dot when their id is in either set.
+//
+// "Currently viewing" = body[data-page="dashboard"] AND state.conversationId
+// matches. Marking a conv as viewed clears it from _unread immediately.
+const _streaming = new Set();
+const _unread = new Set();
+
+function _refreshUnreadUI() {
+  const viewing = (document.body.dataset.page === "dashboard") ? state.conversationId : null;
+  let hasAny = false;
+  for (const id of _streaming) { if (id !== viewing) { hasAny = true; break; } }
+  if (!hasAny) {
+    for (const id of _unread) { if (id !== viewing) { hasAny = true; break; } }
+  }
+  document.body.dataset.hasActiveBot = hasAny ? "1" : "0";
+  // Re-render the list so per-card dots stay in sync. Cheap — tens of items.
+  renderBotsPage();
+}
+
+function _onStreamStart(convId) {
+  if (convId == null) return;
+  _unread.delete(convId);     // any prior pending state is superseded
+  _streaming.add(convId);
+  _refreshUnreadUI();
+}
+
+function _onStreamEnd(convId) {
+  if (convId == null) return;
+  _streaming.delete(convId);
+  // If the user wasn't watching this conv when it finished, leave a breadcrumb
+  // in _unread. If they WERE watching, no dot — they saw the reply land.
+  const viewing = document.body.dataset.page === "dashboard" && state.conversationId === convId;
+  if (!viewing) _unread.add(convId);
+  _refreshUnreadUI();
+}
+
+function _markConvViewed(convId) {
+  if (convId == null) return;
+  if (_unread.delete(convId)) _refreshUnreadUI();
+}
+
+// Back-compat alias — older call sites still use the old name.
+function renderTopbarBotLabel() { renderBreadcrumb(); }
+
+function onBotsPageEntered() {
+  // Re-render on entry so a bot freshly created via the dashboard's +New Chat
+  // shows up the moment the user flips to the Bots tab.
+  renderBotsPage();
+  // Refocus the search box so ⌘K / `/` lands you immediately in filter mode.
+  if (els.botsFilter && document.activeElement !== els.botsFilter) {
+    // Defer so the slide animation isn't fighting an input focus scroll.
+    setTimeout(() => els.botsFilter.focus({ preventScroll: true }), 60);
+  }
+}
+
+function initBotsUI() {
+  if (els.botsFilter) {
+    els.botsFilter.addEventListener("input", () => {
+      _botsState.filter = els.botsFilter.value;
+      renderBotsPage();
+    });
+  }
+  if (els.botsNewBtn) {
+    els.botsNewBtn.addEventListener("click", async () => {
+      await newConversation();
+      applyActivePage("dashboard");
+    });
+  }
+  if (els.breadcrumbBack) {
+    els.breadcrumbBack.addEventListener("click", () => applyActivePage("bots"));
+  }
+  // Global keyboard affordances — Esc exits chat, ⌘K / `/` opens the quick switcher.
+  document.addEventListener("keydown", _botsHotkeyHandler);
+}
+
+// Esc: if you're in chat, fall back to the bots list. Skip when a modal is open
+// (modals own Esc), when you're typing in a textarea/input, or when the chat
+// composer is mid-stream (Stop button handles that case).
+function _botsHotkeyHandler(e) {
+  if (e.defaultPrevented) return;
+  const tgt = e.target;
+  const inField = tgt && (
+    tgt.tagName === "INPUT" ||
+    tgt.tagName === "TEXTAREA" ||
+    tgt.isContentEditable
+  );
+  if (e.key === "Escape") {
+    // Modals own Esc. Skip if any modal backdrop is currently visible.
+    const modalOpen = document.querySelector(".modal-backdrop:not(.hidden)");
+    if (modalOpen) return;
+    if (document.body.dataset.page === "dashboard") {
+      e.preventDefault();
+      applyActivePage("bots");
+    }
+    return;
+  }
+  // ⌘K / Ctrl+K — focus the bots quick switcher from anywhere.
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    applyActivePage("bots");
+    if (els.botsFilter) {
+      els.botsFilter.focus();
+      els.botsFilter.select();
+    }
+    return;
+  }
+  // `/` — same as ⌘K but only when you're not already typing somewhere.
+  if (e.key === "/" && !inField) {
+    e.preventDefault();
+    applyActivePage("bots");
+    if (els.botsFilter) {
+      els.botsFilter.focus();
+      els.botsFilter.select();
+    }
+  }
+}
+
 // ---------- Conversations ----------
+// Single source of truth for "what bots exist." Called after every mutation
+// (create / delete / clear / import). Refreshes the in-memory cache that
+// the Bots page renders from + updates the topbar's current-bot label.
 async function loadConversations() {
   const r = await fetch("/api/conversations");
   const list = await r.json();
-  els.convSelect.innerHTML = "";
-  if (!list.length) {
-    els.convSelect.add(new Option("(no conversations)", ""));
-    return list;
-  }
-  for (const c of list) {
-    els.convSelect.add(new Option(`${c.title} · ${c.model}`, c.id));
-  }
+  _botsState.cache = list;
+  renderBotsPage();
+  renderTopbarBotLabel();
   return list;
 }
 
@@ -453,7 +754,9 @@ async function openConversation(id) {
   els.think.value = thinkToSelect(p.think);
   els.maxThinking.value = p.max_thinking_tokens != null ? p.max_thinking_tokens : "";
   syncParamDisplay();
-  els.convSelect.value = String(id);
+  renderTopbarBotLabel();
+  _markConvViewed(id);  // opening = "I'm reading this now"
+  renderBotsPage();
   renderMessages();
 }
 
@@ -488,7 +791,7 @@ async function newConversation() {
   state.conversationId = c.id;
   state.messages = [];
   await loadConversations();
-  els.convSelect.value = String(c.id);
+  renderTopbarBotLabel();
   renderMessages();
 
   // Reset the sidebar so the user sees the clean config they're about to edit.
@@ -1118,6 +1421,12 @@ async function sendMessage(text) {
     await newConversation();
   }
 
+  // Snapshot the target conv id for unread-indicator bookkeeping. We use the
+  // snapshot (not state.conversationId) in the finally block because the user
+  // may navigate to a different conv mid-stream.
+  const _streamConvId = state.conversationId;
+  _onStreamStart(_streamConvId);
+
   const params = getParams();
 
   // Snapshot attachments at send time so the chips clear immediately and
@@ -1312,6 +1621,7 @@ async function sendMessage(text) {
     els.input.focus();
     scrollToBottom();   // settle the viewport on the fully-rendered final message
     loadConversations();
+    _onStreamEnd(_streamConvId);
   }
 }
 
@@ -1319,14 +1629,31 @@ async function sendMessage(text) {
 // Each conversation is a saved microservice: its model, system prompt, and
 // sampling params are locked server-side. The snippet only needs to supply
 // the message (or the messages list, for multi-turn).
+// _modalConvId overrides state.conversationId for the API code modal, used
+// when the modal was opened from a bot card's `</>` button on the Bots list.
+// Cleared in closeModal so a subsequent topbar open uses the live conversation.
+let _modalConvId = null;
 function buildCodeSnippet(tab, mode, style) {
   const base = window.location.origin;
-  const convId = state.conversationId;
+  const convId = _modalConvId != null ? _modalConvId : state.conversationId;
   if (!convId) {
     return "# Send a message first to create a conversation.\n# Each chat becomes its own configured API endpoint.";
   }
   if (style === "openai") return buildOpenAISnippet(tab, mode, base, convId);
   return buildNativeSnippet(tab, mode, base, convId);
+}
+
+// Open the API-code modal scoped to a specific conv id, regardless of which
+// bot (if any) is currently the active selection. Called from the row `</>`
+// button on bot cards. Doesn't disturb state.conversationId.
+async function openApiCodeForConv(convId) {
+  if (convId == null) return;
+  // flushPendingSave keeps the snippet's params in sync with the GUI for the
+  // *currently open* bot. For a non-current bot we skip the flush — its saved
+  // params are already on disk and the snippet renders from server state.
+  _modalConvId = convId;
+  paintSnippet();
+  els.modalBackdrop.classList.remove("hidden");
 }
 
 function buildNativeSnippet(tab, mode, base, convId) {
@@ -1539,7 +1866,10 @@ async function openModal() {
   paintSnippet();
   els.modalBackdrop.classList.remove("hidden");
 }
-function closeModal() { els.modalBackdrop.classList.add("hidden"); }
+function closeModal() {
+  els.modalBackdrop.classList.add("hidden");
+  _modalConvId = null;  // next regular open uses state.conversationId again
+}
 
 function bindModal() {
   els.apiCodeBtn.addEventListener("click", openModal);
@@ -1635,10 +1965,6 @@ function bindChat() {
   els.stopBtn.addEventListener("click", () => {
     if (state.abortController) state.abortController.abort();
   });
-  els.convSelect.addEventListener("change", e => {
-    const id = e.target.value;
-    if (id) openConversation(parseInt(id, 10));
-  });
 }
 
 async function clearCurrentConversation() {
@@ -1722,16 +2048,46 @@ function bindDownloadMenu() {
   });
 }
 
+// Delete any conv by id, with the right post-delete behavior depending on
+// whether it was the currently-open bot or just one in the list:
+//   - clears in-memory state if id === state.conversationId
+//   - drops the id from _streaming/_unread so a stale dot doesn't linger
+//   - reloads the bots list
+//   - if the deleted bot was open: opens the next-most-recent OR goes to
+//     the Bots home if the list is now empty
+// Returns true if the delete went through, false if cancelled or failed.
+async function deleteConvById(id, opts = {}) {
+  if (id == null) return false;
+  const title = opts.title || "this bot";
+  const ok = opts.skipConfirm || confirm(`Delete "${title}"? This cannot be undone.`);
+  if (!ok) return false;
+  const r = await fetch(`/api/conversations/${id}`, { method: "DELETE" });
+  if (!r.ok) { alert("Failed to delete bot."); return false; }
+
+  const wasOpen = (id === state.conversationId);
+  _streaming.delete(id);
+  _unread.delete(id);
+  if (wasOpen) {
+    state.conversationId = null;
+    state.messages = [];
+    renderMessages();
+  }
+  const list = await loadConversations();
+  if (wasOpen) {
+    if (list.length) {
+      await openConversation(list[0].id);
+    } else {
+      // No bots left — fall back to the Bots home so the user sees the empty
+      // state with a clear "+ New bot" affordance instead of an empty chat.
+      applyActivePage("bots");
+    }
+  }
+  return true;
+}
+
 async function deleteCurrentConversation() {
   if (!state.conversationId) return;
-  if (!confirm("Delete this conversation entirely? This cannot be undone.")) return;
-  const r = await fetch(`/api/conversations/${state.conversationId}`, { method: "DELETE" });
-  if (!r.ok) { alert("Failed to delete conversation."); return; }
-  state.conversationId = null;
-  state.messages = [];
-  renderMessages();
-  const list = await loadConversations();
-  if (list.length) await openConversation(list[0].id);
+  await deleteConvById(state.conversationId);
 }
 
 // ---------- Sidebar splitter ----------
@@ -2533,16 +2889,48 @@ function initBackendsUI() {
 // without unmounting anything. Chat streams keep running across switches.
 const ACTIVE_PAGE_KEY = "miniclosedai:activePage";
 
-const VALID_PAGES = new Set(["dashboard", "settings", "logs"]);
+// "dashboard" is still a valid internal page — it's the chat surface — but it
+// no longer has its own button in the activity bar. The Bots nav icon stays
+// highlighted whether you're on the list (page=bots) or inside a chat
+// (page=dashboard), reinforcing the parent/child relationship.
+const VALID_PAGES = new Set(["dashboard", "bots", "settings", "logs"]);
+const _BOTS_AREA = new Set(["bots", "dashboard"]);
 function applyActivePage(page) {
-  const p = VALID_PAGES.has(page) ? page : "dashboard";
+  const from = document.body.dataset.page;
+  const p = VALID_PAGES.has(page) ? page : "bots";
+
+  // Spatial drill-in / drill-out: slide the chat in from the right when going
+  // bots → dashboard, slide the list back in from the left when going
+  // dashboard → bots. The CSS keyframes are gated on body[data-bots-transition].
+  if (from !== p && _BOTS_AREA.has(from) && _BOTS_AREA.has(p)) {
+    const dir = (from === "bots" && p === "dashboard") ? "forward" : "back";
+    document.body.dataset.botsTransition = dir;
+    // Clear the attribute after the keyframe duration so a future toggle re-fires it.
+    setTimeout(() => {
+      if (document.body.dataset.botsTransition === dir) {
+        delete document.body.dataset.botsTransition;
+      }
+    }, 240);
+  }
+
   document.body.dataset.page = p;
   document.querySelectorAll(".activity-bar .nav-item").forEach(btn => {
-    btn.classList.toggle("active", btn.dataset.page === p);
+    // The Bots nav-item owns BOTH the bots list and the chat (dashboard).
+    const owns = btn.dataset.page === "bots" ? _BOTS_AREA.has(p) : btn.dataset.page === p;
+    btn.classList.toggle("active", owns);
   });
   try { localStorage.setItem(ACTIVE_PAGE_KEY, p); } catch (_) {}
+  // Page change may affect the unread-dot rule (which excludes the currently-
+  // viewed conv). Landing on dashboard with a conv loaded marks it read.
+  if (p === "dashboard" && state.conversationId != null) {
+    _markConvViewed(state.conversationId);
+  }
+  if (typeof _refreshUnreadUI === "function") _refreshUnreadUI();
   if (p === "settings" && typeof renderSettingsPage === "function") {
     renderSettingsPage();
+  }
+  if (p === "bots" && typeof onBotsPageEntered === "function") {
+    onBotsPageEntered();
   }
   if (p === "logs" && typeof onLogsPageEntered === "function") {
     onLogsPageEntered();
@@ -2556,7 +2944,9 @@ function initActivityBar() {
     btn.addEventListener("click", () => applyActivePage(btn.dataset.page));
   });
   const saved = (() => { try { return localStorage.getItem(ACTIVE_PAGE_KEY); } catch { return null; } })();
-  applyActivePage(saved || "dashboard");
+  // First-time visitors land on the Bots list (the home surface). Returning
+  // users get back to wherever they were — typically the chat they had open.
+  applyActivePage(saved || "bots");
 }
 
 // ---------- Pull poller ----------
@@ -3334,6 +3724,7 @@ async function init() {
   initSuggestionChips();
   if (typeof initBackendsUI === "function") initBackendsUI();
   initLogsUI();
+  initBotsUI();
   startPullPoller();
   initUpgradeUI();
   initImportBotUI();

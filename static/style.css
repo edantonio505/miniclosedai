@@ -170,6 +170,33 @@ body {
 .activity-bar .nav-item svg { width: 20px; height: 20px; }
 .activity-bar .nav-item-bottom { margin-top: auto; }
 
+/* "You are inside a bot" indicator — a small pulsing accent dot anchored to
+   the bottom-right of the Bots nav button while a conversation is open.
+   The body[data-has-active-bot] flag is toggled whenever state.conversationId
+   becomes truthy/null (see renderBreadcrumb() in app.js). */
+.activity-bar .nav-item { position: relative; }
+.nav-active-dot {
+  position: absolute;
+  bottom: 6px;
+  right: 6px;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0;
+  transform: scale(0.6);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  pointer-events: none;
+}
+body[data-has-active-bot="1"] .activity-bar .nav-item[data-page="bots"] .nav-active-dot {
+  opacity: 1;
+  transform: scale(1);
+  animation: nav-dot-pulse 2.4s ease-in-out infinite;
+}
+@keyframes nav-dot-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--accent-ring); }
+  50%      { box-shadow: 0 0 0 4px transparent; }
+}
+
 /* =====================================================================
    Main area + page routing (CSS-only; toggled by body[data-page])
    ===================================================================== */
@@ -205,6 +232,290 @@ body[data-page="logs"] .page-logs {
   min-height: 0;
   flex: 1 1 auto;
   overflow: auto;
+}
+body[data-page="bots"] .page-bots {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+}
+
+/* =====================================================================
+   Bots page — searchable library of saved conversations
+   ===================================================================== */
+.bots-container {
+  width: 100%;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 32px 28px 60px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.bots-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+}
+.bots-header h1 { margin: 0 0 4px; font-size: 22px; }
+.bots-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 720px;
+}
+.bots-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.bots-toolbar input[type="search"] {
+  flex: 1 1 auto;
+  padding: 6px 10px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  color: var(--text);
+}
+.bots-count {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.bots-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.bots-empty {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 40px 20px;
+  line-height: 1.6;
+}
+.bot-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--panel);
+  /* Extra left padding reserves space for the pending-dot column so cards
+     don't shift sideways when a dot appears/disappears. */
+  padding: 12px 14px 12px 28px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.12s, border-color 0.12s;
+  position: relative;
+}
+.bot-card::before {
+  /* Pending / unread dot — invisible by default, painted accent when the card
+     has .has-pending. The accent ring on the nav icon pulses; here we keep
+     a static dot so a long list with many pending entries doesn't strobe. */
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: transparent;
+  transform: translateY(-50%);
+  transition: background 0.2s ease;
+}
+.bot-card.has-pending::before {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+/* Row actions — appear on hover/focus only. The gradient mask makes them feel
+   intentional (it fades the title/meta underneath into the card bg) rather
+   than crashed-on-top. */
+.bot-card-actions {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px 0 36px;
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: linear-gradient(to right, transparent 0%, var(--panel) 45%);
+  opacity: 0;
+  transform: translateX(8px);
+  pointer-events: none;
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+.bot-card:hover .bot-card-actions,
+.bot-card:focus-within .bot-card-actions {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+/* Keep the mask color in sync with the card's hovered/active background so
+   the fade looks seamless instead of a stripe of the wrong color. */
+.bot-card:hover .bot-card-actions {
+  background: linear-gradient(to right, transparent 0%, var(--panel-hover) 45%);
+}
+.bot-card.active .bot-card-actions {
+  background: linear-gradient(to right, transparent 0%, var(--accent-soft) 45%);
+}
+.bot-card.active:hover .bot-card-actions {
+  /* Active + hover blends panel-hover INTO accent-soft visually; just stick
+     with the accent-soft mask, the active state already implies "selected". */
+  background: linear-gradient(to right, transparent 0%, var(--accent-soft) 45%);
+}
+
+.bot-card-action {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev-1);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s, transform 0.12s;
+}
+.bot-card-action svg { width: 14px; height: 14px; }
+.bot-card-action:hover {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--text-muted);
+  transform: scale(1.06);
+}
+.bot-card-action:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.bot-card-action.danger:hover {
+  background: rgba(220, 38, 38, 0.10);
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.bot-card:hover,
+.bot-card:focus-within {
+  background: var(--panel-hover);
+  border-color: var(--border-strong);
+  /* Float the hovered card above its siblings so action-button tooltips and
+     the (transform-induced) actions stacking context can paint over the
+     next card's border instead of being eclipsed by it. */
+  z-index: 5;
+}
+.bot-card.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.bot-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bot-card-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bot-card-meta .sep {
+  margin: 0 6px;
+  opacity: 0.5;
+}
+
+/* "Back to bots" — the primary go-up-a-level affordance in chat view.
+   Sits at the leftmost position of the topbar (first item in .brand). Styled
+   as an always-visible button (NOT transparent-until-hover) so the user
+   immediately sees there's a way out. Chevron-left icon = universal "back". */
+.breadcrumb-back {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--panel-hover);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s, transform 0.12s;
+  flex-shrink: 0;
+  line-height: 1;
+}
+.breadcrumb-back:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+  transform: translateX(-1px); /* tiny pull-left on hover hints at the back motion */
+}
+.breadcrumb-back:active { transform: translateX(-2px); }
+.breadcrumb-back:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.breadcrumb-back svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  transition: transform 0.12s;
+}
+.breadcrumb-back:hover svg { transform: translateX(-1px); }
+
+/* Currently-open bot name shown after the model select. A subdued label —
+   the back button is the active control; this is just informational. */
+.breadcrumb-current {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  max-width: 280px;
+  padding: 4px 10px;
+  border-radius: var(--r-pill);
+  background: var(--bg-deep);
+}
+.breadcrumb-current.is-empty {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-style: italic;
+  background: transparent;
+}
+
+/* Spatial drill-in / drill-out animation between Bots list and chat.
+   Triggered by toggling body[data-bots-transition] to "forward" (list → chat)
+   or "back" (chat → list) just before applyActivePage flips data-page. The
+   attribute is auto-cleared once the animation ends. Pages share the same
+   slot so the transform is applied to whichever page becomes visible. */
+body[data-bots-transition="forward"] .page-dashboard {
+  animation: drillIn 200ms cubic-bezier(0.22, 0.8, 0.22, 1) both;
+}
+body[data-bots-transition="back"] .page-bots {
+  animation: drillOut 200ms cubic-bezier(0.22, 0.8, 0.22, 1) both;
+}
+@keyframes drillIn {
+  from { transform: translateX(28px); opacity: 0; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+@keyframes drillOut {
+  from { transform: translateX(-28px); opacity: 0; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  body[data-bots-transition="forward"] .page-dashboard,
+  body[data-bots-transition="back"]    .page-bots { animation: none; }
 }
 
 /* =====================================================================

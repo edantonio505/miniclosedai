@@ -843,10 +843,14 @@ def _():
     r = client.get("/")
     assert r.status_code == 200
     body = r.text
-    assert 'data-page="dashboard"' in body
+    # The Bots list is now the landing surface — the Dashboard nav icon was
+    # removed and the chat page is reached by drilling into a bot.
+    assert 'data-page="bots"' in body
     assert 'class="activity-bar"' in body
     assert 'class="page page-dashboard"' in body
+    assert 'class="page page-bots"' in body
     assert 'class="page page-settings"' in body
+    assert 'id="breadcrumb-back"' in body
 
 
 @test("static: app.js is served and contains recent helpers")
