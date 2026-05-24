@@ -60,7 +60,7 @@ MiniClosedAI is a single-user, single-process web app that wraps **local** LLMs 
 - 📎 **File attachments — images, PDFs, and text files** — paperclip in the composer (and clipboard paste) attaches files to a chat turn. Vision models (`llava`, `gemma4`, `qwen3.6`, `*-vision`, `*-vl`, etc.) see images natively over both Ollama's `/api/chat` and OpenAI's `chat/completions` formats. PDFs are extracted to text server-side with `pypdf` (50-page / 30 000-char caps), and `.txt` / `.md` / `.csv` / source-code files are read inline. Attached file bodies get prepended to the user's message; the bubble shows just the user's question + thumbnails / doc chips. Soft-warns when an image is attached to a model that doesn't pattern-match a vision model. **No extra setup** — `pypdf` ships in `requirements.txt`.
 - ⏹ **Manual stop** — a Stop button in the composer aborts the stream cleanly.
 - 🔁 **OpenAI-SDK-compatible server** — drop MiniClosedAI in place of `api.openai.com` with a one-line `base_url` change. Every bot appears as a "model" to the SDK; calls route to whichever backend that bot is pinned to.
-- 🎨 **Polished UI** — left activity bar (Dashboard / Settings), Light / Dark / System theme, draggable splitters (sidebar width + system-prompt height), Gemini-style empty state, syntax-highlighted API-code modal with Streaming/Non-streaming and Native/OpenAI variants.
+- 🎨 **Polished UI** — left activity bar (Bots / Logs / Settings) with a **drill-in Bots list** as the home surface (searchable, filterable, click a card to enter that chat; `Esc` or the topbar `<` button to come back; `⌘K`/`/` to quick-switch), Light / Dark / System theme, draggable splitters (sidebar width + system-prompt height), Gemini-style empty state, syntax-highlighted API-code modal with Streaming/Non-streaming and Native/OpenAI variants. Pulse-dot **unread indicator** on both the nav icon and individual bot cards signals replies waiting in chats you weren't watching.
 - 🗂️ **SQLite persistence** — one file, two tables (`backends`, `conversations`), JSON columns for messages. Delete to reset, copy to migrate.
 - 🧪 **Fine-tuning data curation built-in** — edit any assistant response in place to turn it into the ideal output, then download the whole conversation as a two-column `input,output` CSV ready for SFT. The original pristine response is preserved under `original_content` for audit / DPO later.
 
@@ -358,30 +358,45 @@ That's the whole loop: **configure → save → call**.
 
 ## UI guide
 
+### Navigation model
+
+The UI is structured around a **list → detail** pattern, not a flat set of tabs. The Bots list is the home surface; clicking any saved bot drills into its chat. A topbar `<` button (and `Esc`) brings you back out.
+
 ### Activity bar (left edge)
 
-Vertical nav with three icons — clicking swaps the main content area without navigating:
+Vertical nav with three icons — clicking swaps the main content area without unmounting anything:
 
-- **Dashboard** (top, grid icon) — the chat + sidebar you use for authoring and running bots. This is where you land.
+- **Bots** (top, message-square icon) — the home for everything chat-related. Shows a searchable list of every saved conversation; click a card to enter that chat. The icon stays highlighted whether you're on the list OR inside a chat (chats are children of Bots, not a sibling tab). A small **pulse dot** on this icon lights up when a bot has a streaming or unread reply you haven't seen yet.
 - **Logs** (middle, terminal icon) — live LM-Studio-style viewer of every chat request and response across all endpoints. See [Logs page](#logs-page) below.
 - **Settings** (bottom, gear icon) — register and manage LLM endpoints (see [Connecting LM Studio and other endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)).
 
 Your selection persists across reloads. Streaming chats keep playing when you flip between tabs — the DOM is never unmounted, and the Logs polling auto-pauses on the other tabs so it doesn't burn cycles when invisible.
 
-### Header (Dashboard)
+### Bots page (home)
+
+Single full-page surface listing every saved conversation, newest first. Each card shows title · model · backend · relative last-updated time. The toolbar has a live filter that matches across all four fields (substring, case-insensitive). The **+ New bot** button at the top-right prompts for a name, creates the conversation, and drills straight into chat.
+
+- **Click a card** → spatial slide-in animation, you land in that chat with full history.
+- **Card with a pulse dot** → that bot has a streaming reply in progress OR a completed reply you haven't viewed yet. Clicking the card clears the dot.
+- **Quick-switch shortcut**: `⌘K` / `Ctrl+K` from anywhere, or `/` when you're not in a text field, jumps to the Bots page and focuses the filter.
+
+### Chat view — topbar
+
+When you drill into a bot, the chat surface gets a topbar with these controls:
 
 | Control | Purpose |
 |---|---|
-| ◆ logo + title | Branding |
+| **`<` back button** (leftmost) | Returns to the Bots list with a reverse slide. Same as pressing `Esc`. Hover tooltip: "Back to bots (Esc)". |
 | Sidebar toggle (panel-left icon) | Collapse/expand the sidebar. Preference persists. |
+| ◆ logo + title | Branding |
 | **Model** `<select>` | **Grouped by endpoint.** Each registered backend contributes an `<optgroup>` with its available models. Picking a model from a different group switches the bot's backend too. |
-| **Conversation** `<select>` | Switch between saved bots. Shows title + backend model. |
-| **+ New Chat** | Prompts for a name, then creates a fresh bot with default params (model + backend inherited from current selection). |
+| **Bot name pill** | Small read-only label showing the currently-open bot's title. Pure indicator — switching bots happens from the Bots list. |
+| **+ New chat** (plus icon) | Prompts for a name, then creates a fresh bot with default params (model + backend inherited from current selection). |
 | **Import bot** (upload-cloud icon) | Pick a `.miniclosed-bot.json` file exported from another instance and create a new bot from it. If no enabled backend serves the bot's model, a picker modal asks you which backend to run it on. See [Sharing bots between instances](./DOCUMENTATION.md#bot-import--export). |
 | **↺ Clear** | Wipes messages in the current conversation, keeps the config. |
 | **Download dataset / bot** (download icon) | Popover menu with five export formats: text CSV, multimodal JSONL+images ZIP, image-classification ZIP, **bot config JSON** (portable, no secrets), and **bot config + history JSON**. The two `.miniclosed-bot.json` formats are for moving a bot to another instance. |
-| **🗑 Delete** | Removes the current conversation entirely. |
-| **API Code** | Opens the snippet modal (see below). |
+| **🗑 Delete** | Removes the current conversation entirely. If it was the last bot, returns you to the Bots list. |
+| **`</>` API code** (icon-only) | Opens the snippet modal (see below). Hover for label. |
 | **Theme toggle** | Cycles System → Light → Dark → System. Respects `prefers-color-scheme` while on System. |
 
 ### Sidebar

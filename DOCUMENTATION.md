@@ -347,14 +347,29 @@ See [Security](#security) and the README's [LAN access](./README.md#lan-access) 
 
 ## UI features
 
-### Header
+### Navigation (list → detail)
 
-- **Model** `<select>` — lists every local Ollama chat model. Switching updates the active conversation's saved model (auto-saved).
-- **Conversation** `<select>` — switch between saved chats.
-- **+ New Chat** — creates a fresh conversation with the current model, system prompt, and params.
+The UI is a **list/detail** pattern, not flat tabs. The activity bar has three icons — **Bots** (home, message-square), **Logs** (terminal), **Settings** (gear). The "Dashboard" page still exists internally (it's the chat surface) but has no nav button; you reach it by drilling into a bot from the list.
+
+- **Bots page** — searchable cards; click to enter that chat. Slide-in animation. `⌘K` / `Ctrl+K` from anywhere (or `/` outside a text field) jumps here and focuses the filter.
+- **Topbar `<` back button** — leftmost element of the chat topbar; returns to the Bots list with a reverse slide. `Esc` is the keyboard equivalent (skipped when a modal is open).
+- **Pulse dot** on the Bots icon AND on individual bot cards — driven by two sets:
+  - `_streaming` — convs whose chat stream is currently in flight.
+  - `_unread` — convs whose stream finished while the user wasn't watching.
+  
+  Dot is lit whenever either set has an id the user isn't currently viewing. Marking a conv as viewed (= landing on the Dashboard with that conv loaded, OR explicitly opening it from the list) drops it from `_unread`. See `_refreshUnreadUI` / `_onStreamStart` / `_onStreamEnd` / `_markConvViewed` in `static/app.js`.
+
+### Chat topbar (when a bot is open)
+
+- **`<` back button** (leftmost) — `applyActivePage("bots")`. Also bound to `Esc`.
+- **Model** `<select>` — lists every model from every reachable backend, grouped by `<optgroup>`. Switching updates the active conversation's saved model (auto-saved).
+- **Bot name pill** — read-only label after the model select; mirrors the currently-open bot's title. Updated by `renderBreadcrumb()`.
+- **+ New chat** (plus icon) — creates a fresh conversation with the current model, system prompt, and params.
+- **Import bot** (upload-cloud) — loads a `.miniclosed-bot.json`.
 - **🧹 Clear** — wipes messages in the current conversation (keeps config).
-- **🗑 Delete** — deletes the current conversation.
-- **Get API Code** — opens a modal with cURL / Python / JavaScript snippets that call the current conversation as a microservice.
+- **Download** (tray) — popover with 5 export formats (CSV / multimodal ZIP / classification ZIP / bot-config JSON / bot-config-with-history JSON).
+- **🗑 Delete** — deletes the current conversation. If it was the last bot, the UI auto-returns to the Bots list.
+- **`</>` API Code** (icon-only) — opens the snippet modal with cURL / Python / JavaScript variants.
 
 ### Sidebar
 
@@ -389,7 +404,7 @@ The sidebar's scrollbar is hidden across all browsers; scrolling still works via
 
 ### Logs page
 
-Vertical-nav button (terminal icon, between Dashboard and Settings) opens the LLM activity viewer. Implementation detail in [Activity logs](#activity-logs) below; from a user's perspective it's a per-call row showing status / endpoint / model / latency / timestamp, click-to-expand for params + messages + response. Polling auto-pauses when the page isn't visible.
+Vertical-nav button (terminal icon, between Bots and Settings in the activity bar) opens the LLM activity viewer. Implementation detail in [Activity logs](#activity-logs) below; from a user's perspective it's a per-call row showing status / endpoint / model / latency / timestamp, click-to-expand for params + messages + response. Polling auto-pauses when the page isn't visible.
 
 ---
 

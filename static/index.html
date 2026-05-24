@@ -20,11 +20,12 @@
     })();
   </script>
 </head>
-<body data-page="dashboard">
+<body data-page="bots">
   <nav class="activity-bar" aria-label="Primary">
-    <button class="nav-item active" data-page="dashboard" title="Dashboard" aria-label="Dashboard">
-      <!-- Feather: grid -->
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+    <button class="nav-item active" data-page="bots" title="Bots — your saved conversations" aria-label="Bots">
+      <!-- Feather: message-square — the home for everything chat-related -->
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      <span class="nav-active-dot" aria-hidden="true"></span>
     </button>
     <button class="nav-item" data-page="logs" title="Logs — LLM request/response activity" aria-label="Logs">
       <!-- Feather: terminal — represents request/response stream activity -->
@@ -40,12 +41,16 @@
   <div class="page page-dashboard">
   <header class="topbar">
     <div class="brand">
+      <button id="breadcrumb-back" class="breadcrumb-back" data-tooltip="Back to bots (Esc)" aria-label="Back to bots">
+        <!-- Feather: chevron-left — universal "go up a level" indicator -->
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
       <button id="sidebar-toggle" class="icon-btn" data-tooltip="Hide sidebar" aria-label="Hide sidebar">
         <!-- Feather: panel-left -->
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
       </button>
       <span class="logo">◆</span>
-      <span>MiniClosedAI</span>
+      <span class="brand-name">MiniClosedAI</span>
     </div>
 
     <div class="top-controls">
@@ -53,9 +58,7 @@
         <option value="">Loading models…</option>
       </select>
 
-      <select id="conversation-select" title="Switch conversation">
-        <option value="">No conversations</option>
-      </select>
+      <span id="breadcrumb-current" class="breadcrumb-current" data-tooltip="Currently open bot">(no bot selected)</span>
 
       <span class="divider-v"></span>
 
@@ -107,9 +110,8 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
       </button>
 
-      <button id="api-code-btn" class="btn btn-small" data-tooltip="Get API integration code">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-        API Code
+      <button id="api-code-btn" class="icon-btn" data-tooltip="Get API integration code" aria-label="API integration code">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
       </button>
 
       <button id="upgrade-badge" class="btn btn-small btn-upgrade" data-tooltip="Update available — click to upgrade" hidden>
@@ -299,6 +301,27 @@
     </div>
   </div>
 
+  <div class="page page-bots">
+    <div class="bots-container">
+      <div class="bots-header">
+        <div>
+          <h1>Bots</h1>
+          <p class="bots-hint">Browse your saved conversational bots. Click any card to open it on the Dashboard with its full history.</p>
+        </div>
+        <button id="bots-new-btn" type="button" class="btn btn-primary">+ New bot</button>
+      </div>
+      <div class="bots-toolbar">
+        <input type="search" id="bots-filter" placeholder="Filter by name, model, or backend…" />
+        <span class="bots-count" id="bots-count">0 bots</span>
+      </div>
+      <div id="bots-list" class="bots-list"></div>
+      <div id="bots-empty" class="bots-empty" hidden>
+        <p>No bots saved yet.</p>
+        <p>Click <strong>+ New bot</strong> above to author your first one, or open <strong>Settings → Add endpoint</strong> first if you haven't registered an LLM endpoint yet.</p>
+      </div>
+    </div>
+  </div>
+
   <div class="page page-settings">
     <div class="settings-container">
       <h1>Settings</h1>
@@ -332,7 +355,14 @@
   <div id="modal-backdrop" class="modal-backdrop hidden">
     <div class="modal">
       <div class="modal-header">
-        <h3>API Integration Code</h3>
+        <div class="modal-title-group">
+          <h3>API Integration Code</h3>
+          <button id="copy-bot-id" type="button" class="copy-id-pill" data-tooltip="Copy bot ID — paste into your microservice config">
+            <span id="modal-bot-id" class="copy-id-value">Bot #—</span>
+            <!-- Feather: copy -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+        </div>
         <button id="modal-close" class="icon-btn" data-tooltip="Close" aria-label="Close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
