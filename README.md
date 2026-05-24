@@ -1973,6 +1973,20 @@ Local-only — there is no per-call charge. The example labeled 100 images in ro
 
 Two runnable templates in [`docs/examples/`](./docs/examples/) — one Python CLI, one drop-in HTML widget — both backed by the same per-conversation endpoint. Pick whichever matches your delivery surface (terminal tool / kiosk / web page / internal admin) and edit two lines to point it at your bot.
 
+### Video walkthrough — Hotel Reservation Bot, end to end
+
+▶️ **[Watch the walkthrough on YouTube](https://youtu.be/LiQeIAeSVA4)** — building a Hotel Reservation Bot from scratch and embedding it in a web page, start to finish.
+
+The video covers the whole loop. Every file it touches is in this repo:
+
+1. **Create a new bot.** In MiniClosedAI, click **+ New bot**, then paste the system-prompt template from [`docs/recipes/Hotel Reservations Bot.md`](./docs/recipes/Hotel%20Reservations%20Bot.md) into the **System Prompt** field. Apply the recommended settings from that recipe (`qwen3:8b`, temperature `0.3`, max tokens `600`).
+2. **Chat in the GUI to verify.** Send a test message (the recipe's "Example 0" one-shot booking is a good probe). You should see the dual-mode output — a natural-language reply, then a fenced `create_booking` JSON block right below it. That confirms the bot works.
+3. **Grab the bot ID.** Click the **`</>`** ("Get API integration code") button in the chat topbar, then click the **Copy bot ID** pill in the modal header. One click — no typing the number.
+4. **Point the widget at your bot.** Open [`docs/examples/web_chatbot/index.html`](./docs/examples/web_chatbot/index.html), change the single line `const CONV_ID = …` to the id you just copied, and save. The base URL auto-detects the host (with a `file://` fallback for local testing).
+5. **Serve the file and chat.** Run a static server (`cd docs/examples/web_chatbot && python3 -m http.server 9000`) and open the page — you're now chatting with the bot you just built, in the browser.
+
+That's the entire flow: **build → copy ID → paste → serve → chat.** The rest of this section is the reference detail behind each template.
+
 Both share the same lifecycle:
 
 1. Stream the bot's reply token-by-token into a chat surface.
@@ -2029,12 +2043,17 @@ Conversation ended — information extracted
 
 ### HTML drop-in widget — [`docs/examples/web_chatbot/index.html`](./docs/examples/web_chatbot/index.html)
 
-A self-contained single-file HTML page (~560 lines, no dependencies) that turns the same saved bot into a polished chat widget. Drop it on any web server, an internal admin tool, a kiosk, or just open it locally — copy the file, edit two `TODO` constants at the top of the `<script>` block, done.
+A self-contained single-file HTML page (~560 lines, no dependencies) that turns the same saved bot into a polished chat widget. Drop it on any web server, an internal admin tool, a kiosk, or just open it locally — copy the file, change the one `CONV_ID` line, done. The base URL is auto-derived from the page's host (with an explicit `file://` fallback), so usually there's nothing else to edit.
 
 ```html
-<!-- index.html — line ~310 -->
-const MCAI_BASE_URL = "http://localhost:8095";  // TODO: your MCAi instance
-const CONV_ID       = 39;                       // TODO: your saved conv id
+<!-- index.html — in the <script> block -->
+const MCAI_BASE_URL =
+  window.location.protocol === "file:"
+    ? "http://localhost:8095"                                   // file:// fallback
+    : `${window.location.protocol}//${window.location.hostname}:8095`;
+
+// Copy this from MiniClosedAI: the <> "Get API integration code" button → Copy bot ID
+const CONV_ID = 79;
 ```
 
 **Features baked in:**

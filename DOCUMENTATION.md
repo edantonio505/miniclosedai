@@ -1183,6 +1183,20 @@ The [`docs/examples/hotdog_nothotdog/`](./docs/examples/hotdog_nothotdog/) folde
 
 ## Worked example — chatbot frontends (Python CLI + HTML widget)
 
+### Video walkthrough — Hotel Reservation Bot, end to end
+
+▶️ **[YouTube: build + embed a Hotel Reservation Bot](https://youtu.be/LiQeIAeSVA4)** — the full create-to-chat loop in one take. Every file referenced is in this repo; this is the step-by-step the video follows:
+
+1. **New bot.** MiniClosedAI → **+ New bot** → paste the system prompt from [`docs/recipes/Hotel Reservations Bot.md`](./docs/recipes/Hotel%20Reservations%20Bot.md) → apply the recipe's recommended settings (`qwen3:8b`, T `0.3`, max tokens `600`, `include_history: true`).
+2. **Verify in the GUI.** Send the recipe's "Example 0" one-shot booking. Correct behavior = a prose reply followed by a fenced `create_booking` JSON block (the dual-mode output pattern).
+3. **Copy the bot ID.** Chat topbar → **`</>`** ("Get API integration code") → **Copy bot ID** pill in the modal header (one click; no manual typing).
+4. **Repoint the widget.** Edit [`docs/examples/web_chatbot/index.html`](./docs/examples/web_chatbot/index.html) → set `const CONV_ID = <id>` → save. `MCAI_BASE_URL` auto-derives from the page host (with a `file://` fallback), so no other edit is needed for same-host serving.
+5. **Serve + chat.** `cd docs/examples/web_chatbot && python3 -m http.server 9000` → open the page → chat with the bot you just built.
+
+The rest of this section is the implementation detail behind the two templates.
+
+---
+
 Two reference implementations of "consume a conversational MCAi bot as an end-user surface". Both back-end on the same `/api/conversations/{id}/chat/stream` endpoint (the HTML) or `/v1/chat/completions` (the Python script via the OpenAI SDK) and demonstrate the same five-stage lifecycle:
 
 1. **Stream** the bot's reply token-by-token.
