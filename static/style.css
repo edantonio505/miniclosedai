@@ -298,10 +298,45 @@ body[data-page="bots"] .page-bots {
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
 }
+
+/* List ↔ grid segmented control. Two icon buttons in a bordered pill; the
+   active mode gets the accent-soft fill. */
+.view-toggle {
+  display: inline-flex;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+.view-toggle-btn {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 28px;
+  border: 0;
+  background: var(--bg-elev-1);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.view-toggle-btn + .view-toggle-btn { border-left: 1px solid var(--border); }
+.view-toggle-btn:hover { background: var(--panel-hover); color: var(--text); }
+.view-toggle-btn.active { background: var(--accent-soft); color: var(--accent); }
+.view-toggle-btn:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--accent-ring); }
+.view-toggle-btn svg { width: 15px; height: 15px; }
+
 .bots-list {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+/* Grid view — responsive auto-fill tiles. Cards keep their internal layout
+   (title + meta stack, dot on the left, hover actions on the right); only
+   the container switches from a vertical stack to a wrapping grid. */
+.bots-list.grid-view {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
 }
 .bots-empty {
   text-align: center;

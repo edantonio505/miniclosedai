@@ -11,6 +11,8 @@ const els = {
   botsCount: document.getElementById("bots-count"),
   botsEmpty: document.getElementById("bots-empty"),
   botsNewBtn: document.getElementById("bots-new-btn"),
+  botsViewList: document.getElementById("bots-view-list"),
+  botsViewGrid: document.getElementById("bots-view-grid"),
   newChatBtn: document.getElementById("new-chat-btn"),
   clearChatBtn: document.getElementById("clear-chat-btn"),
   downloadCsvBtn: document.getElementById("download-csv-btn"),
@@ -429,11 +431,38 @@ function setStatus(kind, text) {
 // ─── Bots page ───────────────────────────────────────────────
 // Replaces the legacy topbar `<select id="conversation-select">` with a
 // dedicated activity-bar tab that lists all saved bots with live search.
+const _BOTS_VIEW_KEY = "miniclosedai:botsView";
 const _botsState = {
   cache: [],               // last list returned by /api/conversations (newest first)
   filter: "",              // current search input value
   backendNames: new Map(), // backend_id → display name, populated by loadModels()
+  // "list" (vertical stack) or "grid" (responsive tiles). Restored from
+  // localStorage on init; toggled via the segmented control in the toolbar.
+  view: (() => { try { return localStorage.getItem(_BOTS_VIEW_KEY) === "grid" ? "grid" : "list"; } catch { return "list"; } })(),
 };
+
+// Apply the current view mode to the list container + toggle buttons.
+function _applyBotsView() {
+  if (els.botsList) {
+    els.botsList.classList.toggle("grid-view", _botsState.view === "grid");
+  }
+  if (els.botsViewList) {
+    const isList = _botsState.view === "list";
+    els.botsViewList.classList.toggle("active", isList);
+    els.botsViewList.setAttribute("aria-pressed", String(isList));
+  }
+  if (els.botsViewGrid) {
+    const isGrid = _botsState.view === "grid";
+    els.botsViewGrid.classList.toggle("active", isGrid);
+    els.botsViewGrid.setAttribute("aria-pressed", String(isGrid));
+  }
+}
+
+function _setBotsView(view) {
+  _botsState.view = view === "grid" ? "grid" : "list";
+  try { localStorage.setItem(_BOTS_VIEW_KEY, _botsState.view); } catch (_) {}
+  _applyBotsView();
+}
 
 // "2 hours ago", "yesterday", "just now" — matches the relative-time style
 // elsewhere in the UI. Falls back to the raw ISO if anything looks off.
@@ -470,6 +499,7 @@ function _botMatchesFilter(c, q) {
 
 function renderBotsPage() {
   if (!els.botsList) return; // page not in DOM yet
+  _applyBotsView();  // keep the grid/list class in sync on every re-render
   const q = _botsState.filter.trim().toLowerCase();
   const all = _botsState.cache || [];
   const filtered = all.filter(c => _botMatchesFilter(c, q));
@@ -669,6 +699,13 @@ function initBotsUI() {
   if (els.breadcrumbBack) {
     els.breadcrumbBack.addEventListener("click", () => applyActivePage("bots"));
   }
+  if (els.botsViewList) {
+    els.botsViewList.addEventListener("click", () => _setBotsView("list"));
+  }
+  if (els.botsViewGrid) {
+    els.botsViewGrid.addEventListener("click", () => _setBotsView("grid"));
+  }
+  _applyBotsView();  // reflect the restored view on first paint
   // Global keyboard affordances — Esc exits chat, ⌘K / `/` opens the quick switcher.
   document.addEventListener("keydown", _botsHotkeyHandler);
 }
