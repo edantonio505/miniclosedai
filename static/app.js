@@ -54,6 +54,8 @@ const els = {
   modalClose: document.getElementById("modal-close"),
   codeSnippet: document.getElementById("code-snippet"),
   copyCode: document.getElementById("copy-code"),
+  copyBotId: document.getElementById("copy-bot-id"),
+  modalBotId: document.getElementById("modal-bot-id"),
   langTabs: document.querySelectorAll('.tabs[data-group="lang"] .tab'),
   modeTabs: document.querySelectorAll('.tabs[data-group="mode"] .tab'),
   styleTabs: document.querySelectorAll('.tabs[data-group="style"] .tab'),
@@ -1856,6 +1858,22 @@ function paintSnippet() {
   if (window.hljs && typeof hljs.highlightElement === "function") {
     try { hljs.highlightElement(els.codeSnippet); } catch (_) {}
   }
+  _updateModalBotId();
+}
+
+// Sync the "Bot #N" pill in the modal header with whichever conv the modal
+// is currently scoped to (row-opened or topbar-opened). Disables the pill
+// when no conv exists so a misclick can't copy a stale id.
+function _updateModalBotId() {
+  if (!els.modalBotId) return;
+  const convId = _modalConvId != null ? _modalConvId : state.conversationId;
+  if (convId != null) {
+    els.modalBotId.textContent = `Bot #${convId}`;
+    if (els.copyBotId) els.copyBotId.disabled = false;
+  } else {
+    els.modalBotId.textContent = "Bot #—";
+    if (els.copyBotId) els.copyBotId.disabled = true;
+  }
 }
 
 async function openModal() {
@@ -1899,6 +1917,23 @@ function bindModal() {
       paintSnippet();
     });
   });
+  if (els.copyBotId) {
+    els.copyBotId.addEventListener("click", async () => {
+      const convId = _modalConvId != null ? _modalConvId : state.conversationId;
+      if (convId == null) return;
+      const ok = await copyToClipboard(String(convId));
+      if (!ok) return;
+      // Brief flip to "Copied!" — same pattern as the main Copy button so the
+      // feedback feels consistent across the modal.
+      const orig = els.modalBotId.textContent;
+      els.copyBotId.classList.add("copied");
+      els.modalBotId.textContent = "Copied!";
+      setTimeout(() => {
+        els.copyBotId.classList.remove("copied");
+        els.modalBotId.textContent = orig;
+      }, 1200);
+    });
+  }
   els.copyCode.addEventListener("click", async () => {
     const text = els.codeSnippet.textContent;
     const ok = await copyToClipboard(text);

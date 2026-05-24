@@ -271,8 +271,17 @@ body[data-page="bots"] .page-bots {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 8px 0;
+  padding: 12px 0;
   border-bottom: 1px solid var(--border);
+  /* Pin to the top of the scrolling .page-bots container so the filter input
+     stays visible while the cards scroll underneath. The bg is required —
+     without it, scrolling cards would show through the gap above the search
+     input. z-index outranks the z-index: 5 we apply to hovered cards so
+     a card hovered just below the toolbar can't paint over it. */
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
 }
 .bots-toolbar input[type="search"] {
   flex: 1 1 auto;
@@ -563,8 +572,15 @@ body[data-bots-transition="back"] .page-bots {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 8px 0;
+  padding: 12px 0;
   border-bottom: 1px solid var(--border);
+  /* Pin to the top of the scrolling .page-logs container — same treatment as
+     .bots-toolbar. Bg is required so log rows scrolling underneath don't
+     bleed through the gap above the search input. */
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
 }
 .logs-toolbar input[type="search"] {
   flex: 1 1 auto;
@@ -2383,6 +2399,66 @@ body.sidebar-collapsed #sidebar-toggle {
   font-size: 16px;
   font-weight: 600;
   letter-spacing: -0.01em;
+}
+
+/* Wraps the modal title with the "Bot #N" copy pill so the close button on
+   the far right still gets the space-between treatment from .modal-header. */
+.modal-title-group {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+/* Clickable "Bot #N" pill that copies the raw conversation id. Lives next
+   to the modal title so the snippet variants (lang / mode / style) stay
+   independent — you can grab just the id without affecting the snippet. */
+.copy-id-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--bg-deep);
+  color: var(--text);
+  font-size: 12.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.14s, color 0.14s, border-color 0.14s, transform 0.14s;
+  white-space: nowrap;
+}
+.copy-id-pill:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.copy-id-pill:active { transform: scale(0.97); }
+.copy-id-pill:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.copy-id-pill svg {
+  width: 13px;
+  height: 13px;
+  opacity: 0.7;
+  transition: opacity 0.14s;
+}
+.copy-id-pill:hover svg { opacity: 1; }
+/* Briefly applied after a successful copy — fills the pill with the accent
+   so the feedback is unmistakable, then fades back automatically. */
+.copy-id-pill.copied,
+.copy-id-pill.copied:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.copy-id-pill.copied svg { opacity: 1; }
+.copy-id-pill[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .modal-toolbar {
