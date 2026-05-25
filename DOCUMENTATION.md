@@ -33,16 +33,17 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 10. [Stopping generation](#stopping-generation)
 11. [Fine-tuning data export](#fine-tuning-data-export)
 12. [Worked example — automated image labeling](#worked-example--automated-image-labeling)
-13. [Worked example — chatbot frontends (Python CLI + HTML widget)](#worked-example--chatbot-frontends-python-cli--html-widget) · [Client SDK](#client-sdk--composing-bots-from-your-code)
-14. [Bot import / export](#bot-import--export)
-15. [Self-upgrade](#self-upgrade)
-16. [Prompt generator](#prompt-generator)
-17. [Activity logs](#activity-logs)
-18. [Database](#database)
-19. [Configuration](#configuration)
-20. [File layout](#file-layout)
-21. [Security](#security)
-22. [Troubleshooting](#troubleshooting)
+13. [Worked example — chatbot frontends (Python CLI + HTML widget)](#worked-example--chatbot-frontends-python-cli--html-widget)
+14. [Client SDK — composing bots from your code](#client-sdk--composing-bots-from-your-code)
+15. [Bot import / export](#bot-import--export)
+16. [Self-upgrade](#self-upgrade)
+17. [Prompt generator](#prompt-generator)
+18. [Activity logs](#activity-logs)
+19. [Database](#database)
+20. [Configuration](#configuration)
+21. [File layout](#file-layout)
+22. [Security](#security)
+23. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -1353,49 +1354,6 @@ Neither file references "hotel" or `create_booking` in the chat-handling code pa
 
 Nothing else changes. The Doctor's `create_appointment`, the Restaurant's `create_reservation`, a custom bot of yours emitting `{"type": "place_order", ...}` — all render the same way and trigger the same lifecycle.
 
-### Client SDK — composing bots from your code
-
-The CLI and HTML examples are *end-user surfaces* for a single bot. For **orchestration** — one process that calls several bots, has them feed each other, or embeds each bot as a function inside an internal app — there's a zero-dependency single-file client at [`docs/examples/client/miniclosedai_client.py`](./docs/examples/client/miniclosedai_client.py) (stdlib only; copy, no `pip install`).
-
-```python
-from miniclosedai_client import Bot
-triage, writer = Bot.find("triage"), Bot.find("writer")
-intent = triage.ask(user_msg, history=False)
-reply  = writer.ask(f"Reply addressing: {intent}", history=False)
-```
-
-The `Bot` class is a thin wrapper over the per-conversation endpoints:
-
-| Method | Endpoint | Purpose |
-|---|---|---|
-| `Bot(id)` / `Bot.find(title)` / `Bot.list()` | `GET /api/conversations` | address / discover bots |
-| `Bot.create(...)` / `Bot.get_or_create(...)` | `POST /api/conversations` | create a bot from code (get_or_create is idempotent by exact title) |
-| `.ask(msg, history=, persist=)` | `POST /api/conversations/{id}/chat` | reply text (sets `include_history`, `persist`) |
-| `.stream(msg)` | `POST .../chat/stream` | generator of SSE `chunk`s |
-| `.add_text()` / `.add_file()` / `.knowledge()` | `…/knowledge` | manage the bot's RAG library |
-| `.delete()` | `DELETE /api/conversations/{id}` | remove the bot (+ its knowledge base) |
-
-Base URL comes from `MINICLOSEDAI_BASE_URL` (default `http://localhost:8095`). Errors raise `MiniClosedAIError`. Two runnable examples: [`example.py`](./docs/examples/client/example.py) (a two-bot pipeline) and [`router_example.py`](./docs/examples/client/router_example.py) — a self-bootstrapping router that creates a router + three specialist bots, classifies a support message, and dispatches to the matching expert (verified live; `--cleanup` removes the demo bots).
-
-This is the intended **multi-LLM management** shape: MiniClosedAI is the registry/host (each bot = a configured expert with its own model, knowledge, tools); the orchestration logic lives in *your* code, not inside MCAi. (Implementation note: the client uses `from __future__ import annotations` because the `Bot.list` classmethod shadows the builtin `list` in the class namespace, which would otherwise break the `-> list[dict]` hints.) For OpenAI-SDK ergonomics you can alternatively use the official `openai` package against `…:8095/v1` with `model="conv-<id>"`; the bespoke client exists for the native-only features (`include_history`, `persist`, knowledge upload).
-
-#### Router walkthrough — classify-then-dispatch over a bot fleet
-
-[`router_example.py`](./docs/examples/client/router_example.py) is the canonical multi-LLM example: one router bot classifies an inbound message, and the orchestration code dispatches to the matching specialist. It's self-contained — it bootstraps its own bots, so it runs against any instance with a tool-capable chat model.
-
-1. **Bootstrap (idempotent).** `Bot.get_or_create(title, MODEL, system_prompt, **params)` creates a router + three specialists keyed by exact title, so re-runs don't duplicate. The router prompt forces a single-word reply (`billing` / `technical` / `sales`) at `temperature=0.0` for determinism; specialists run at `0.3`.
-2. **Dispatch (the whole orchestration):**
-   ```python
-   label  = router.ask(message, history=False).strip().lower().split()[0]
-   expert = LABEL_TO_TITLE_MAP[label] (fallback: technical)
-   reply  = expert.ask(message, history=False)
-   ```
-   `history=False` on every call = pure-function semantics (each request independent; no shared history). `.split()[0]` defensively takes the first token in case a model adds stray words around the label.
-3. **Verified live** against `qwen3:8b`: "charged twice" → `billing`, "crashes on PDF upload" → `technical`, "annual discount?" → `sales`, each answered by the correct specialist.
-4. **Cleanup:** `--cleanup` enumerates `Bot.list()`, matches the demo titles, and calls `Bot.delete()` on each.
-
-Design point: the specialists are independent server-side experts — give any of them a different model, a RAG knowledge base, or MCP tools and the orchestration code is unchanged. The engine stays in the user's script; MCAi only hosts the bots. This is deliberately *not* a workflow runtime baked into MCAi (which would compete with LangGraph/CrewAI and bloat the core) — the classify-then-dispatch logic is ~10 lines of plain Python the user owns.
-
 ### Deployment surfaces — HTML widget
 
 The HTML's CORS-friendliness (MCAi ships `allow_origins=["*"]`) plus its auto-derived `MCAI_BASE_URL` makes it work in five useful contexts:
@@ -1475,6 +1433,51 @@ Bot replies typically contain `**bold**`, numbered lists, and inline `` `code` `
 - **Authentication.** Neither example includes auth headers. MCAi is local-first; if you front it with a reverse proxy that requires a bearer token, add an `Authorization` header to both clients (~1 line each).
 - **Multi-turn persistence beyond the script's lifetime.** Both clients keep history in-memory only. Reload the page (or rerun the script) and you start with a fresh `history`. To carry context across sessions, set `persist: true` in the Python call (and use `/api/conversations/{id}/chat` rather than the OpenAI-compat endpoint) or maintain history client-side and resend it on every request.
 - **Production hardening.** No retry-on-network-failure, no abort-controller for streaming, no rate-limiting. Add these in your production fork — the templates are deliberately readable above optimized.
+
+---
+
+## Client SDK — composing bots from your code
+
+The CLI and HTML examples are *end-user surfaces* for a single bot. For **orchestration** — one process that calls several bots, has them feed each other, or embeds each bot as a function inside an internal app — there's a zero-dependency single-file client at [`docs/examples/client/miniclosedai_client.py`](./docs/examples/client/miniclosedai_client.py) (stdlib only; copy, no `pip install`).
+
+```python
+from miniclosedai_client import Bot
+triage, writer = Bot.find("triage"), Bot.find("writer")
+intent = triage.ask(user_msg, history=False)
+reply  = writer.ask(f"Reply addressing: {intent}", history=False)
+```
+
+The `Bot` class is a thin wrapper over the per-conversation endpoints:
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `Bot(id)` / `Bot.find(title)` / `Bot.list()` | `GET /api/conversations` | address / discover bots |
+| `Bot.create(...)` / `Bot.get_or_create(...)` | `POST /api/conversations` | create a bot from code (get_or_create is idempotent by exact title) |
+| `.ask(msg, history=, persist=)` | `POST /api/conversations/{id}/chat` | reply text (sets `include_history`, `persist`) |
+| `.stream(msg)` | `POST .../chat/stream` | generator of SSE `chunk`s |
+| `.add_text()` / `.add_file()` / `.knowledge()` | `…/knowledge` | manage the bot's RAG library |
+| `.delete()` | `DELETE /api/conversations/{id}` | remove the bot (+ its knowledge base) |
+
+Base URL comes from `MINICLOSEDAI_BASE_URL` (default `http://localhost:8095`). Errors raise `MiniClosedAIError`. Two runnable examples: [`example.py`](./docs/examples/client/example.py) (a two-bot pipeline) and [`router_example.py`](./docs/examples/client/router_example.py) — a self-bootstrapping router that creates a router + three specialist bots, classifies a support message, and dispatches to the matching expert (verified live; `--cleanup` removes the demo bots).
+
+This is the intended **multi-LLM management** shape: MiniClosedAI is the registry/host (each bot = a configured expert with its own model, knowledge, tools); the orchestration logic lives in *your* code, not inside MCAi. (Implementation note: the client uses `from __future__ import annotations` because the `Bot.list` classmethod shadows the builtin `list` in the class namespace, which would otherwise break the `-> list[dict]` hints.) For OpenAI-SDK ergonomics you can alternatively use the official `openai` package against `…:8095/v1` with `model="conv-<id>"`; the bespoke client exists for the native-only features (`include_history`, `persist`, knowledge upload).
+
+### Router walkthrough — classify-then-dispatch over a bot fleet
+
+[`router_example.py`](./docs/examples/client/router_example.py) is the canonical multi-LLM example: one router bot classifies an inbound message, and the orchestration code dispatches to the matching specialist. It's self-contained — it bootstraps its own bots, so it runs against any instance with a tool-capable chat model.
+
+1. **Bootstrap (idempotent).** `Bot.get_or_create(title, MODEL, system_prompt, **params)` creates a router + three specialists keyed by exact title, so re-runs don't duplicate. The router prompt forces a single-word reply (`billing` / `technical` / `sales`) at `temperature=0.0` for determinism; specialists run at `0.3`.
+2. **Dispatch (the whole orchestration):**
+   ```python
+   label  = router.ask(message, history=False).strip().lower().split()[0]
+   expert = LABEL_TO_TITLE_MAP[label] (fallback: technical)
+   reply  = expert.ask(message, history=False)
+   ```
+   `history=False` on every call = pure-function semantics (each request independent; no shared history). `.split()[0]` defensively takes the first token in case a model adds stray words around the label.
+3. **Verified live** against `qwen3:8b`: "charged twice" → `billing`, "crashes on PDF upload" → `technical`, "annual discount?" → `sales`, each answered by the correct specialist.
+4. **Cleanup:** `--cleanup` enumerates `Bot.list()`, matches the demo titles, and calls `Bot.delete()` on each.
+
+Design point: the specialists are independent server-side experts — give any of them a different model, a RAG knowledge base, or MCP tools and the orchestration code is unchanged. The engine stays in the user's script; MCAi only hosts the bots. This is deliberately *not* a workflow runtime baked into MCAi (which would compete with LangGraph/CrewAI and bloat the core) — the classify-then-dispatch logic is ~10 lines of plain Python the user owns.
 
 ---
 

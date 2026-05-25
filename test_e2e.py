@@ -1100,6 +1100,129 @@ def _():
     assert "Hello" in chunks
 
 
+@test("clear: wipes messages but keeps config; 404 on missing conv")
+def _():
+    cid = _seed_conv_with_turn("clear-test")
+    assert len(client.get(f"/api/conversations/{cid}").json()["messages"]) >= 2
+    r = client.post(f"/api/conversations/{cid}/clear")
+    assert r.status_code == 200, r.text
+    after = client.get(f"/api/conversations/{cid}").json()
+    assert after["messages"] == []          # messages wiped
+    assert after["model"] == "ollama-a:3b"  # config kept
+    assert client.post("/api/conversations/999999/clear").status_code == 404
+
+
+@test("legacy /api/chat/stream: streams content via explicit backend")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    with client.stream("POST", "/api/chat/stream", json={
+        "model": "ollama-a:3b",
+        "messages": [{"role": "user", "content": "hi"}],
+        "backend_id": 1,
+    }) as r:
+        body = b"".join(r.iter_bytes())
+    evs = sse_events(body)
+    assert "Hello" in "".join(e.get("chunk", "") for e in evs)
+    assert any(e.get("end") for e in evs)
+
+
+@test("mcp: streaming endpoint runs the tool loop and emits the final answer")
+def _():
+    import mcp_host as mh
+    cid = _new_fake_conv("mcp-stream")
+    client.put(f"/api/conversations/{cid}/mcp",
+               json={"servers": [{"name": "t", "url": "http://x/mcp", "enabled": True}]})
+
+    async def fake_gather(servers):
+        spec = {"type": "function", "function": {
+            "name": "echo", "description": "echo", "parameters": {"type": "object"}}}
+        return ([spec], {"echo": {"url": "http://x/mcp", "headers": None}})
+
+    async def fake_call(url, headers, name, args):
+        return "tool ran"
+
+    og, oc = mh.gather_tools, mh.call_tool
+    mh.gather_tools, mh.call_tool = fake_gather, fake_call
+    try:
+        with client.stream("POST", f"/api/conversations/{cid}/chat/stream",
+                           json={"message": "use the tool"}) as r:
+            body = b"".join(r.iter_bytes())
+        evs = sse_events(body)
+        assert "final answer" in "".join(e.get("chunk", "") for e in evs).lower()
+        assert any(e.get("end") for e in evs)
+    finally:
+        mh.gather_tools, mh.call_tool = og, oc
+
+
+@test("knowledge: messages=[] form skips retrieval (single-message only)")
+def _():
+    cid = _new_fake_conv("kb-messages-form")
+    client.post(f"/api/conversations/{cid}/knowledge",
+                json={"filename": "g.txt", "text": "gamma gamma gamma facts"})
+    fake_ollama.captured.clear()
+    r = client.post(f"/api/conversations/{cid}/chat",
+                    json={"messages": [{"role": "user", "content": "about gamma"}]})
+    assert r.status_code == 200, r.text
+    chat_calls = [c for c in fake_ollama.captured if c["path"] == "/api/chat"]
+    sys_msg = chat_calls[-1]["payload"]["messages"][0]
+    assert "Knowledge base excerpts" not in sys_msg["content"]
+
+
+@test("mcp_host.gather_tools: dedups tool names (first wins) + skips unreachable/disabled")
+def _():
+    import asyncio
+    import mcp_host as mh
+
+    async def fake_list(url, headers=None):
+        if url == "http://a/mcp":
+            return [{"type": "function", "function": {"name": "shared", "description": "", "parameters": {}}},
+                    {"type": "function", "function": {"name": "only_a", "description": "", "parameters": {}}}]
+        if url == "http://b/mcp":
+            return [{"type": "function", "function": {"name": "shared", "description": "", "parameters": {}}}]
+        raise RuntimeError("unreachable")
+
+    orig = mh.list_tools
+    mh.list_tools = fake_list
+    try:
+        servers = [
+            {"url": "http://a/mcp", "enabled": True},
+            {"url": "http://b/mcp", "enabled": True},     # 'shared' collides → dropped
+            {"url": "http://dead/mcp", "enabled": True},  # raises → skipped
+            {"url": "http://a/mcp", "enabled": False},    # disabled → skipped
+        ]
+        tools, routing = asyncio.run(mh.gather_tools(servers))
+        names = [t["function"]["name"] for t in tools]
+        assert names == ["shared", "only_a"], names
+        assert routing["shared"]["url"] == "http://a/mcp"  # first server wins
+    finally:
+        mh.list_tools = orig
+
+
+@test("knowledge.py units: chunk_text overlap/empty, top_k ranking, context block")
+def _():
+    import knowledge as kn
+    assert kn.chunk_text("") == []
+    assert kn.chunk_text("short") == ["short"]
+    cs = kn.chunk_text("word " * 600, size=200, overlap=40)
+    assert len(cs) > 1
+    chunks = [{"embedding": kn.normalize([1.0, 0.0]), "text": "A", "filename": "a.txt"},
+              {"embedding": kn.normalize([0.0, 1.0]), "text": "B", "filename": "b.txt"}]
+    top = kn.top_k([0.9, 0.1], chunks, k=1)
+    assert top[0]["text"] == "A" and top[0]["score"] > 0.5
+    block = kn.build_context_block(top)
+    assert "Knowledge base excerpts" in block and "[source: a.txt]" in block
+
+
+@test("llm.tool_result_message: per-kind shape (ollama vs openai)")
+def _():
+    import llm as _llm
+    call = {"id": "call_1", "name": "echo", "arguments": {}}
+    assert _llm.tool_result_message({"kind": "ollama"}, call, "R") == \
+        {"role": "tool", "content": "R", "tool_name": "echo"}
+    assert _llm.tool_result_message({"kind": "openai"}, call, "R") == \
+        {"role": "tool", "tool_call_id": "call_1", "content": "R"}
+
+
 @test("edit-message: PATCH happy path — content updated, original preserved, edited_at set")
 def _():
     cid = _seed_conv_with_turn("edit-happy")

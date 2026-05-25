@@ -36,15 +36,16 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 13. [Getting good responses from small models](#getting-good-responses-from-small-models)
 14. [Curating fine-tuning data](#curating-fine-tuning-data)
 15. [Automated image labeling — hot dog / not hot dog](#automated-image-labeling--hot-dog--not-hot-dog)
-16. [Building a chatbot against a saved bot](#building-a-chatbot-against-a-saved-bot) · [Python client SDK](#python-client-sdk--compose-bots-in-your-own-code)
-17. [Sharing bots between instances](#sharing-bots-between-instances)
-18. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
-19. [LAN access](#lan-access)
-20. [Troubleshooting](#troubleshooting)
-21. [Testing](#testing)
-22. [Project layout](#project-layout)
-23. [Security](#security)
-24. [License](#license)
+16. [Building a chatbot against a saved bot](#building-a-chatbot-against-a-saved-bot)
+17. [Python client SDK](#python-client-sdk--compose-bots-in-your-own-code)
+18. [Sharing bots between instances](#sharing-bots-between-instances)
+19. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
+20. [LAN access](#lan-access)
+21. [Troubleshooting](#troubleshooting)
+22. [Testing](#testing)
+23. [Project layout](#project-layout)
+24. [Security](#security)
+25. [License](#license)
 
 ---
 
@@ -2127,7 +2128,9 @@ Both examples are recipe-agnostic — the fence-detection and action-extraction 
 
 The renderers (`render_action` in Python, `renderAction` in JS) walk the dict generically with `snake_case → "Title Case"` labels and nested-section grouping, so a `create_appointment` from the doctor's recipe renders just as cleanly as a `create_booking` from the hotel's.
 
-### Python client SDK — compose bots in your own code
+---
+
+## Python client SDK — compose bots in your own code
 
 For orchestration (one script that calls several bots, or each bot used as a function inside an internal app), there's a **zero-dependency single-file client**: [`docs/examples/client/miniclosedai_client.py`](./docs/examples/client/miniclosedai_client.py). Copy it into your project — it's stdlib only (`urllib` + `json`), no `pip install`.
 
@@ -2150,7 +2153,7 @@ Two runnable examples ship alongside it:
 
 This is the **multi-LLM pattern**: MiniClosedAI hosts each bot (its model, system prompt, knowledge, tools); your script is the orchestration layer that wires them together. Drop the same logic into a FastAPI route and you have a self-hosted multi-agent backend. (You can also just use the official `openai` SDK against `…:8095/v1` with `model="conv-<id>"` — the client adds the native niceties like `include_history`, `persist`, and knowledge upload that the OpenAI surface doesn't expose.)
 
-#### Router walkthrough — a fleet of specialists behind one classifier
+### Router walkthrough — a fleet of specialists behind one classifier
 
 [`router_example.py`](./docs/examples/client/router_example.py) is a complete, self-contained version of the dispatch pattern. Step by step:
 
