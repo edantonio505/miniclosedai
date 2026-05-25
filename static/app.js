@@ -87,6 +87,30 @@ const els = {
   langTabs: document.querySelectorAll('.tabs[data-group="lang"] .tab'),
   modeTabs: document.querySelectorAll('.tabs[data-group="mode"] .tab'),
   styleTabs: document.querySelectorAll('.tabs[data-group="style"] .tab'),
+  // Evals
+  evalsSummary: document.getElementById("evals-summary"),
+  evalsManageBtn: document.getElementById("evals-manage-btn"),
+  evalModalBackdrop: document.getElementById("eval-modal-backdrop"),
+  evalModalBot: document.getElementById("eval-modal-bot"),
+  evalModalClose: document.getElementById("eval-modal-close"),
+  evalInput: document.getElementById("eval-input"),
+  evalExpected: document.getElementById("eval-expected"),
+  evalAddBtn: document.getElementById("eval-add-btn"),
+  evalSeedBtn: document.getElementById("eval-seed-btn"),
+  evalCsvBtn: document.getElementById("eval-csv-btn"),
+  evalCsvFile: document.getElementById("eval-csv-file"),
+  evalClearBtn: document.getElementById("eval-clear-btn"),
+  evalList: document.getElementById("eval-list"),
+  evalEmpty: document.getElementById("eval-empty"),
+  evalMode: document.getElementById("eval-mode"),
+  evalRunBtn: document.getElementById("eval-run-btn"),
+  evalScore: document.getElementById("eval-score"),
+  evalResults: document.getElementById("eval-results"),
+  evalTarget: document.getElementById("eval-target"),
+  evalIters: document.getElementById("eval-iters"),
+  evalImproveBtn: document.getElementById("eval-improve-btn"),
+  evalImproveLog: document.getElementById("eval-improve-log"),
+  evalStatus: document.getElementById("eval-status"),
 };
 
 const DEFAULTS = { temperature: 0.7, max_tokens: 2048, top_p: 0.9, top_k: 40 };
@@ -607,6 +631,18 @@ function renderBotsPage() {
       openMcpModal(c.id, c.title);
     });
 
+    const evalBtn = document.createElement("button");
+    evalBtn.type = "button";
+    evalBtn.className = "bot-card-action";
+    evalBtn.setAttribute("aria-label", `Evals for ${c.title}`);
+    evalBtn.dataset.tooltip = "Evals — score & auto-improve";
+    evalBtn.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>';
+    evalBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      openEvalModal(c.id, c.title);
+    });
+
     const delBtn = document.createElement("button");
     delBtn.type = "button";
     delBtn.className = "bot-card-action danger";
@@ -622,6 +658,7 @@ function renderBotsPage() {
     actions.appendChild(codeBtn);
     actions.appendChild(kbBtn);
     actions.appendChild(mcpBtn);
+    actions.appendChild(evalBtn);
     actions.appendChild(delBtn);
     card.appendChild(actions);
 
@@ -810,12 +847,13 @@ function _botCardFlash(convId, msg, isError) {
 // ─── Manage Knowledge modal (view + add + delete a bot's documents) ─────
 let _kbModalConvId = null;
 
-function _kbModalSetStatus(msg, isError) {
+function _kbModalSetStatus(msg, isError, loading) {
   if (!els.kbModalStatus) return;
-  if (!msg) { els.kbModalStatus.hidden = true; els.kbModalStatus.textContent = ""; return; }
+  if (!msg) { els.kbModalStatus.hidden = true; els.kbModalStatus.textContent = ""; els.kbModalStatus.classList.remove("loading"); return; }
   els.kbModalStatus.hidden = false;
   els.kbModalStatus.textContent = msg;
   els.kbModalStatus.classList.toggle("kb-error", !!isError);
+  els.kbModalStatus.classList.toggle("loading", !!loading);
 }
 
 function _fmtBytes(n) {
@@ -1045,17 +1083,325 @@ function initMcpModalUI() {
   }
 }
 
+// ─── Evals: per-bot scoring + auto-improve ──────────────────────────────
+let _evalModalConvId = null;
+
+// Sidebar summary (just a count + a "Manage evals" affordance).
+async function loadEvals() {
+  if (!els.evalsSummary) return;
+  if (!state.conversationId) { els.evalsSummary.textContent = "No test cases yet."; return; }
+  try {
+    const r = await fetch(`/api/conversations/${state.conversationId}/eval/cases`);
+    const cases = r.ok ? ((await r.json()).cases || []) : [];
+    els.evalsSummary.textContent = cases.length
+      ? `${cases.length} test case${cases.length === 1 ? "" : "s"}.`
+      : "No test cases yet.";
+  } catch (_) {
+    els.evalsSummary.textContent = "No test cases yet.";
+  }
+}
+
+function _evalSetStatus(msg, isError) {
+  if (!els.evalStatus) return;
+  if (!msg) { els.evalStatus.hidden = true; els.evalStatus.textContent = ""; return; }
+  els.evalStatus.hidden = false;
+  els.evalStatus.textContent = msg;
+  els.evalStatus.classList.toggle("kb-error", !!isError);
+}
+
+function _renderEvalCases(cases) {
+  if (!els.evalList) return;
+  els.evalList.innerHTML = "";
+  const list = cases || [];
+  if (els.evalEmpty) els.evalEmpty.hidden = list.length > 0;
+  for (const c of list) {
+    const row = document.createElement("div");
+    row.className = "eval-case";
+
+    const info = document.createElement("div");
+    info.className = "eval-case-info";
+    const inp = document.createElement("span");
+    inp.className = "eval-case-input"; inp.textContent = c.input; inp.title = c.input;
+    const arrow = document.createElement("span");
+    arrow.className = "eval-case-arrow"; arrow.textContent = "→";
+    const exp = document.createElement("span");
+    exp.className = "eval-case-expected"; exp.textContent = c.expected; exp.title = c.expected;
+    info.appendChild(inp); info.appendChild(arrow); info.appendChild(exp);
+
+    const del = document.createElement("button");
+    del.type = "button"; del.className = "eval-case-del";
+    del.title = "Delete case"; del.setAttribute("aria-label", "Delete case");
+    del.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>';
+    del.addEventListener("click", async () => {
+      await fetch(`/api/conversations/${_evalModalConvId}/eval/cases/${c.id}`, { method: "DELETE" });
+      await _loadEvalModal();
+      loadEvals();
+    });
+
+    row.appendChild(info);
+    row.appendChild(del);
+    els.evalList.appendChild(row);
+  }
+}
+
+async function _loadEvalModal() {
+  if (_evalModalConvId == null) return;
+  try {
+    const r = await fetch(`/api/conversations/${_evalModalConvId}/eval/cases`);
+    _renderEvalCases(r.ok ? ((await r.json()).cases || []) : []);
+  } catch (_) { _renderEvalCases([]); }
+}
+
+function openEvalModal(convId, title) {
+  _evalModalConvId = convId;
+  if (els.evalModalBot) els.evalModalBot.textContent = title ? `— ${title}` : "";
+  els.evalScore.textContent = "";
+  els.evalResults.innerHTML = "";
+  els.evalImproveLog.innerHTML = "";
+  _evalSetStatus("", false);
+  _renderEvalCases([]);
+  _loadEvalModal();
+  if (els.evalModalBackdrop) els.evalModalBackdrop.classList.remove("hidden");
+}
+
+function closeEvalModal() {
+  if (els.evalModalBackdrop) els.evalModalBackdrop.classList.add("hidden");
+  _evalModalConvId = null;
+  loadEvals();  // refresh the sidebar count
+}
+
+async function _evalAddCase() {
+  const input = (els.evalInput.value || "").trim();
+  const expected = (els.evalExpected.value || "").trim();
+  if (!input || !expected) return;
+  await fetch(`/api/conversations/${_evalModalConvId}/eval/cases`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cases: [{ input, expected }] }),
+  });
+  els.evalInput.value = ""; els.evalExpected.value = "";
+  els.evalInput.focus();
+  await _loadEvalModal();
+}
+
+async function _evalSeed() {
+  _evalSetStatus("Seeding from chat history…", false);
+  const r = await fetch(`/api/conversations/${_evalModalConvId}/eval/seed`, { method: "POST" });
+  const n = r.ok ? (await r.json()).added : 0;
+  _evalSetStatus(n ? `Seeded ${n} case${n === 1 ? "" : "s"} from history.` : "No usable turns to seed from.", !n);
+  await _loadEvalModal();
+}
+
+// Minimal CSV parse: 2 columns (input,expected). Handles simple quoted fields.
+function _parseCsv(text) {
+  const rows = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    let cols;
+    if (line.includes('"')) {
+      cols = []; let cur = ""; let inq = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') { if (inq && line[i + 1] === '"') { cur += '"'; i++; } else inq = !inq; }
+        else if (ch === "," && !inq) { cols.push(cur); cur = ""; }
+        else cur += ch;
+      }
+      cols.push(cur);
+    } else {
+      cols = line.split(",");
+    }
+    if (cols.length >= 2) rows.push([cols[0].trim(), cols.slice(1).join(",").trim()]);
+  }
+  // Drop a header row if it looks like input,output/expected.
+  if (rows.length && /^(input)$/i.test(rows[0][0]) && /^(output|expected)$/i.test(rows[0][1])) rows.shift();
+  return rows;
+}
+
+async function _evalUploadCsv(file) {
+  if (!file) return;
+  const text = await file.text();
+  const rows = _parseCsv(text);
+  if (!rows.length) { _evalSetStatus("No (input,expected) rows found in the CSV.", true); return; }
+  await fetch(`/api/conversations/${_evalModalConvId}/eval/cases`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cases: rows.map(([input, expected]) => ({ input, expected })) }),
+  });
+  _evalSetStatus(`Imported ${rows.length} case${rows.length === 1 ? "" : "s"} from CSV.`, false);
+  await _loadEvalModal();
+}
+
+// Run the eval set once; render results; return the parsed body (for the loop).
+async function runEvals(mode) {
+  const payload = { mode };
+  if (mode === "judge") {
+    if (!_promptGenBackend || !_promptGenModel) {
+      _evalSetStatus("Judge mode needs a Prompt-Generator model — set one in Settings → Prompt Generator.", true);
+      return null;
+    }
+    payload.judge_backend_id = _promptGenBackend.id;
+    payload.judge_model = _promptGenModel;
+  }
+  els.evalRunBtn.disabled = true;
+  _evalSetStatus("Running…", false);
+  let body = null;
+  try {
+    const r = await fetch(`/api/conversations/${_evalModalConvId}/eval/run`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    body = await r.json();
+    if (!r.ok) { _evalSetStatus(body.detail || `Run failed (${r.status}).`, true); return null; }
+    _renderEvalResults(body);
+    _evalSetStatus("", false);
+  } catch (e) {
+    _evalSetStatus(`Run failed: ${e.message}`, true);
+  } finally {
+    els.evalRunBtn.disabled = false;
+  }
+  return body;
+}
+
+function _renderEvalResults(body) {
+  if (!body) return;
+  const pct = Math.round((body.accuracy || 0) * 100);
+  els.evalScore.textContent = `${pct}%  (${body.passed}/${body.total})`;
+  els.evalScore.style.color = pct === 100 ? "#16a34a" : (pct >= 50 ? "var(--text)" : "var(--danger)");
+  els.evalResults.innerHTML = "";
+  for (const res of (body.results || [])) {
+    const row = document.createElement("div");
+    row.className = "eval-case " + (res.passed ? "pass" : "fail");
+    const info = document.createElement("div");
+    info.className = "eval-case-info";
+    const inp = document.createElement("span");
+    inp.className = "eval-case-input"; inp.textContent = res.input; inp.title = res.input;
+    const got = document.createElement("span");
+    got.className = "eval-case-expected";
+    got.textContent = res.passed ? res.expected : `got: ${res.got}`;
+    got.title = `expected: ${res.expected}\ngot: ${res.got}`;
+    info.appendChild(inp);
+    const verdict = document.createElement("span");
+    verdict.className = "eval-case-verdict " + (res.passed ? "pass" : "fail");
+    verdict.textContent = res.passed ? "✓" : "✗";
+    row.appendChild(verdict);
+    row.appendChild(info);
+    info.appendChild(got);
+    els.evalResults.appendChild(row);
+  }
+}
+
+// Auto-improve: run → if below target, summarize failures into the existing
+// Improve-prompt flow → persist → re-run, up to maxIters. Keep the best prompt.
+async function autoImproveLoop() {
+  const mode = els.evalMode.value;
+  const target = Math.max(1, Math.min(100, parseInt(els.evalTarget.value, 10) || 100)) / 100;
+  const maxIters = Math.max(1, Math.min(10, parseInt(els.evalIters.value, 10) || 3));
+  const ta = document.getElementById("system-prompt");
+  if (!ta) return;
+  if (!ta.value.trim()) {
+    _evalSetStatus("Auto-improve needs a non-empty system prompt to improve.", true);
+    return;
+  }
+  if (!_promptGenBackend || !_promptGenModel) {
+    _evalSetStatus("Auto-improve needs a Prompt-Generator model — set one in Settings → Prompt Generator.", true);
+    return;
+  }
+  els.evalImproveBtn.disabled = true;
+  els.evalImproveLog.innerHTML = "";
+  let best = null;
+  try {
+    for (let i = 0; i < maxIters; i++) {
+      const res = await runEvals(mode);
+      if (!res) break;  // run failed / judge misconfigured
+      const promptNow = ta.value;
+      const line = document.createElement("div");
+      line.textContent = `iter ${i + 1}: ${Math.round(res.accuracy * 100)}% (${res.passed}/${res.total})`;
+      els.evalImproveLog.appendChild(line);
+      if (!best || res.accuracy > best.accuracy) best = { accuracy: res.accuracy, prompt: promptNow };
+      if (res.accuracy >= target) { line.classList.add("best"); break; }
+      if (i === maxIters - 1) break;  // no improve after the last run
+      const failures = (res.results || []).filter(r => !r.passed);
+      const summary =
+        "These test cases failed. Rewrite the system prompt so they produce the EXPECTED " +
+        "output, without breaking the ones that already pass. Be specific and concise.\n\n" +
+        failures.map(f => `INPUT: ${f.input}\nEXPECTED: ${f.expected}\nGOT: ${f.got}`).join("\n\n");
+      _evalSetStatus(`Improving prompt (iter ${i + 1})…`, false);
+      await _runPromptGeneration(summary);   // streams a new prompt into #system-prompt
+      await flushPendingSave();              // persist so the next run scores it
+    }
+    // Restore the best-scoring prompt and persist it.
+    if (best && ta.value !== best.prompt) {
+      ta.value = best.prompt;
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+      await flushPendingSave();
+    }
+    if (best) {
+      const done = document.createElement("div");
+      done.className = "best";
+      done.textContent = `✓ best: ${Math.round(best.accuracy * 100)}% (kept this prompt)`;
+      els.evalImproveLog.appendChild(done);
+    }
+    _evalSetStatus("", false);
+  } finally {
+    els.evalImproveBtn.disabled = false;
+  }
+}
+
+function initEvalsUI() {
+  if (els.evalsManageBtn) {
+    els.evalsManageBtn.addEventListener("click", () => {
+      if (!state.conversationId) { alert("Open or create a bot first, then add evals."); return; }
+      const c = _botsState.cache.find(x => x.id === state.conversationId);
+      openEvalModal(state.conversationId, c ? c.title : "");
+    });
+  }
+}
+
+function initEvalModalUI() {
+  if (els.evalModalClose) els.evalModalClose.addEventListener("click", closeEvalModal);
+  if (els.evalModalBackdrop) {
+    els.evalModalBackdrop.addEventListener("click", e => {
+      if (e.target === els.evalModalBackdrop) closeEvalModal();
+    });
+  }
+  if (els.evalAddBtn) els.evalAddBtn.addEventListener("click", _evalAddCase);
+  if (els.evalExpected) {
+    els.evalExpected.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); _evalAddCase(); }
+    });
+  }
+  if (els.evalSeedBtn) els.evalSeedBtn.addEventListener("click", _evalSeed);
+  if (els.evalClearBtn) {
+    els.evalClearBtn.addEventListener("click", async () => {
+      if (!confirm("Delete all test cases for this bot?")) return;
+      await fetch(`/api/conversations/${_evalModalConvId}/eval/cases`, { method: "DELETE" });
+      await _loadEvalModal();
+      loadEvals();
+    });
+  }
+  if (els.evalCsvBtn && els.evalCsvFile) {
+    els.evalCsvBtn.addEventListener("click", () => els.evalCsvFile.click());
+    els.evalCsvFile.addEventListener("change", async () => {
+      await _evalUploadCsv(els.evalCsvFile.files[0]);
+      els.evalCsvFile.value = "";
+    });
+  }
+  if (els.evalRunBtn) els.evalRunBtn.addEventListener("click", () => runEvals(els.evalMode.value));
+  if (els.evalImproveBtn) els.evalImproveBtn.addEventListener("click", autoImproveLoop);
+}
+
 // ─── Per-bot Knowledge base (RAG) ───────────────────────────────────────
 // Upload PDFs / txt / md to the open bot. PDFs go through the existing
 // /api/extract-pdf endpoint; text files are read in-browser. The extracted
 // text is POSTed to the bot's knowledge endpoint, which chunks + embeds it.
 
-function _kbSetStatus(msg, isError) {
+function _kbSetStatus(msg, isError, loading) {
   if (!els.kbStatus) return;
-  if (!msg) { els.kbStatus.hidden = true; els.kbStatus.textContent = ""; return; }
+  if (!msg) { els.kbStatus.hidden = true; els.kbStatus.textContent = ""; els.kbStatus.classList.remove("loading"); return; }
   els.kbStatus.hidden = false;
   els.kbStatus.textContent = msg;
   els.kbStatus.classList.toggle("kb-error", !!isError);
+  els.kbStatus.classList.toggle("loading", !!loading);
 }
 
 function renderKnowledge(docs) {
@@ -1123,7 +1469,8 @@ async function _kbExtractText(file) {
   if (isPdf) {
     const fd = new FormData();
     fd.append("file", file);
-    const r = await fetch("/api/extract-pdf", { method: "POST", body: fd });
+    // full=1 → book-friendly caps; the extracted text is chunked + embedded.
+    const r = await fetch("/api/extract-pdf?full=1", { method: "POST", body: fd });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       throw new Error(err.detail || `PDF extraction failed (${r.status})`);
@@ -1143,7 +1490,7 @@ async function _uploadKnowledgeToConv(convId, files, onStatus) {
   let added = 0;
   for (let i = 0; i < list.length; i++) {
     const file = list[i];
-    if (onStatus) onStatus(`Processing ${file.name} (${i + 1}/${list.length})…`, false);
+    if (onStatus) onStatus(`Processing ${file.name} (${i + 1}/${list.length})…`, false, true);  // loading
     try {
       const text = await _kbExtractText(file);
       if (!text.trim()) {
@@ -1426,6 +1773,7 @@ async function openConversation(id) {
   renderMessages();
   loadKnowledge();
   loadMcp();
+  loadEvals();
 }
 
 async function newConversation() {
@@ -1465,6 +1813,7 @@ async function newConversation() {
   loadKnowledge();  // fresh bot → empty library
   _mcpSetStatus("", false);
   loadMcp();
+  loadEvals();
 
   // Reset the sidebar so the user sees the clean config they're about to edit.
   // Must happen AFTER state.conversationId is set so the debounced auto-save
@@ -4438,6 +4787,8 @@ async function init() {
   initKnowledgeModalUI();
   initMcpUI();
   initMcpModalUI();
+  initEvalsUI();
+  initEvalModalUI();
   startPullPoller();
   initUpgradeUI();
   initImportBotUI();

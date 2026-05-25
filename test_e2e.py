@@ -901,6 +901,10 @@ def _():
     assert 'id="kb-modal-list"' in body
     assert 'id="mcp-modal-backdrop"' in body
     assert 'id="mcp-modal-list"' in body
+    # Evals panel + modal.
+    assert 'id="evals-manage-btn"' in body
+    assert 'id="eval-modal-backdrop"' in body
+    assert 'id="eval-run-btn"' in body
 
 
 @test("static: app.js is served and contains recent helpers")
@@ -929,6 +933,9 @@ def _():
         # Manage Knowledge + Manage Extensions modals
         "openKnowledgeModal", "_loadKbModal", "initKnowledgeModalUI",
         "openMcpModal", "_loadMcpModal", "initMcpModalUI",
+        # Evals
+        "loadEvals", "openEvalModal", "runEvals", "autoImproveLoop",
+        "initEvalsUI", "initEvalModalUI",
     ]
     for needle in needles:
         assert needle in r.text, f"missing {needle} in served app.js"
@@ -1027,6 +1034,20 @@ def _():
     assert "gamma sector seven" in sys_msg["content"]
 
 
+@test("knowledge: a bot on a non-Ollama backend still embeds via local Ollama")
+def _():
+    # Reproduces the relay bug: a bot pinned to an OpenAI-compat / cloud backend
+    # that doesn't serve the embed model must still embed locally (built-in Ollama).
+    _reseed_builtin_to_fake_ollama()        # built-in id=1 = fake Ollama (has /api/embed)
+    bid = _add_openai_backend()             # fake OpenAI-compat (no /api/embed)
+    cid = client.post("/api/conversations", json={
+        "title": "kb-relay", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    r = client.post(f"/api/conversations/{cid}/knowledge",
+                    json={"filename": "n.txt", "text": "alpha alpha facts about alpha."})
+    assert r.status_code == 200, r.text     # embeds on built-in Ollama, not the OpenAI bot backend
+    assert r.json()["chunk_count"] >= 1
+
+
 @test("knowledge: deleting a conversation cascades to its knowledge base")
 def _():
     cid = _new_fake_conv("kb-cascade")
@@ -1098,6 +1119,96 @@ def _():
     evs = sse_events(body)
     chunks = "".join(e.get("chunk", "") for e in evs)
     assert "Hello" in chunks
+
+
+@test("eval: case CRUD — add (bulk), list, delete, clear")
+def _():
+    cid = _new_fake_conv("eval-crud")
+    assert client.get(f"/api/conversations/{cid}/eval/cases").json()["cases"] == []
+    r = client.post(f"/api/conversations/{cid}/eval/cases", json={"cases": [
+        {"input": "a", "expected": "1"}, {"input": "b", "expected": "2"}]})
+    assert r.status_code == 200 and r.json()["added"] == 2, r.text
+    cases = client.get(f"/api/conversations/{cid}/eval/cases").json()["cases"]
+    assert len(cases) == 2 and cases[0]["input"] == "a"
+    assert client.delete(f"/api/conversations/{cid}/eval/cases/{cases[0]['id']}").status_code == 200
+    assert len(client.get(f"/api/conversations/{cid}/eval/cases").json()["cases"]) == 1
+    client.delete(f"/api/conversations/{cid}/eval/cases")
+    assert client.get(f"/api/conversations/{cid}/eval/cases").json()["cases"] == []
+
+
+@test("eval: seed from chat history creates input/expected pairs")
+def _():
+    cid = _seed_conv_with_turn("eval-seed")  # streams one user→assistant turn
+    r = client.post(f"/api/conversations/{cid}/eval/seed")
+    assert r.status_code == 200 and r.json()["added"] >= 1, r.text
+    cases = client.get(f"/api/conversations/{cid}/eval/cases").json()["cases"]
+    assert cases and cases[0]["input"] == "hi"
+    assert "Hello world" in cases[0]["expected"]
+
+
+@test("eval run: exact mode scores reply vs expected")
+def _():
+    cid = _new_fake_conv("eval-exact")  # fake bot always replies "Hello world!"
+    client.post(f"/api/conversations/{cid}/eval/cases", json={"cases": [
+        {"input": "x", "expected": "Hello world!"},    # passes (normalized match)
+        {"input": "y", "expected": "totally wrong"}]})  # fails
+    r = client.post(f"/api/conversations/{cid}/eval/run", json={"mode": "exact"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 2 and body["passed"] == 1 and body["accuracy"] == 0.5
+    by_input = {x["input"]: x for x in body["results"]}
+    assert by_input["x"]["passed"] is True and by_input["y"]["passed"] is False
+
+
+@test("eval run: contains mode passes on substring match")
+def _():
+    cid = _new_fake_conv("eval-contains")
+    client.post(f"/api/conversations/{cid}/eval/cases", json={"cases": [
+        {"input": "x", "expected": "world"}]})   # 'world' ⊂ 'Hello world!'
+    body = client.post(f"/api/conversations/{cid}/eval/run", json={"mode": "contains"}).json()
+    assert body["passed"] == 1 and body["accuracy"] == 1.0
+
+
+@test("eval run: judge mode scores via the grader LLM")
+def _():
+    import llm as _llm
+    cid = _new_fake_conv("eval-judge")
+    client.post(f"/api/conversations/{cid}/eval/cases", json={"cases": [
+        {"input": "x", "expected": "anything goes"}]})
+    real_chat = _llm.chat
+
+    async def fake_chat(backend, model, messages, **kw):
+        # The grader call carries the judge system prompt; return YES for it,
+        # delegate real bot calls to the actual fake-backed path.
+        sys = messages[0].get("content", "") if messages else ""
+        if "grading assistant" in sys:
+            return "YES"
+        return await real_chat(backend, model, messages, **kw)
+
+    _llm.chat = fake_chat
+    try:
+        body = client.post(f"/api/conversations/{cid}/eval/run", json={
+            "mode": "judge", "judge_backend_id": 1, "judge_model": "ollama-a:3b"}).json()
+        assert body["passed"] == 1 and body["accuracy"] == 1.0, body
+    finally:
+        _llm.chat = real_chat
+
+
+@test("eval run: judge mode without judge_model is rejected (400)")
+def _():
+    cid = _new_fake_conv("eval-judge-bad")
+    client.post(f"/api/conversations/{cid}/eval/cases", json={"cases": [{"input": "x", "expected": "y"}]})
+    r = client.post(f"/api/conversations/{cid}/eval/run", json={"mode": "judge"})
+    assert r.status_code == 400, r.text
+
+
+@test("eval: deleting a conversation cascades to its eval cases")
+def _():
+    cid = _new_fake_conv("eval-cascade")
+    client.post(f"/api/conversations/{cid}/eval/cases", json={"cases": [{"input": "a", "expected": "b"}]})
+    assert client.get(f"/api/conversations/{cid}/eval/cases").json()["cases"]
+    client.delete(f"/api/conversations/{cid}")
+    assert client.get(f"/api/conversations/{cid}/eval/cases").json()["cases"] == []
 
 
 @test("clear: wipes messages but keeps config; 404 on missing conv")
@@ -2211,7 +2322,7 @@ def _():
 
 @test("extract-pdf: oversize upload is rejected (413)")
 def _():
-    # 11 MB of zero bytes — past the 10 MB cap.
+    # 11 MB of zero bytes — past the 10 MB chat-attachment cap.
     big = b"\x00" * (11 * 1024 * 1024)
     r = client.post(
         "/api/extract-pdf",
@@ -2219,6 +2330,20 @@ def _():
     )
     assert r.status_code == 413, r.text
     assert "too large" in r.json()["detail"].lower()
+
+
+@test("extract-pdf: full=1 raises the byte cap (knowledge-base path)")
+def _():
+    # Same 11 MB that the default path rejects — full=1 must NOT 413 it (it's
+    # under the book-friendly cap). The zero bytes aren't a valid PDF, so it
+    # gets a 400 parse error instead — proving the size gate was lifted, not hit.
+    big = b"\x00" * (11 * 1024 * 1024)
+    r = client.post(
+        "/api/extract-pdf?full=1",
+        files={"file": ("book.pdf", big, "application/pdf")},
+    )
+    assert r.status_code != 413, r.text
+    assert r.status_code == 400, r.text
 
 
 @test("extract-pdf: malformed bytes return 400")

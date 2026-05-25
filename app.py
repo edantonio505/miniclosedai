@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import pypdf
 
 import db
+import evals
 import knowledge
 import llm
 import logs as chat_logs
@@ -702,25 +703,37 @@ async def api_cancel_pull(backend_id: int, name: str):
 # This endpoint is the only file-upload path; everything else (.txt, .md,
 # .csv, .json, source code, images) is read in JS via FileReader.
 
-PDF_MAX_BYTES = 10 * 1024 * 1024     # 10 MB raw upload cap
-PDF_MAX_PAGES = 50                   # only the first 50 pages are scanned
-PDF_MAX_CHARS = 30_000               # output truncated past this many chars
+# Caps for the CHAT-ATTACHMENT path (a PDF stuffed into one chat turn): modest,
+# so a giant doc can't blow the model's context.
+PDF_MAX_BYTES = int(os.environ.get("MINICLOSEDAI_PDF_MAX_MB", "10")) * 1024 * 1024
+PDF_MAX_PAGES = int(os.environ.get("MINICLOSEDAI_PDF_MAX_PAGES", "50"))
+PDF_MAX_CHARS = int(os.environ.get("MINICLOSEDAI_PDF_MAX_CHARS", "30000"))
+# Book-friendly caps for the KNOWLEDGE-BASE path (?full=1): the full text is
+# chunked + embedded, so length is not a context concern — let whole books in.
+PDF_FULL_MAX_BYTES = int(os.environ.get("MINICLOSEDAI_PDF_FULL_MAX_MB", "200")) * 1024 * 1024
+PDF_FULL_MAX_PAGES = int(os.environ.get("MINICLOSEDAI_PDF_FULL_MAX_PAGES", "5000"))
+PDF_FULL_MAX_CHARS = int(os.environ.get("MINICLOSEDAI_PDF_FULL_MAX_CHARS", "5000000"))
 
 
 @app.post("/api/extract-pdf")
-async def api_extract_pdf(file: UploadFile = File(...)):
+async def api_extract_pdf(file: UploadFile = File(...), full: bool = False):
     """Extract plain text from an uploaded PDF.
 
-    Returns ``{filename, page_count, char_count, truncated, text}``. ``truncated``
-    is true if either the page cap or the character cap was hit; the caller
-    can surface that to the user. Image-only / scanned PDFs come back with
-    short or empty ``text`` — that's a pypdf limitation, not a bug here.
+    `full=true` uses the book-friendly caps (knowledge-base ingestion — whole
+    books); the default modest caps are for the chat-attachment path. Returns
+    ``{filename, page_count, char_count, truncated, text}``. ``truncated`` is
+    true if a page/char cap was hit. Image-only / scanned PDFs come back with
+    short or empty ``text`` — a pypdf limitation, not a bug here.
     """
+    max_bytes = PDF_FULL_MAX_BYTES if full else PDF_MAX_BYTES
+    max_pages = PDF_FULL_MAX_PAGES if full else PDF_MAX_PAGES
+    max_chars = PDF_FULL_MAX_CHARS if full else PDF_MAX_CHARS
+
     raw = await file.read()
-    if len(raw) > PDF_MAX_BYTES:
+    if len(raw) > max_bytes:
         raise HTTPException(
             status_code=413,
-            detail=f"PDF too large ({len(raw) / 1024 / 1024:.1f} MB > {PDF_MAX_BYTES // 1024 // 1024} MB cap)",
+            detail=f"PDF too large ({len(raw) / 1024 / 1024:.1f} MB > {max_bytes // 1024 // 1024} MB cap)",
         )
     try:
         reader = pypdf.PdfReader(io.BytesIO(raw))
@@ -728,10 +741,10 @@ async def api_extract_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
 
     total_pages = len(reader.pages)
-    pages_scanned = min(total_pages, PDF_MAX_PAGES)
+    pages_scanned = min(total_pages, max_pages)
     chunks: list[str] = []
     chars = 0
-    truncated = total_pages > PDF_MAX_PAGES
+    truncated = total_pages > max_pages
     for i in range(pages_scanned):
         try:
             page_text = reader.pages[i].extract_text() or ""
@@ -740,13 +753,13 @@ async def api_extract_pdf(file: UploadFile = File(...)):
         # Header lets the model see page boundaries when scanning multi-page docs.
         chunks.append(f"--- Page {i + 1} ---\n{page_text.strip()}")
         chars += len(page_text)
-        if chars >= PDF_MAX_CHARS:
+        if chars >= max_chars:
             truncated = True
             break
 
     text = "\n\n".join(chunks)
-    if len(text) > PDF_MAX_CHARS:
-        text = text[:PDF_MAX_CHARS]
+    if len(text) > max_chars:
+        text = text[:max_chars]
         truncated = True
 
     return {
@@ -902,9 +915,10 @@ def api_update_conversation(conv_id: int, data: ConversationUpdate):
 def api_delete_conversation(conv_id: int):
     with db.get_conn() as conn:
         conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
-        # Logical-FK cleanup: drop this bot's knowledge base too.
+        # Logical-FK cleanup: drop this bot's knowledge base + eval cases too.
         conn.execute("DELETE FROM kb_chunks WHERE conversation_id = ?", (conv_id,))
         conn.execute("DELETE FROM kb_documents WHERE conversation_id = ?", (conv_id,))
+        conn.execute("DELETE FROM eval_cases WHERE conversation_id = ?", (conv_id,))
         conn.commit()
     return {"ok": True}
 
@@ -947,11 +961,44 @@ def _conv_exists(conv_id: int) -> dict:
     return db.row_to_dict(row)
 
 
+def _resolve_embed_backend() -> dict:
+    """Pick a backend to compute embeddings on.
+
+    Embeddings are a LOCAL concern: `nomic-embed-text` lives on a local Ollama,
+    not on a cloud chat relay. A bot can be pinned to a remote/relay backend for
+    *chat* (e.g. Interdata) that doesn't serve the embedding model — so we do NOT
+    use the bot's chat backend here. Resolution order:
+      1. MINICLOSEDAI_EMBED_BACKEND_ID env override.
+      2. The built-in local Ollama (is_builtin=1), if enabled.
+      3. Any other enabled Ollama backend (lowest id first).
+    Raises 503 if no Ollama-kind backend is available at all.
+    """
+    override = os.environ.get("MINICLOSEDAI_EMBED_BACKEND_ID")
+    with db.get_conn() as conn:
+        if override and override.strip().isdigit():
+            row = conn.execute("SELECT * FROM backends WHERE id = ?", (int(override),)).fetchone()
+            if row:
+                return db.row_to_dict(row)
+        row = conn.execute(
+            "SELECT * FROM backends WHERE kind = 'ollama' AND enabled = 1 "
+            "ORDER BY is_builtin DESC, id ASC LIMIT 1"
+        ).fetchone()
+    if not row:
+        raise HTTPException(
+            503,
+            f"No local Ollama backend is available to compute embeddings. The "
+            f"knowledge base needs an enabled Ollama endpoint with '{EMBED_MODEL}' "
+            f"pulled (`ollama pull {EMBED_MODEL}`). Your bot's chat backend can "
+            f"still be a cloud/relay endpoint — embeddings just run locally.",
+        )
+    return db.row_to_dict(row)
+
+
 @app.post("/api/conversations/{conv_id}/knowledge")
 async def api_add_knowledge(conv_id: int, doc: KnowledgeDocCreate):
     """Chunk + embed a document and store it in this bot's knowledge base."""
-    conv = _conv_exists(conv_id)
-    backend = _load_backend(conv.get("backend_id", 1))
+    _conv_exists(conv_id)
+    backend = _resolve_embed_backend()
 
     chunks = knowledge.chunk_text(doc.text)
     if not chunks:
@@ -962,9 +1009,10 @@ async def api_add_knowledge(conv_id: int, doc: KnowledgeDocCreate):
     except (httpx.ConnectError, RuntimeError, ValueError) as e:
         raise HTTPException(
             502,
-            f"Embedding failed with model '{EMBED_MODEL}': {e}. "
-            f"Make sure the embedding model is available on this bot's backend "
-            f"(e.g. run `ollama pull {EMBED_MODEL}`).",
+            f"Embedding failed with model '{EMBED_MODEL}' on backend "
+            f"'{backend.get('name', '?')}': {e}. Pull it there with "
+            f"`ollama pull {EMBED_MODEL}`, or set MINICLOSEDAI_EMBED_BACKEND_ID "
+            f"to an Ollama endpoint that serves it.",
         )
     if len(vecs) != len(chunks):
         raise HTTPException(502, "Embedding backend returned the wrong number of vectors.")
@@ -1034,6 +1082,10 @@ async def _augment_messages_with_knowledge(
     prepend them to the system message. Best-effort: any failure (embedding
     model not pulled, backend down) is swallowed so a knowledge hiccup never
     blocks a normal chat turn — the bot just answers without augmentation.
+
+    `backend` is the bot's CHAT backend (unused for embedding): the query is
+    embedded on the local embed backend so chunks + query use the same model,
+    even when the bot chats through a cloud relay. See _resolve_embed_backend.
     """
     if not query_text or not query_text.strip():
         return
@@ -1050,7 +1102,8 @@ async def _augment_messages_with_knowledge(
         ).fetchall()
     names = {r["id"]: r["filename"] for r in docrows}
     try:
-        qvecs = await llm.embed(backend, EMBED_MODEL, [query_text])
+        embed_backend = _resolve_embed_backend()
+        qvecs = await llm.embed(embed_backend, EMBED_MODEL, [query_text])
     except Exception:
         return
     if not qvecs or not qvecs[0]:
@@ -1161,6 +1214,154 @@ async def _run_mcp_tool_loop(model: str, messages: list[dict], eff: dict,
     # Exhausted the iteration budget — ask for a final answer without tools.
     final = await llm.chat(backend, model, convo, **params)
     return final or "(stopped: reached the maximum number of tool-call rounds)"
+
+
+# ---------- Per-bot evaluation (scoring) ----------
+
+class EvalCaseSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    input: str = Field(..., min_length=1)
+    expected: str = Field(..., min_length=1)
+
+
+class EvalCasesCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cases: list[EvalCaseSpec]
+
+
+class EvalRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["exact", "contains", "judge"] = "exact"
+    # For judge mode — which model grades. Supplied by the frontend from the
+    # user's Prompt-Generator model choice. Ignored for exact/contains.
+    judge_backend_id: int | None = None
+    judge_model: str | None = None
+
+
+@app.post("/api/conversations/{conv_id}/eval/cases")
+def api_add_eval_cases(conv_id: int, body: EvalCasesCreate):
+    """Bulk-add test cases to a bot's eval set."""
+    _conv_exists(conv_id)
+    with db.get_conn() as conn:
+        for c in body.cases:
+            conn.execute(
+                "INSERT INTO eval_cases (conversation_id, input, expected) VALUES (?, ?, ?)",
+                (conv_id, c.input, c.expected),
+            )
+        conn.commit()
+    return {"added": len(body.cases)}
+
+
+@app.get("/api/conversations/{conv_id}/eval/cases")
+def api_list_eval_cases(conv_id: int):
+    """List a bot's eval cases (newest first)."""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, input, expected, created_at FROM eval_cases
+               WHERE conversation_id = ? ORDER BY id ASC""",
+            (conv_id,),
+        ).fetchall()
+    return {"cases": [dict(r) for r in rows]}
+
+
+@app.delete("/api/conversations/{conv_id}/eval/cases/{case_id}")
+def api_delete_eval_case(conv_id: int, case_id: int):
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM eval_cases WHERE id = ? AND conversation_id = ?",
+            (case_id, conv_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Eval case not found")
+    return {"ok": True}
+
+
+@app.delete("/api/conversations/{conv_id}/eval/cases")
+def api_clear_eval_cases(conv_id: int):
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM eval_cases WHERE conversation_id = ?", (conv_id,))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/conversations/{conv_id}/eval/seed")
+def api_seed_eval_cases(conv_id: int):
+    """Seed eval cases from this bot's saved chat history — each user→assistant
+    pair becomes a case (input=user turn, expected=assistant reply). Reuses the
+    same pair extraction as the dataset CSV export."""
+    conv = _conv_exists(conv_id)
+    pairs = list(_iter_pairs(conv.get("messages", []) or []))
+    added = 0
+    with db.get_conn() as conn:
+        for user_msg, assistant_msg in pairs:
+            inp = _content_text_for_export(user_msg.get("display_text", user_msg.get("content", "")))
+            exp = _content_text_for_export(assistant_msg.get("content", ""))
+            if not inp.strip() or not exp.strip():
+                continue
+            conn.execute(
+                "INSERT INTO eval_cases (conversation_id, input, expected) VALUES (?, ?, ?)",
+                (conv_id, inp, exp),
+            )
+            added += 1
+        conn.commit()
+    return {"added": added}
+
+
+@app.post("/api/conversations/{conv_id}/eval/run")
+async def api_run_eval(conv_id: int, req: EvalRunRequest):
+    """Run the bot over its eval set and score each case. Returns per-case
+    results + overall accuracy. Scoring mode: exact | contains | judge."""
+    _conv_exists(conv_id)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, input, expected FROM eval_cases WHERE conversation_id = ? ORDER BY id ASC",
+            (conv_id,),
+        ).fetchall()
+    cases = [dict(r) for r in rows]
+    if not cases:
+        return {"mode": req.mode, "total": 0, "passed": 0, "accuracy": 0.0, "results": []}
+
+    judge_backend = None
+    if req.mode == "judge":
+        if not req.judge_model:
+            raise HTTPException(400, "judge mode requires judge_model (and judge_backend_id).")
+        judge_backend = _load_backend(req.judge_backend_id)
+
+    results = []
+    passed = 0
+    for c in cases:
+        try:
+            reply = await _run_conv_message(conv_id, c["input"])
+        except (httpx.ConnectError, RuntimeError) as e:
+            reply = f"(error: {e})"
+        if req.mode == "judge":
+            try:
+                verdict = await llm.chat(
+                    judge_backend, req.judge_model,
+                    evals.build_judge_messages(c["input"], c["expected"], reply),
+                    temperature=0.0, max_tokens=8, think=False,
+                )
+                ok = evals.parse_judge(verdict)
+            except (httpx.ConnectError, RuntimeError):
+                ok = False
+        else:
+            ok = evals.score(req.mode, reply, c["expected"])
+        if ok:
+            passed += 1
+        results.append({
+            "case_id": c["id"], "input": c["input"], "expected": c["expected"],
+            "got": reply, "passed": ok,
+        })
+
+    total = len(cases)
+    return {
+        "mode": req.mode,
+        "total": total,
+        "passed": passed,
+        "accuracy": round(passed / total, 4),
+        "results": results,
+    }
 
 
 class MessageEditRequest(BaseModel):
@@ -1964,6 +2165,25 @@ def _persist_conv_chat_turn(
             (json.dumps(existing), conv_id),
         )
         conn.commit()
+
+
+async def _run_conv_message(conv_id: int, message: str) -> str:
+    """Run ONE message through a bot's full configured path (knowledge + MCP +
+    relay), one-shot: no history, no persist, no chat-log entry. Used by the
+    eval runner so a scored response is exactly what the bot would return in
+    production. Mirrors the core sequence of api_conv_chat."""
+    req = ConversationChatRequest(message=message, include_history=False, persist=False)
+    conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
+    mcp_servers = _enabled_mcp_servers(conv)
+    await _augment_messages_with_knowledge(conv_id, messages, message, backend)
+    backend = await _maybe_override_to_relay(backend, eff["model"])
+    if mcp_servers:
+        return await _run_mcp_tool_loop(eff["model"], messages, eff, backend, mcp_servers)
+    return await llm.chat(
+        backend, eff["model"], messages,
+        temperature=eff["temperature"], max_tokens=eff["max_tokens"],
+        top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
+    )
 
 
 @app.post("/api/conversations/{conv_id}/chat")
