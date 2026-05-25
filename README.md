@@ -57,6 +57,8 @@ MiniClosedAI is a single-user, single-process web app that wraps **local** LLMs 
 - 🎛️ **Live parameter sliders** — temperature, max tokens, top-p, top-k, thinking level, max thinking tokens. Every change auto-saves to the active conversation.
 - 🔁 **Per-chat microservice endpoints** — each saved conversation is an addressable URL that replays your GUI-configured bot. Callers just send `{"message": "..."}`.
 - 💭 **Reasoning-model aware** — `thinking` and `content` tokens from models like qwen3, deepseek-r1, and gpt-oss stream separately; "thoughts" appear in a collapsible block. `max_thinking_tokens` is a soft cap: visible reasoning is hidden but the model keeps running so the answer still arrives.
+- 📚 **Per-bot knowledge base (RAG) — "give your bot books"** — upload PDFs / `.txt` / `.md` to a bot from the sidebar **Knowledge** panel and it answers grounded in them. **No vector database to install:** SQLite *is* the store and Ollama provides the embeddings (`nomic-embed-text` by default). Chunks are embedded once at upload; each turn, the user's question is embedded and the top-k passages are injected into the system prompt. Each bot has its own isolated library. All local, $0 per query. (Needs the embedding model pulled once: `ollama pull nomic-embed-text`.)
+- 🧩 **MCP plugins — "give your bot tools"** — MiniClosedAI is an [MCP](https://modelcontextprotocol.io) host. Paste a remote MCP server URL into the sidebar **Extensions** panel and the bot can call that server's tools mid-conversation (bounded model→tools→model loop). "Writing a plugin" = pointing at any of the thousands of existing MCP servers, or writing your own — no MiniClosedAI-specific plugin format. Remote (Streamable HTTP) servers; needs a tool-calling-capable model (qwen3, llama3.x, mistral, …).
 - 📎 **File attachments — images, PDFs, and text files** — paperclip in the composer (and clipboard paste) attaches files to a chat turn. Vision models (`llava`, `gemma4`, `qwen3.6`, `*-vision`, `*-vl`, etc.) see images natively over both Ollama's `/api/chat` and OpenAI's `chat/completions` formats. PDFs are extracted to text server-side with `pypdf` (50-page / 30 000-char caps), and `.txt` / `.md` / `.csv` / source-code files are read inline. Attached file bodies get prepended to the user's message; the bubble shows just the user's question + thumbnails / doc chips. Soft-warns when an image is attached to a model that doesn't pattern-match a vision model. **No extra setup** — `pypdf` ships in `requirements.txt`.
 - ⏹ **Manual stop** — a Stop button in the composer aborts the stream cleanly.
 - 🔁 **OpenAI-SDK-compatible server** — drop MiniClosedAI in place of `api.openai.com` with a one-line `base_url` change. Every bot appears as a "model" to the SDK; calls route to whichever backend that bot is pinned to.
@@ -418,6 +420,17 @@ Two panels, separated by a **horizontal splitter** you can drag to resize:
 | Max thinking tokens | blank or N | Auto-stop after N thinking tokens. Protects against runaway reasoning. |
 
 **Reset defaults** snaps everything back to stock values.
+
+**Knowledge** — the per-bot RAG library. Click **+ Add document** to upload PDFs / `.txt` / `.md`; each file is chunked, embedded (via the bot's backend using `nomic-embed-text` by default), and stored in SQLite keyed to this bot. On every turn the user's question is embedded and the most relevant passages are prepended to the system prompt, so the bot answers from your documents. Remove a document with its trash icon. Requires the embedding model once (`ollama pull nomic-embed-text`); override with `MINICLOSEDAI_EMBED_MODEL`. No external vector database.
+
+**Extensions** — the per-bot MCP plugins. Paste a remote MCP server URL and click **Add**; MiniClosedAI connects, lists the server's tools, and (if reachable) saves it. When the bot has enabled plugins, a chat turn runs a bounded tool-calling loop: the model can call the server's tools and incorporate the results before answering. Toggle a plugin on/off or remove it. Needs a tool-calling-capable model. See [Extensibility — MCP plugins](./DOCUMENTATION.md#extensibility--mcp-plugins) for details.
+
+> **Try it in 30 seconds.** A ready-to-run example MCP server ships in the repo:
+> [`docs/examples/mcp_server/server.py`](./docs/examples/mcp_server/server.py) — ~15 lines, three demo tools (`add`, `current_utc_time`, `weather`).
+> ```bash
+> python docs/examples/mcp_server/server.py     # serves at http://localhost:8765/mcp
+> ```
+> Then open a bot → **Extensions** → paste `http://localhost:8765/mcp` → **Add**, and ask "what's the weather in Tokyo?". Writing your own plugin is the same pattern: decorate a Python function with `@mcp.tool()` — its type hints + docstring become the tool schema the model sees. **Use `transport="streamable-http"`** (MiniClosedAI connects over Streamable HTTP, so the URL always ends in `/mcp`).
 
 **Status** at the bottom reports the reachable / total endpoint count plus a combined model count (green dot = at least one endpoint reachable; amber = some down; red = none reachable).
 

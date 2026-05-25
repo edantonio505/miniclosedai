@@ -13,6 +13,16 @@ const els = {
   botsNewBtn: document.getElementById("bots-new-btn"),
   botsViewList: document.getElementById("bots-view-list"),
   botsViewGrid: document.getElementById("bots-view-grid"),
+  kbList: document.getElementById("kb-list"),
+  kbEmpty: document.getElementById("kb-empty"),
+  kbAddBtn: document.getElementById("kb-add-btn"),
+  kbFileInput: document.getElementById("kb-file-input"),
+  kbStatus: document.getElementById("kb-status"),
+  mcpList: document.getElementById("mcp-list"),
+  mcpEmpty: document.getElementById("mcp-empty"),
+  mcpUrlInput: document.getElementById("mcp-url-input"),
+  mcpAddBtn: document.getElementById("mcp-add-btn"),
+  mcpStatus: document.getElementById("mcp-status"),
   newChatBtn: document.getElementById("new-chat-btn"),
   clearChatBtn: document.getElementById("clear-chat-btn"),
   downloadCsvBtn: document.getElementById("download-csv-btn"),
@@ -710,6 +720,270 @@ function initBotsUI() {
   document.addEventListener("keydown", _botsHotkeyHandler);
 }
 
+// ─── Per-bot Knowledge base (RAG) ───────────────────────────────────────
+// Upload PDFs / txt / md to the open bot. PDFs go through the existing
+// /api/extract-pdf endpoint; text files are read in-browser. The extracted
+// text is POSTed to the bot's knowledge endpoint, which chunks + embeds it.
+
+function _kbSetStatus(msg, isError) {
+  if (!els.kbStatus) return;
+  if (!msg) { els.kbStatus.hidden = true; els.kbStatus.textContent = ""; return; }
+  els.kbStatus.hidden = false;
+  els.kbStatus.textContent = msg;
+  els.kbStatus.classList.toggle("kb-error", !!isError);
+}
+
+function renderKnowledge(docs) {
+  if (!els.kbList) return;
+  els.kbList.innerHTML = "";
+  const list = docs || [];
+  if (els.kbEmpty) els.kbEmpty.hidden = list.length > 0;
+  for (const d of list) {
+    const row = document.createElement("div");
+    row.className = "kb-doc";
+
+    const info = document.createElement("div");
+    info.className = "kb-doc-info";
+    const name = document.createElement("div");
+    name.className = "kb-doc-name";
+    name.textContent = d.filename;
+    name.title = d.filename;
+    const meta = document.createElement("div");
+    meta.className = "kb-doc-meta";
+    meta.textContent = `${d.chunk_count} chunk${d.chunk_count === 1 ? "" : "s"}`;
+    info.appendChild(name);
+    info.appendChild(meta);
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "kb-doc-del";
+    del.title = "Remove from knowledge base";
+    del.setAttribute("aria-label", `Remove ${d.filename}`);
+    del.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>';
+    del.addEventListener("click", () => deleteKnowledgeDoc(d.id));
+
+    row.appendChild(info);
+    row.appendChild(del);
+    els.kbList.appendChild(row);
+  }
+}
+
+async function loadKnowledge() {
+  if (!els.kbList) return;
+  if (!state.conversationId) { renderKnowledge([]); return; }
+  try {
+    const r = await fetch(`/api/conversations/${state.conversationId}/knowledge`);
+    if (!r.ok) { renderKnowledge([]); return; }
+    const data = await r.json();
+    renderKnowledge(data.documents || []);
+  } catch (_) {
+    renderKnowledge([]);
+  }
+}
+
+async function deleteKnowledgeDoc(docId) {
+  if (!state.conversationId) return;
+  const r = await fetch(
+    `/api/conversations/${state.conversationId}/knowledge/${docId}`,
+    { method: "DELETE" }
+  );
+  if (r.ok) loadKnowledge();
+}
+
+// Read one file into plain text. PDFs use the server extractor; everything
+// else is read directly in the browser.
+async function _kbExtractText(file) {
+  const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+  if (isPdf) {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch("/api/extract-pdf", { method: "POST", body: fd });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || `PDF extraction failed (${r.status})`);
+    }
+    return (await r.json()).text || "";
+  }
+  return await file.text();
+}
+
+async function addKnowledgeFiles(files) {
+  if (!state.conversationId) {
+    alert("Open or create a bot first (send a message, or use + New bot), then add knowledge.");
+    return;
+  }
+  const list = Array.from(files || []);
+  if (!list.length) return;
+  let added = 0;
+  for (let i = 0; i < list.length; i++) {
+    const file = list[i];
+    _kbSetStatus(`Processing ${file.name} (${i + 1}/${list.length})…`, false);
+    try {
+      const text = await _kbExtractText(file);
+      if (!text.trim()) {
+        _kbSetStatus(`${file.name}: no extractable text — skipped.`, true);
+        continue;
+      }
+      const r = await fetch(`/api/conversations/${state.conversationId}/knowledge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: file.name, text }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        _kbSetStatus(err.detail || `${file.name}: failed (${r.status}).`, true);
+        continue;  // keep going with the rest
+      }
+      added++;
+    } catch (e) {
+      _kbSetStatus(`${file.name}: ${e.message}`, true);
+    }
+  }
+  if (added) _kbSetStatus(`Added ${added} document${added === 1 ? "" : "s"}.`, false);
+  await loadKnowledge();
+}
+
+function initKnowledgeUI() {
+  if (els.kbAddBtn && els.kbFileInput) {
+    els.kbAddBtn.addEventListener("click", () => els.kbFileInput.click());
+    els.kbFileInput.addEventListener("change", async () => {
+      await addKnowledgeFiles(els.kbFileInput.files);
+      els.kbFileInput.value = "";  // allow re-selecting the same file
+    });
+  }
+}
+
+// ─── MCP Extensions (per-bot plugins / tool servers) ────────────────────
+// A bot's plugins are remote MCP server URLs. We validate a URL by listing
+// its tools before saving, then persist the list to the conversation.
+
+const _mcpState = { servers: [] };
+
+function _mcpSetStatus(msg, isError) {
+  if (!els.mcpStatus) return;
+  if (!msg) { els.mcpStatus.hidden = true; els.mcpStatus.textContent = ""; return; }
+  els.mcpStatus.hidden = false;
+  els.mcpStatus.textContent = msg;
+  els.mcpStatus.classList.toggle("kb-error", !!isError);
+}
+
+function renderMcp() {
+  if (!els.mcpList) return;
+  els.mcpList.innerHTML = "";
+  const servers = _mcpState.servers || [];
+  if (els.mcpEmpty) els.mcpEmpty.hidden = servers.length > 0;
+  servers.forEach((srv, i) => {
+    const row = document.createElement("div");
+    row.className = "mcp-srv" + (srv.enabled ? "" : " disabled");
+
+    const toggle = document.createElement("input");
+    toggle.type = "checkbox";
+    toggle.className = "mcp-srv-toggle";
+    toggle.checked = srv.enabled !== false;
+    toggle.title = "Enable/disable this plugin";
+    toggle.addEventListener("change", () => {
+      _mcpState.servers[i].enabled = toggle.checked;
+      saveMcp();
+      renderMcp();
+    });
+
+    const info = document.createElement("div");
+    info.className = "mcp-srv-info";
+    const name = document.createElement("div");
+    name.className = "mcp-srv-name";
+    name.textContent = srv.name || srv.url;
+    const url = document.createElement("div");
+    url.className = "mcp-srv-url";
+    url.textContent = srv.url;
+    url.title = srv.url;
+    info.appendChild(name);
+    info.appendChild(url);
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "mcp-srv-del";
+    del.title = "Remove plugin";
+    del.setAttribute("aria-label", `Remove ${srv.name || srv.url}`);
+    del.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>';
+    del.addEventListener("click", () => {
+      _mcpState.servers.splice(i, 1);
+      saveMcp();
+      renderMcp();
+    });
+
+    row.appendChild(toggle);
+    row.appendChild(info);
+    row.appendChild(del);
+    els.mcpList.appendChild(row);
+  });
+}
+
+async function loadMcp() {
+  if (!els.mcpList) return;
+  if (!state.conversationId) { _mcpState.servers = []; renderMcp(); return; }
+  try {
+    const r = await fetch(`/api/conversations/${state.conversationId}/mcp`);
+    _mcpState.servers = r.ok ? ((await r.json()).servers || []) : [];
+  } catch (_) {
+    _mcpState.servers = [];
+  }
+  renderMcp();
+}
+
+async function saveMcp() {
+  if (!state.conversationId) return;
+  await fetch(`/api/conversations/${state.conversationId}/mcp`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ servers: _mcpState.servers }),
+  });
+}
+
+async function addMcpServer() {
+  if (!state.conversationId) {
+    alert("Open or create a bot first, then add plugins.");
+    return;
+  }
+  const url = (els.mcpUrlInput.value || "").trim();
+  if (!url) return;
+  _mcpSetStatus("Connecting to MCP server…", false);
+  let resp;
+  try {
+    const r = await fetch(`/api/conversations/${state.conversationId}/mcp/test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    resp = await r.json();
+  } catch (e) {
+    _mcpSetStatus(`Could not reach ${url}.`, true);
+    return;
+  }
+  if (!resp.ok) {
+    _mcpSetStatus(`Couldn't connect: ${resp.error || "unknown error"}`, true);
+    return;
+  }
+  let host = url;
+  try { host = new URL(url).host; } catch (_) {}
+  _mcpState.servers.push({ name: host, url, enabled: true });
+  await saveMcp();
+  renderMcp();
+  els.mcpUrlInput.value = "";
+  const n = (resp.tools || []).length;
+  _mcpSetStatus(`Added — ${n} tool${n === 1 ? "" : "s"} available.`, false);
+}
+
+function initMcpUI() {
+  if (els.mcpAddBtn) els.mcpAddBtn.addEventListener("click", addMcpServer);
+  if (els.mcpUrlInput) {
+    els.mcpUrlInput.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); addMcpServer(); }
+    });
+  }
+}
+
 // Esc: if you're in chat, fall back to the bots list. Skip when a modal is open
 // (modals own Esc), when you're typing in a textarea/input, or when the chat
 // composer is mid-stream (Stop button handles that case).
@@ -797,6 +1071,8 @@ async function openConversation(id) {
   _markConvViewed(id);  // opening = "I'm reading this now"
   renderBotsPage();
   renderMessages();
+  loadKnowledge();
+  loadMcp();
 }
 
 async function newConversation() {
@@ -832,6 +1108,10 @@ async function newConversation() {
   await loadConversations();
   renderTopbarBotLabel();
   renderMessages();
+  _kbSetStatus("", false);
+  loadKnowledge();  // fresh bot → empty library
+  _mcpSetStatus("", false);
+  loadMcp();
 
   // Reset the sidebar so the user sees the clean config they're about to edit.
   // Must happen AFTER state.conversationId is set so the debounced auto-save
@@ -3797,6 +4077,8 @@ async function init() {
   if (typeof initBackendsUI === "function") initBackendsUI();
   initLogsUI();
   initBotsUI();
+  initKnowledgeUI();
+  initMcpUI();
   startPullPoller();
   initUpgradeUI();
   initImportBotUI();

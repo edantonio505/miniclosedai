@@ -409,6 +409,68 @@ Vertical-nav button (terminal icon, between Bots and Settings in the activity ba
 
 ---
 
+## Knowledge base (RAG)
+
+Each bot can have its own library of documents ("books") that it answers from. The design is deliberately zero-install: **SQLite is the vector store and Ollama supplies the embeddings** — there is no external vector database.
+
+**Data model** (`db.py`): two tables, both keyed to `conversation_id` (logical FK, cleaned up in the conversation-delete handler):
+- `kb_documents(id, conversation_id, filename, char_count, chunk_count, embed_model, created_at)`
+- `kb_chunks(id, document_id, conversation_id, ordinal, text, embedding BLOB)` — the embedding is a packed little-endian float32 BLOB, L2-normalized at store time.
+
+**Module** `knowledge.py` (stdlib only): `chunk_text` (≈1000-char windows, 150 overlap, prefers whitespace breaks), `pack_vector` / `unpack_vector` (struct), `normalize`, `dot`, `top_k` (brute-force cosine = dot over normalized vectors), `build_context_block`.
+
+**Embeddings** `llm.embed(backend, model, texts)` — kind-agnostic: Ollama `POST /api/embed`, OpenAI-compat `POST /v1/embeddings`. Runs through the **bot's own backend**, so the embedding model (`MINICLOSEDAI_EMBED_MODEL`, default `nomic-embed-text`) must be served there.
+
+**Endpoints:**
+- `POST /api/conversations/{id}/knowledge` — body `{filename, text}`. Chunks → embeds → stores. The frontend extracts text first (txt/md read in-browser, PDFs via the existing `/api/extract-pdf`), keeping this endpoint JSON-only. Embedding failure → 502 with a "pull the embedding model" hint.
+- `GET /api/conversations/{id}/knowledge` — list documents (no chunk text).
+- `DELETE /api/conversations/{id}/knowledge/{doc_id}` — drop a document + its chunks.
+
+**Retrieval** happens in `_augment_messages_with_knowledge`, called from both conv-chat handlers **before** the relay override (so embeddings use the bot's configured backend, not a cloud relay). Only the single-`message` form is augmented (same rule as `include_history`). It embeds the query, runs `top_k` (default `MINICLOSEDAI_KB_TOP_K=5`) over this bot's chunks, and prepends a `## Knowledge base excerpts` block to the system message. **Best-effort**: any failure (model not pulled, backend down) is swallowed so a knowledge hiccup never blocks a normal chat turn.
+
+---
+
+## Extensibility — MCP plugins
+
+MiniClosedAI is a **host/client** for the [Model Context Protocol](https://modelcontextprotocol.io). A bot is configured with remote MCP server URLs; on a chat turn the model can call those servers' tools. "Writing a plugin" means writing (or pointing at) an MCP server — there's no MiniClosedAI-specific plugin format, and you inherit the existing MCP ecosystem.
+
+**Config** lives in a `conversations.mcp_servers` JSON column (additive migration) — a list of `{name, url, enabled}`. Endpoints:
+- `GET /api/conversations/{id}/mcp` — current servers.
+- `PUT /api/conversations/{id}/mcp` — replace the list.
+- `POST /api/conversations/{id}/mcp/test` — connect to a URL and return its tool names (used by the "Add" UI to validate before saving).
+
+**Module** `mcp_host.py` (uses the official `mcp` SDK, Streamable HTTP transport): `list_tools(url)`, `call_tool(url, headers, name, args)`, and `gather_tools(servers)` which merges tools across enabled servers into OpenAI tool specs + a `name → server` routing map (first server wins on a name collision; unreachable servers are skipped). **Remote-only, stateless** (connect per operation) for v1 simplicity — no local stdio subprocesses.
+
+**Tool-calling** `llm.chat_with_tools(...)` is a non-streaming call (Ollama `/api/chat` and OpenAI `/v1/chat/completions`, both `stream:false`, with `tools`) returning a normalized `{assistant_message, tool_calls:[{id,name,arguments}], content}`. `llm.tool_result_message(...)` builds the per-kind `role:"tool"` turn.
+
+**The loop** `_run_mcp_tool_loop` runs `model → (execute tool calls via MCP) → model → …` up to `MINICLOSEDAI_MCP_MAX_ITERS` (default 6) rounds, then returns the final text. Tool errors are fed back to the model as text so it can recover. Wired into both conv-chat handlers when the bot has enabled servers + the single-`message` form. Because tool calling is request/response (not streamable), the **streaming** endpoint runs the loop and emits the final answer as a single SSE chunk + `end`, preserving the frontend's contract.
+
+**Requirements / caveats:** needs a tool-calling-capable model (qwen3, llama3.x, mistral; not 1-bit Bonsai-class). Connecting to a remote MCP server runs code on that server — opt-in, per-bot, remote-first by design.
+
+### Writing a plugin (example server)
+
+The easiest way to write a plugin is **FastMCP**, bundled with the `mcp` SDK (already in `requirements.txt`). A runnable example ships at [`docs/examples/mcp_server/server.py`](./docs/examples/mcp_server/server.py):
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("demo-tools", host="127.0.0.1", port=8765)
+
+@mcp.tool()
+def add(a: float, b: float) -> float:
+    """Add two numbers and return the sum."""
+    return a + b
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")   # MUST be streamable-http
+```
+
+Run it (`python docs/examples/mcp_server/server.py`), then add `http://localhost:8765/mcp` in a bot's **Extensions** panel. The function's type hints + docstring *are* the tool schema — no separate spec. The mount path is always `/mcp`; the transport must be `streamable-http` (stdio servers aren't reachable by the host's `streamablehttp_client`).
+
+**Verified live:** with this example server + a `qwen3:8b` bot, MiniClosedAI lists the three tools, and asking "what's the weather in Reykjavik?" triggers a real `CallToolRequest` and the bot answers using the tool's returned value — confirming the full host → model → tool → model loop.
+
+---
+
 ## Worked example — connecting Bonsai (1-bit 8B)
 
 This section walks through registering **[PrismML's Bonsai-8B](https://github.com/PrismML-Eng/Bonsai-demo)** — a 1-bit quantized 8-billion-parameter model that runs at ~1.15 GB on disk — as an endpoint. It's a good end-to-end illustration of how the multi-backend architecture handles anything that exposes the OpenAI-compat `/v1` surface.

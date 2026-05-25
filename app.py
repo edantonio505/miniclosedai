@@ -31,8 +31,20 @@ from pydantic import BaseModel, ConfigDict, Field
 import pypdf
 
 import db
+import knowledge
 import llm
 import logs as chat_logs
+import mcp_host
+
+# Embedding model used for the per-bot knowledge base. Defaults to a small,
+# widely-available Ollama embedding model; override via env. Embeddings are
+# requested through the bot's own backend, so this model must be served there.
+EMBED_MODEL = os.environ.get("MINICLOSEDAI_EMBED_MODEL", "nomic-embed-text")
+# Cap on how many retrieved chunks get injected into the prompt per turn.
+KB_TOP_K = int(os.environ.get("MINICLOSEDAI_KB_TOP_K", "5"))
+# Safety cap on MCP tool-call rounds per turn (model→tools→model→…). Prevents a
+# runaway loop where the model keeps calling tools without ever answering.
+MCP_MAX_TOOL_ITERS = int(os.environ.get("MINICLOSEDAI_MCP_MAX_ITERS", "6"))
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -890,6 +902,9 @@ def api_update_conversation(conv_id: int, data: ConversationUpdate):
 def api_delete_conversation(conv_id: int):
     with db.get_conn() as conn:
         conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+        # Logical-FK cleanup: drop this bot's knowledge base too.
+        conn.execute("DELETE FROM kb_chunks WHERE conversation_id = ?", (conv_id,))
+        conn.execute("DELETE FROM kb_documents WHERE conversation_id = ?", (conv_id,))
         conn.commit()
     return {"ok": True}
 
@@ -906,6 +921,246 @@ def api_clear_conversation(conv_id: int):
         if cur.rowcount == 0:
             raise HTTPException(404, "Conversation not found")
     return {"ok": True}
+
+
+# ---------- Per-bot knowledge base (RAG) ----------
+
+class KnowledgeDocCreate(BaseModel):
+    """Body for POST /api/conversations/{id}/knowledge.
+
+    The frontend extracts text client-side (txt/md read directly, PDFs via the
+    existing /api/extract-pdf endpoint) and posts the plain text here. Keeping
+    this endpoint JSON-only (no multipart) keeps it simple.
+    """
+    model_config = ConfigDict(extra="forbid")
+    filename: str = Field(..., min_length=1, max_length=300)
+    text: str = Field(..., min_length=1)
+
+
+def _conv_exists(conv_id: int) -> dict:
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conv_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Conversation not found")
+    return db.row_to_dict(row)
+
+
+@app.post("/api/conversations/{conv_id}/knowledge")
+async def api_add_knowledge(conv_id: int, doc: KnowledgeDocCreate):
+    """Chunk + embed a document and store it in this bot's knowledge base."""
+    conv = _conv_exists(conv_id)
+    backend = _load_backend(conv.get("backend_id", 1))
+
+    chunks = knowledge.chunk_text(doc.text)
+    if not chunks:
+        raise HTTPException(400, "Document has no extractable text.")
+
+    try:
+        vecs = await llm.embed(backend, EMBED_MODEL, chunks)
+    except (httpx.ConnectError, RuntimeError, ValueError) as e:
+        raise HTTPException(
+            502,
+            f"Embedding failed with model '{EMBED_MODEL}': {e}. "
+            f"Make sure the embedding model is available on this bot's backend "
+            f"(e.g. run `ollama pull {EMBED_MODEL}`).",
+        )
+    if len(vecs) != len(chunks):
+        raise HTTPException(502, "Embedding backend returned the wrong number of vectors.")
+
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO kb_documents
+               (conversation_id, filename, char_count, chunk_count, embed_model)
+               VALUES (?, ?, ?, ?, ?)""",
+            (conv_id, doc.filename, len(doc.text), len(chunks), EMBED_MODEL),
+        )
+        doc_id = cur.lastrowid
+        for i, (text, vec) in enumerate(zip(chunks, vecs)):
+            packed = knowledge.pack_vector(knowledge.normalize(vec))
+            conn.execute(
+                """INSERT INTO kb_chunks
+                   (document_id, conversation_id, ordinal, text, embedding)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (doc_id, conv_id, i, text, packed),
+            )
+        conn.commit()
+
+    return {
+        "id": doc_id,
+        "filename": doc.filename,
+        "char_count": len(doc.text),
+        "chunk_count": len(chunks),
+        "embed_model": EMBED_MODEL,
+    }
+
+
+@app.get("/api/conversations/{conv_id}/knowledge")
+def api_list_knowledge(conv_id: int):
+    """List the documents in this bot's knowledge base (no chunk text)."""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, filename, char_count, chunk_count, embed_model, created_at
+               FROM kb_documents WHERE conversation_id = ?
+               ORDER BY created_at DESC, id DESC""",
+            (conv_id,),
+        ).fetchall()
+    return {"documents": [dict(r) for r in rows]}
+
+
+@app.delete("/api/conversations/{conv_id}/knowledge/{doc_id}")
+def api_delete_knowledge(conv_id: int, doc_id: int):
+    """Remove one document + its chunks from this bot's knowledge base."""
+    with db.get_conn() as conn:
+        conn.execute(
+            "DELETE FROM kb_chunks WHERE document_id = ? AND conversation_id = ?",
+            (doc_id, conv_id),
+        )
+        cur = conn.execute(
+            "DELETE FROM kb_documents WHERE id = ? AND conversation_id = ?",
+            (doc_id, conv_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Document not found")
+    return {"ok": True}
+
+
+async def _augment_messages_with_knowledge(
+    conv_id: int, messages: list[dict], query_text: str, backend: dict
+) -> None:
+    """If this bot has a knowledge base, retrieve top-k chunks for the query and
+    prepend them to the system message. Best-effort: any failure (embedding
+    model not pulled, backend down) is swallowed so a knowledge hiccup never
+    blocks a normal chat turn — the bot just answers without augmentation.
+    """
+    if not query_text or not query_text.strip():
+        return
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT text, embedding, document_id FROM kb_chunks WHERE conversation_id = ?",
+            (conv_id,),
+        ).fetchall()
+        if not rows:
+            return
+        docrows = conn.execute(
+            "SELECT id, filename FROM kb_documents WHERE conversation_id = ?",
+            (conv_id,),
+        ).fetchall()
+    names = {r["id"]: r["filename"] for r in docrows}
+    try:
+        qvecs = await llm.embed(backend, EMBED_MODEL, [query_text])
+    except Exception:
+        return
+    if not qvecs or not qvecs[0]:
+        return
+    chunks = [
+        {
+            "text": r["text"],
+            "embedding": knowledge.unpack_vector(r["embedding"]),
+            "filename": names.get(r["document_id"], "document"),
+        }
+        for r in rows
+    ]
+    passages = knowledge.top_k(qvecs[0], chunks, k=KB_TOP_K)
+    block = knowledge.build_context_block(passages)
+    if block and messages and messages[0].get("role") == "system":
+        messages[0]["content"] = block + "\n\n" + messages[0]["content"]
+
+
+# ---------- MCP plugins (per-bot tool servers) ----------
+
+class MCPServerSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field("", max_length=80)
+    url: str = Field(..., min_length=1, max_length=2000)
+    enabled: bool = True
+
+
+class MCPServersUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    servers: list[MCPServerSpec]
+
+
+class MCPTestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    url: str = Field(..., min_length=1, max_length=2000)
+
+
+@app.get("/api/conversations/{conv_id}/mcp")
+def api_get_mcp(conv_id: int):
+    """Return the bot's configured MCP servers."""
+    conv = _conv_exists(conv_id)
+    return {"servers": conv.get("mcp_servers", []) or []}
+
+
+@app.put("/api/conversations/{conv_id}/mcp")
+def api_set_mcp(conv_id: int, body: MCPServersUpdate):
+    """Replace the bot's MCP server list."""
+    _conv_exists(conv_id)
+    servers = [s.model_dump() for s in body.servers]
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE conversations SET mcp_servers = ?, updated_at = datetime('now') WHERE id = ?",
+            (json.dumps(servers), conv_id),
+        )
+        conn.commit()
+    return {"servers": servers}
+
+
+@app.post("/api/conversations/{conv_id}/mcp/test")
+async def api_test_mcp(conv_id: int, body: MCPTestRequest):
+    """Connect to an MCP server URL and list its tools — used by the 'add
+    server' UI to confirm a URL works before saving it."""
+    _conv_exists(conv_id)
+    try:
+        tools = await mcp_host.list_tools(body.url)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "tools": [t["function"]["name"] for t in tools]}
+
+
+def _enabled_mcp_servers(conv: dict) -> list[dict]:
+    return [s for s in (conv.get("mcp_servers") or []) if s.get("enabled", True) and s.get("url")]
+
+
+async def _run_mcp_tool_loop(model: str, messages: list[dict], eff: dict,
+                             backend: dict, servers: list[dict]) -> str:
+    """Run a bounded model→tools→model loop using the bot's MCP servers.
+
+    Returns the final visible text. If no tools are reachable, falls back to a
+    plain completion. Tool errors are fed back to the model as text so it can
+    recover rather than crashing the turn.
+    """
+    tools, routing = await mcp_host.gather_tools(servers)
+    params = dict(temperature=eff["temperature"], max_tokens=eff["max_tokens"],
+                  top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"])
+    if not tools:
+        return await llm.chat(backend, model, messages, **params)
+
+    convo = list(messages)
+    for _ in range(MCP_MAX_TOOL_ITERS):
+        resp = await llm.chat_with_tools(backend, model, convo, tools, **params)
+        calls = resp.get("tool_calls") or []
+        if not calls:
+            return resp.get("content") or ""
+        convo.append(resp["assistant_message"])
+        for call in calls:
+            route = routing.get(call["name"])
+            if not route:
+                result = f"(no MCP server provides a tool named '{call['name']}')"
+            else:
+                try:
+                    result = await mcp_host.call_tool(
+                        route["url"], route.get("headers"), call["name"], call["arguments"]
+                    )
+                except Exception as e:
+                    result = f"(tool '{call['name']}' failed: {e})"
+            convo.append(llm.tool_result_message(backend, call, result))
+    # Exhausted the iteration budget — ask for a final answer without tools.
+    final = await llm.chat(backend, model, convo, **params)
+    return final or "(stopped: reached the maximum number of tool-call rounds)"
 
 
 class MessageEditRequest(BaseModel):
@@ -1715,18 +1970,24 @@ def _persist_conv_chat_turn(
 async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
     """Call the saved conversation as a configured function (non-streaming)."""
     conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
+    mcp_servers = _enabled_mcp_servers(conv) if req.message is not None else []
+    if req.message is not None:
+        await _augment_messages_with_knowledge(conv_id, messages, req.message, backend)
     backend = await _maybe_override_to_relay(backend, eff["model"])
     attachments = [a.name for a in (req.attachments or [])] if req.attachments else []
     endpoint = f"/api/conversations/{conv_id}/chat"
     t0 = time.perf_counter()
     try:
-        text = await llm.chat(
-            backend,
-            eff["model"], messages,
-            temperature=eff["temperature"], max_tokens=eff["max_tokens"],
-            top_p=eff["top_p"], top_k=eff["top_k"],
-            think=eff["think"],
-        )
+        if mcp_servers:
+            text = await _run_mcp_tool_loop(eff["model"], messages, eff, backend, mcp_servers)
+        else:
+            text = await llm.chat(
+                backend,
+                eff["model"], messages,
+                temperature=eff["temperature"], max_tokens=eff["max_tokens"],
+                top_p=eff["top_p"], top_k=eff["top_k"],
+                think=eff["think"],
+            )
     except (httpx.ConnectError, RuntimeError) as e:
         chat_logs.record_chat(
             endpoint=endpoint, kind="sync", backend=backend, model=eff["model"],
@@ -1767,6 +2028,9 @@ async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
 async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
     """Call the saved conversation as a configured function (SSE streaming)."""
     conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
+    mcp_servers = _enabled_mcp_servers(conv) if req.message is not None else []
+    if req.message is not None:
+        await _augment_messages_with_knowledge(conv_id, messages, req.message, backend)
     backend = await _maybe_override_to_relay(backend, eff["model"])
     attachments = [a.name for a in (req.attachments or [])] if req.attachments else []
     endpoint = f"/api/conversations/{conv_id}/chat/stream"
@@ -1778,6 +2042,39 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
         max_think = eff.get("max_thinking_tokens")
         truncated = False
         t0 = time.perf_counter()
+        # MCP tools require a request/response tool-calling loop, which can't be
+        # streamed token-by-token. When a bot has plugins enabled we run the
+        # loop, then emit the final answer as a single chunk so the SSE contract
+        # (chunk… then end) the frontend expects still holds.
+        if mcp_servers:
+            try:
+                text = await _run_mcp_tool_loop(eff["model"], messages, eff, backend, mcp_servers)
+            except (httpx.ConnectError, Exception) as e:
+                chat_logs.record_chat(
+                    endpoint=endpoint, kind="stream", backend=backend, model=eff["model"],
+                    messages=messages, params=eff, attachments=attachments,
+                    status="error", error=str(e),
+                    latency_ms=int((time.perf_counter() - t0) * 1000),
+                )
+                msg = _backend_err(backend) if isinstance(e, httpx.ConnectError) else str(e)
+                yield f"data: {json.dumps({'error': msg})}\n\n"
+                return
+            collected.append(text)
+            yield f"data: {json.dumps({'chunk': text})}\n\n"
+            chat_logs.record_chat(
+                endpoint=endpoint, kind="stream", backend=backend, model=eff["model"],
+                messages=messages, params=eff, attachments=attachments,
+                response_text=text,
+                latency_ms=int((time.perf_counter() - t0) * 1000),
+            )
+            if req.persist:
+                attachments_raw = (
+                    [a.model_dump() for a in req.attachments] if req.attachments else None
+                )
+                user_msgs = [_build_user_message(req.message, attachments_raw)]
+                _persist_conv_chat_turn(conv_id, user_msgs, text, eff, backend)
+            yield f"data: {json.dumps({'end': True, 'truncated': False})}\n\n"
+            return
         try:
             async for ev in llm.chat_stream(
                 backend,

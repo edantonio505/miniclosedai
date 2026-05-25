@@ -216,6 +216,27 @@
         <button id="reset-params" class="btn btn-small">Reset defaults</button>
       </div>
 
+      <div class="panel knowledge-panel">
+        <h3>Knowledge <span class="kb-subtitle">— books this bot can read</span></h3>
+        <div id="kb-list" class="kb-list"></div>
+        <div id="kb-empty" class="kb-empty">No documents yet. Add PDFs, .txt, or .md files to make this bot an expert.</div>
+        <button id="kb-add-btn" type="button" class="btn btn-small kb-add-btn">+ Add document</button>
+        <input id="kb-file-input" type="file" multiple hidden
+               accept=".txt,.md,.markdown,.csv,.json,.yaml,.yml,.log,.pdf,text/*" />
+        <div id="kb-status" class="kb-status" hidden></div>
+      </div>
+
+      <div class="panel mcp-panel">
+        <h3>Extensions <span class="kb-subtitle">— MCP plugins (tools)</span></h3>
+        <div id="mcp-list" class="mcp-list"></div>
+        <div id="mcp-empty" class="kb-empty">No plugins. Paste an MCP server URL to give this bot tools.</div>
+        <div class="mcp-add-row">
+          <input id="mcp-url-input" type="text" placeholder="https://server.example/mcp" spellcheck="false" />
+          <button id="mcp-add-btn" type="button" class="btn btn-small">Add</button>
+        </div>
+        <div id="mcp-status" class="kb-status" hidden></div>
+      </div>
+
       <div class="panel status-panel">
         <h3>Status</h3>
         <div id="status-line">Checking Ollama…</div>

@@ -123,6 +123,22 @@ class FakeOllama(_FakeServer):
                     payload = json.loads(self.rfile.read(length))
                     captured.append({"path": self.path, "payload": payload,
                                      "headers": dict(self.headers)})
+                    # Non-streaming (tool-calling) path: return a single JSON
+                    # object. If tools are offered and we haven't yet seen a
+                    # tool result, ask to call the 'echo' tool; otherwise give
+                    # a final answer. This drives the MCP tool-loop test.
+                    if payload.get("stream") is False:
+                        msgs = payload.get("messages", [])
+                        has_tool_result = any(m.get("role") == "tool" for m in msgs)
+                        if payload.get("tools") and not has_tool_result:
+                            msg = {"role": "assistant", "content": "",
+                                   "tool_calls": [{"function": {"name": "echo",
+                                                                "arguments": {"text": "hi"}}}]}
+                        else:
+                            msg = {"role": "assistant", "content": "final answer using tool"}
+                        body = json.dumps({"message": msg, "done": True}).encode()
+                        self._reply(200, body, "application/json")
+                        return
                     self.send_response(200)
                     self.send_header("Content-Type", "application/x-ndjson")
                     self.end_headers()
@@ -138,6 +154,22 @@ class FakeOllama(_FakeServer):
                     for f in frames:
                         self.wfile.write((json.dumps(f) + "\n").encode())
                         self.wfile.flush()
+                    return
+                if self.path == "/api/embed":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length)) if length else {}
+                    captured.append({"path": self.path, "payload": payload})
+                    inp = payload.get("input", [])
+                    if isinstance(inp, str):
+                        inp = [inp]
+                    # Deterministic bag-of-keywords embedding so retrieval is
+                    # testable: a text containing "alpha" lands near a query
+                    # containing "alpha". Zero vector if no vocab words present.
+                    vocab = ["alpha", "beta", "gamma", "delta",
+                             "epsilon", "zeta", "eta", "theta"]
+                    embs = [[float(t.lower().count(w)) for w in vocab] for t in inp]
+                    body = json.dumps({"embeddings": embs}).encode()
+                    self._reply(200, body, "application/json")
                     return
                 if self.path == "/api/pull":
                     length = int(self.headers.get("Content-Length", "0"))
@@ -857,6 +889,11 @@ def _():
     # Bots page has its own filter input + list container.
     assert 'id="bots-filter"' in body
     assert 'id="bots-list"' in body
+    # Sidebar Knowledge (RAG) + Extensions (MCP) panels.
+    assert 'id="kb-list"' in body
+    assert 'id="kb-add-btn"' in body
+    assert 'id="mcp-list"' in body
+    assert 'id="mcp-url-input"' in body
 
 
 @test("static: app.js is served and contains recent helpers")
@@ -876,6 +913,9 @@ def _():
         "_refreshUnreadUI", "_onStreamStart", "_onStreamEnd", "_markConvViewed",
         # Row actions on bot cards + scoped API code modal
         "deleteConvById", "openApiCodeForConv", "_modalConvId",
+        # Knowledge (RAG) + Extensions (MCP) panels
+        "loadKnowledge", "addKnowledgeFiles", "initKnowledgeUI",
+        "loadMcp", "addMcpServer", "initMcpUI",
     ]
     for needle in needles:
         assert needle in r.text, f"missing {needle} in served app.js"
@@ -898,6 +938,153 @@ def _seed_conv_with_turn(title: str) -> int:
         for _ in r.iter_bytes():
             pass
     return c["id"]
+
+
+def _new_fake_conv(title: str) -> int:
+    """Create an empty conv on the fake Ollama backend (no turns)."""
+    _reseed_builtin_to_fake_ollama()
+    return client.post("/api/conversations", json={
+        "title": title, "model": "ollama-a:3b", "backend_id": 1,
+    }).json()["id"]
+
+
+@test("knowledge: add a document → chunks + embeds, returns summary")
+def _():
+    cid = _new_fake_conv("kb-add")
+    r = client.post(
+        f"/api/conversations/{cid}/knowledge",
+        json={"filename": "book.txt", "text": "The alpha protocol governs alpha sequences."},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["filename"] == "book.txt"
+    assert body["chunk_count"] >= 1
+    assert body["char_count"] > 0
+    assert body["embed_model"]  # whatever EMBED_MODEL resolved to
+
+
+@test("knowledge: list returns added docs; delete removes them")
+def _():
+    cid = _new_fake_conv("kb-list-del")
+    d = client.post(
+        f"/api/conversations/{cid}/knowledge",
+        json={"filename": "beta.md", "text": "beta beta facts about beta."},
+    ).json()
+    listed = client.get(f"/api/conversations/{cid}/knowledge").json()["documents"]
+    assert any(x["id"] == d["id"] and x["filename"] == "beta.md" for x in listed)
+
+    r = client.delete(f"/api/conversations/{cid}/knowledge/{d['id']}")
+    assert r.status_code == 200, r.text
+    after = client.get(f"/api/conversations/{cid}/knowledge").json()["documents"]
+    assert all(x["id"] != d["id"] for x in after)
+    # Deleting a missing doc 404s.
+    assert client.delete(f"/api/conversations/{cid}/knowledge/{d['id']}").status_code == 404
+
+
+@test("knowledge: whitespace-only text rejected (400)")
+def _():
+    cid = _new_fake_conv("kb-empty")
+    r = client.post(
+        f"/api/conversations/{cid}/knowledge",
+        json={"filename": "blank.txt", "text": "   \n  "},
+    )
+    assert r.status_code == 400, r.text
+
+
+@test("knowledge: retrieval injects the relevant excerpt into the system prompt")
+def _():
+    cid = _new_fake_conv("kb-retrieve")
+    client.post(
+        f"/api/conversations/{cid}/knowledge",
+        json={"filename": "gamma.txt",
+              "text": "The gamma ray burst was recorded near gamma sector seven."},
+    )
+    fake_ollama.captured.clear()
+    # A query sharing the 'gamma' keyword should pull that chunk into context.
+    r = client.post(
+        f"/api/conversations/{cid}/chat",
+        json={"message": "tell me about the gamma reading"},
+    )
+    assert r.status_code == 200, r.text
+    chat_calls = [c for c in fake_ollama.captured if c["path"] == "/api/chat"]
+    assert chat_calls, "no chat call captured"
+    sys_msg = chat_calls[-1]["payload"]["messages"][0]
+    assert sys_msg["role"] == "system"
+    assert "Knowledge base excerpts" in sys_msg["content"]
+    assert "gamma sector seven" in sys_msg["content"]
+
+
+@test("knowledge: deleting a conversation cascades to its knowledge base")
+def _():
+    cid = _new_fake_conv("kb-cascade")
+    client.post(
+        f"/api/conversations/{cid}/knowledge",
+        json={"filename": "delta.txt", "text": "delta delta delta."},
+    )
+    assert client.get(f"/api/conversations/{cid}/knowledge").json()["documents"]
+    client.delete(f"/api/conversations/{cid}")
+    # KB rows are keyed by conversation_id; cascade should leave none.
+    assert client.get(f"/api/conversations/{cid}/knowledge").json()["documents"] == []
+
+
+@test("mcp: server config GET default empty, PUT then GET roundtrips")
+def _():
+    cid = _new_fake_conv("mcp-cfg")
+    assert client.get(f"/api/conversations/{cid}/mcp").json()["servers"] == []
+    servers = [{"name": "GH", "url": "http://localhost:9999/mcp", "enabled": True}]
+    r = client.put(f"/api/conversations/{cid}/mcp", json={"servers": servers})
+    assert r.status_code == 200, r.text
+    got = client.get(f"/api/conversations/{cid}/mcp").json()["servers"]
+    assert got[0]["url"] == "http://localhost:9999/mcp"
+    assert got[0]["enabled"] is True
+
+
+@test("mcp: /test against an unreachable server returns ok:false")
+def _():
+    cid = _new_fake_conv("mcp-test")
+    r = client.post(f"/api/conversations/{cid}/mcp/test", json={"url": "http://127.0.0.1:1/mcp"})
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is False
+
+
+@test("mcp: tool-call loop executes a tool then returns a final answer")
+def _():
+    import mcp_host as mh
+    cid = _new_fake_conv("mcp-loop")
+    client.put(
+        f"/api/conversations/{cid}/mcp",
+        json={"servers": [{"name": "t", "url": "http://x/mcp", "enabled": True}]},
+    )
+
+    async def fake_gather(servers):
+        spec = {"type": "function", "function": {
+            "name": "echo", "description": "echo", "parameters": {"type": "object"}}}
+        return ([spec], {"echo": {"url": "http://x/mcp", "headers": None}})
+
+    async def fake_call(url, headers, name, args):
+        return "ECHOED:" + str(args)
+
+    orig_g, orig_c = mh.gather_tools, mh.call_tool
+    mh.gather_tools = fake_gather
+    mh.call_tool = fake_call
+    try:
+        r = client.post(f"/api/conversations/{cid}/chat", json={"message": "use the tool"})
+        assert r.status_code == 200, r.text
+        assert "final answer" in r.json()["response"].lower()
+    finally:
+        mh.gather_tools, mh.call_tool = orig_g, orig_c
+
+
+@test("mcp: no servers configured → normal chat, tool loop not triggered")
+def _():
+    cid = _new_fake_conv("mcp-none")
+    # No MCP servers → streaming path with the usual Hello world fake stream.
+    with client.stream("POST", f"/api/conversations/{cid}/chat/stream",
+                       json={"message": "hi"}) as r:
+        body = b"".join(r.iter_bytes())
+    evs = sse_events(body)
+    chunks = "".join(e.get("chunk", "") for e in evs)
+    assert "Hello" in chunks
 
 
 @test("edit-message: PATCH happy path — content updated, original preserved, edited_at set")
