@@ -356,7 +356,7 @@ See [Security](#security) and the README's [LAN access](./README.md#lan-access) 
 
 The UI is a **list/detail** pattern, not flat tabs. The activity bar has three icons — **Bots** (home, message-square), **Logs** (terminal), **Settings** (gear). The "Dashboard" page still exists internally (it's the chat surface) but has no nav button; you reach it by drilling into a bot from the list.
 
-- **Bots page** — searchable cards; click to enter that chat. Slide-in animation. The toolbar (filter input + bot count) is `position: sticky; top: 0; z-index: 10` with `background: var(--bg)` so it pins to the top of the scrolling `.page-bots` container while cards scroll underneath. `⌘K` / `Ctrl+K` from anywhere (or `/` outside a text field) jumps here and focuses the filter.
+- **Bots page** — searchable cards; click to enter that chat. Slide-in animation. The toolbar (filter input + bot count + a **list ↔ grid view toggle**, persisted to `localStorage` key `miniclosedai:botsView`) is `position: sticky; top: 0; z-index: 10` with `background: var(--bg)` so it pins to the top of the scrolling `.page-bots` container while cards scroll underneath. Grid view is `.bots-list.grid-view` (responsive auto-fill tiles); list is the default vertical stack. `⌘K` / `Ctrl+K` from anywhere (or `/` outside a text field) jumps here and focuses the filter.
 - **Bot card row actions** — appear on `:hover` / `:focus-within` only, in `.bot-card-actions` (an absolutely-positioned strip on the right edge with a gradient mask fade): `</>` API code, **📚 Manage knowledge**, **🧩 Manage extensions**, and 🗑 Delete. All call `e.stopPropagation()` and carry the card's `data-conv-id`.
   - **📚 → Manage Knowledge modal** (`openKnowledgeModal`): lists the bot's documents (filename · chunk count · size · date) with per-doc delete, plus **+ Add document** which routes the shared hidden file input (`#bots-kb-file`) via `_triggerKbUpload({convId, onStatus, onDone})` → `_uploadKnowledgeToConv`.
   - **🧩 → Manage Extensions modal** (`openMcpModal`): lists the bot's MCP servers with a per-server **enable toggle** + remove (each mutation PUTs the full list via `_saveMcpModal`), plus an add-by-URL row → `_addMcpToConv`.
@@ -427,14 +427,14 @@ Each bot can have its own library of documents ("books") that it answers from. T
 
 **Module** `knowledge.py` (stdlib only): `chunk_text` (≈1000-char windows, 150 overlap, prefers whitespace breaks), `pack_vector` / `unpack_vector` (struct), `normalize`, `dot`, `top_k` (brute-force cosine = dot over normalized vectors), `build_context_block`.
 
-**Embeddings** `llm.embed(backend, model, texts)` — kind-agnostic: Ollama `POST /api/embed`, OpenAI-compat `POST /v1/embeddings`. Runs through the **bot's own backend**, so the embedding model (`MINICLOSEDAI_EMBED_MODEL`, default `nomic-embed-text`) must be served there.
+**Embeddings** `llm.embed(backend, model, texts)` — kind-agnostic: Ollama `POST /api/embed`, OpenAI-compat `POST /v1/embeddings`. Embeddings are a **local** concern: `_resolve_embed_backend()` routes them to the built-in/local Ollama (prefers `is_builtin`; override with `MINICLOSEDAI_EMBED_BACKEND_ID`), **not** the bot's chat backend. So a bot pinned to a cloud relay — which serves chat models but not `nomic-embed-text` — still embeds locally instead of 403-ing. The embedding model (`MINICLOSEDAI_EMBED_MODEL`, default `nomic-embed-text`) must be pulled on that local backend. Ingestion and retrieval use the **same** resolver, so chunks + queries are always embedded by the same model.
 
 **Endpoints:**
-- `POST /api/conversations/{id}/knowledge` — body `{filename, text}`. Chunks → embeds → stores. The frontend extracts text first (txt/md read in-browser, PDFs via the existing `/api/extract-pdf`), keeping this endpoint JSON-only. Embedding failure → 502 with a "pull the embedding model" hint.
+- `POST /api/conversations/{id}/knowledge` — body `{filename, text}`. Chunks → embeds → stores. The frontend extracts text first (txt/md read in-browser, PDFs via `/api/extract-pdf?full=1` — book-friendly caps of 200 MB / 5000 pages / 5M chars vs. the 10 MB chat-attachment caps; see [Configuration](#configuration)), keeping this endpoint JSON-only. Embedding failure → 502 with a "pull the embedding model" hint.
 - `GET /api/conversations/{id}/knowledge` — list documents (no chunk text).
 - `DELETE /api/conversations/{id}/knowledge/{doc_id}` — drop a document + its chunks.
 
-**Retrieval** happens in `_augment_messages_with_knowledge`, called from both conv-chat handlers **before** the relay override (so embeddings use the bot's configured backend, not a cloud relay). Only the single-`message` form is augmented (same rule as `include_history`). It embeds the query, runs `top_k` (default `MINICLOSEDAI_KB_TOP_K=5`) over this bot's chunks, and prepends a `## Knowledge base excerpts` block to the system message. **Best-effort**: any failure (model not pulled, backend down) is swallowed so a knowledge hiccup never blocks a normal chat turn.
+**Retrieval** happens in `_augment_messages_with_knowledge`, called from both conv-chat handlers. It embeds the query on the **local embed backend** (same resolver as ingestion, so chunks + query share one model even when the bot chats through a relay). Only the single-`message` form is augmented (same rule as `include_history`). It runs `top_k` (default `MINICLOSEDAI_KB_TOP_K=5`) over this bot's chunks and prepends a `## Knowledge base excerpts` block to the system message. **Best-effort**: any failure (model not pulled, backend down) is swallowed so a knowledge hiccup never blocks a normal chat turn.
 
 ---
 
@@ -1947,6 +1947,14 @@ Environment variables the app reads:
 |---|---|---|
 | `OLLAMA_URL` | `http://localhost:11434` | Default URL for the built-in Ollama backend. Used by `db.py:23` (seed) and `llm.py:32` (client default). In Docker compose, set to `http://ollama:11434` so MiniClosedAI reaches the sibling Ollama service over the internal network. |
 | `MINICLOSEDAI_DB_PATH` | `<repo>/miniclosedai.db` | Override the SQLite file location. Set to `/app/data/miniclosedai.db` in the Docker container so the `miniclosedai_db` named volume can persist state without mounting over the app code tree. Unset in local dev = original path, no behavior change. |
+| `MINICLOSEDAI_NO_OLLAMA` | unset | "Lite" mode — don't seed the built-in Ollama backend (and auto-disable an existing one). For installs that only use external/cloud endpoints. Accepts `1`/`true`/`yes`/`on`. See [Lite mode](#docker-deployment). |
+| `MINICLOSEDAI_DISABLE_RELAY_AUTO_ROUTE` | unset | Set to `1` to disable the auto-route that sends a chat to a matching relay (e.g. Interdata) when the relay serves the bot's model. Keeps every bot strictly on its pinned backend. |
+| `MINICLOSEDAI_EMBED_MODEL` | `nomic-embed-text` | Embedding model for the knowledge base (RAG). Must be pulled on an Ollama backend. |
+| `MINICLOSEDAI_EMBED_BACKEND_ID` | unset | Force a specific backend id for embeddings. By default embeddings resolve to the built-in/local Ollama (see [Knowledge base](#knowledge-base-rag)), so a bot chatting on a cloud relay still embeds locally. |
+| `MINICLOSEDAI_KB_TOP_K` | `5` | How many retrieved knowledge chunks are injected into the prompt per turn. |
+| `MINICLOSEDAI_MCP_MAX_ITERS` | `6` | Safety cap on MCP tool-call rounds per turn (model→tools→model…). |
+| `MINICLOSEDAI_PDF_MAX_MB` / `_PAGES` / `_CHARS` | `10` / `50` / `30000` | Caps for the **chat-attachment** PDF path (a PDF stuffed into one chat turn). |
+| `MINICLOSEDAI_PDF_FULL_MAX_MB` / `_PAGES` / `_CHARS` | `200` / `5000` / `5000000` | Book-friendly caps for the **knowledge-base** PDF path (`/api/extract-pdf?full=1`) — the text is chunked + embedded, so length isn't a context concern. |
 
 The listen port is set in `app.py` (`port=8095`) or via the uvicorn `--port` flag. In Docker, port mapping lives in `docker-compose.yml` (`ports: ["127.0.0.1:8095:8095"]`).
 
