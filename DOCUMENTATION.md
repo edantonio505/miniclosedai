@@ -33,7 +33,7 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 10. [Stopping generation](#stopping-generation)
 11. [Fine-tuning data export](#fine-tuning-data-export)
 12. [Worked example — automated image labeling](#worked-example--automated-image-labeling)
-13. [Worked example — chatbot frontends (Python CLI + HTML widget)](#worked-example--chatbot-frontends-python-cli--html-widget)
+13. [Worked example — chatbot frontends (Python CLI + HTML widget)](#worked-example--chatbot-frontends-python-cli--html-widget) · [Client SDK](#client-sdk--composing-bots-from-your-code)
 14. [Bot import / export](#bot-import--export)
 15. [Self-upgrade](#self-upgrade)
 16. [Prompt generator](#prompt-generator)

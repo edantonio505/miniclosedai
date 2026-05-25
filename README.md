@@ -36,7 +36,7 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 13. [Getting good responses from small models](#getting-good-responses-from-small-models)
 14. [Curating fine-tuning data](#curating-fine-tuning-data)
 15. [Automated image labeling — hot dog / not hot dog](#automated-image-labeling--hot-dog--not-hot-dog)
-16. [Building a chatbot against a saved bot](#building-a-chatbot-against-a-saved-bot)
+16. [Building a chatbot against a saved bot](#building-a-chatbot-against-a-saved-bot) · [Python client SDK](#python-client-sdk--compose-bots-in-your-own-code)
 17. [Sharing bots between instances](#sharing-bots-between-instances)
 18. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
 19. [LAN access](#lan-access)
