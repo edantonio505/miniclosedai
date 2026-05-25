@@ -1353,6 +1353,30 @@ Neither file references "hotel" or `create_booking` in the chat-handling code pa
 
 Nothing else changes. The Doctor's `create_appointment`, the Restaurant's `create_reservation`, a custom bot of yours emitting `{"type": "place_order", ...}` — all render the same way and trigger the same lifecycle.
 
+### Client SDK — composing bots from your code
+
+The CLI and HTML examples are *end-user surfaces* for a single bot. For **orchestration** — one process that calls several bots, has them feed each other, or embeds each bot as a function inside an internal app — there's a zero-dependency single-file client at [`docs/examples/client/miniclosedai_client.py`](./docs/examples/client/miniclosedai_client.py) (stdlib only; copy, no `pip install`).
+
+```python
+from miniclosedai_client import Bot
+triage, writer = Bot.find("triage"), Bot.find("writer")
+intent = triage.ask(user_msg, history=False)
+reply  = writer.ask(f"Reply addressing: {intent}", history=False)
+```
+
+The `Bot` class is a thin wrapper over the per-conversation endpoints:
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `Bot(id)` / `Bot.find(title)` / `Bot.list()` | `GET /api/conversations` | address / discover bots |
+| `.ask(msg, history=, persist=)` | `POST /api/conversations/{id}/chat` | reply text (sets `include_history`, `persist`) |
+| `.stream(msg)` | `POST .../chat/stream` | generator of SSE `chunk`s |
+| `.add_text()` / `.add_file()` / `.knowledge()` | `…/knowledge` | manage the bot's RAG library |
+
+Base URL comes from `MINICLOSEDAI_BASE_URL` (default `http://localhost:8095`). Errors raise `MiniClosedAIError`. A runnable two-bot pipeline is in [`docs/examples/client/example.py`](./docs/examples/client/example.py).
+
+This is the intended **multi-LLM management** shape: MiniClosedAI is the registry/host (each bot = a configured expert with its own model, knowledge, tools); the orchestration logic lives in *your* code, not inside MCAi. (Implementation note: the client uses `from __future__ import annotations` because the `Bot.list` classmethod shadows the builtin `list` in the class namespace, which would otherwise break the `-> list[dict]` hints.) For OpenAI-SDK ergonomics you can alternatively use the official `openai` package against `…:8095/v1` with `model="conv-<id>"`; the bespoke client exists for the native-only features (`include_history`, `persist`, knowledge upload).
+
 ### Deployment surfaces — HTML widget
 
 The HTML's CORS-friendliness (MCAi ships `allow_origins=["*"]`) plus its auto-derived `MCAI_BASE_URL` makes it work in five useful contexts:

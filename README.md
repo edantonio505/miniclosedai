@@ -2127,6 +2127,25 @@ Both examples are recipe-agnostic — the fence-detection and action-extraction 
 
 The renderers (`render_action` in Python, `renderAction` in JS) walk the dict generically with `snake_case → "Title Case"` labels and nested-section grouping, so a `create_appointment` from the doctor's recipe renders just as cleanly as a `create_booking` from the hotel's.
 
+### Python client SDK — compose bots in your own code
+
+For orchestration (one script that calls several bots, or each bot used as a function inside an internal app), there's a **zero-dependency single-file client**: [`docs/examples/client/miniclosedai_client.py`](./docs/examples/client/miniclosedai_client.py). Copy it into your project — it's stdlib only (`urllib` + `json`), no `pip install`.
+
+```python
+from miniclosedai_client import Bot
+
+triage = Bot.find("triage")        # or Bot(12) by id (the </> "Copy bot ID" pill)
+writer = Bot.find("writer")        # or Bot(56)
+
+intent = triage.ask("My order #4471 is two weeks late!", history=False)  # one-shot
+reply  = writer.ask(f"Draft a friendly apology about: {intent}", history=False)
+print(reply)
+```
+
+The `Bot` class wraps the per-conversation endpoints: `Bot(id)` / `Bot.find(title)` / `Bot.list()` to address or discover bots; `.ask(msg, history=, persist=)` for a reply; `.stream(msg)` to yield chunks; `.add_text()` / `.add_file()` / `.knowledge()` to manage a bot's knowledge base. Point it at your instance with the `MINICLOSEDAI_BASE_URL` env var (default `http://localhost:8095`). A runnable two-bot pipeline is in [`docs/examples/client/example.py`](./docs/examples/client/example.py).
+
+This is the **multi-LLM pattern**: MiniClosedAI hosts each bot (its model, system prompt, knowledge, tools); your script is the orchestration layer that wires them together. Drop the same logic into a FastAPI route and you have a self-hosted multi-agent backend. (You can also just use the official `openai` SDK against `…:8095/v1` with `model="conv-<id>"` — the client adds the native niceties like `include_history`, `persist`, and knowledge upload that the OpenAI surface doesn't expose.)
+
 ---
 
 ## Sharing bots between instances
