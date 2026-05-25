@@ -862,14 +862,66 @@ function renderBotsPage() {
 function renderBreadcrumb() {
   const c = _botsState.cache.find(x => x.id === state.conversationId);
   if (els.breadcrumbCurrent) {
+    // Don't clobber an in-progress rename input.
+    if (els.breadcrumbCurrent.querySelector("input")) return;
     if (c) {
       els.breadcrumbCurrent.textContent = c.title;
       els.breadcrumbCurrent.classList.remove("is-empty");
+      els.breadcrumbCurrent.title = "Click to rename this bot";
     } else {
       els.breadcrumbCurrent.textContent = "(no bot selected)";
       els.breadcrumbCurrent.classList.add("is-empty");
+      els.breadcrumbCurrent.removeAttribute("title");
     }
   }
+}
+
+// Click the topbar bot-name pill to rename the current bot inline.
+// PATCH /api/conversations/{id} {title}; the backend already supports it.
+function _beginRenameBot() {
+  if (!state.conversationId || !els.breadcrumbCurrent) return;
+  if (els.breadcrumbCurrent.querySelector("input")) return;  // already editing
+  const c = _botsState.cache.find(x => x.id === state.conversationId);
+  const current = c ? c.title : els.breadcrumbCurrent.textContent;
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "breadcrumb-rename-input";
+  input.value = current;
+  input.maxLength = 200;
+  els.breadcrumbCurrent.textContent = "";
+  els.breadcrumbCurrent.appendChild(input);
+  input.focus();
+  input.select();
+
+  let settled = false;
+  const finish = async (save) => {
+    if (settled) return;
+    settled = true;
+    const name = input.value.trim();
+    // Remove the input BEFORE repainting — renderBreadcrumb() skips while an
+    // input is present, so it must be gone first or edit mode never exits.
+    input.remove();
+    if (save && name && name !== current) {
+      try {
+        await fetch(`/api/conversations/${state.conversationId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: name }),
+        });
+        await loadConversations();  // refresh cache → breadcrumb + bots list re-render
+        return;
+      } catch (_) { /* fall through to restore */ }
+    }
+    renderBreadcrumb();  // cancelled / unchanged / failed → restore label
+  };
+  input.addEventListener("keydown", e => {
+    e.stopPropagation();  // don't trigger global Esc-to-bots / ⌘K while typing
+    if (e.key === "Enter") { e.preventDefault(); finish(true); }
+    if (e.key === "Escape") { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
+  input.addEventListener("click", e => e.stopPropagation());
 }
 
 // ─── Unread / streaming indicator ───────────────────────────────────────
@@ -947,6 +999,11 @@ function initBotsUI() {
   }
   if (els.breadcrumbBack) {
     els.breadcrumbBack.addEventListener("click", () => applyActivePage("bots"));
+  }
+  if (els.breadcrumbCurrent) {
+    els.breadcrumbCurrent.addEventListener("click", () => {
+      if (state.conversationId) _beginRenameBot();
+    });
   }
   if (els.botsViewList) {
     els.botsViewList.addEventListener("click", () => _setBotsView("list"));
