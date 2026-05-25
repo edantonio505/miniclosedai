@@ -381,6 +381,16 @@ Your selection persists across reloads. Streaming chats keep playing when you fl
 
 Single full-page surface listing every saved conversation, newest first. Each card shows title · model · backend · relative last-updated time. The toolbar (search input + bot count) **stays pinned to the top via `position: sticky`** while the cards scroll under it — you can filter without losing your place. A **list ↔ grid view toggle** sits on the toolbar (your choice persists in `localStorage`): list is a vertical stack of full-width rows; grid is responsive auto-fill tiles. The **+ New bot** button at the top-right prompts for a name, creates the conversation, and drills straight into chat.
 
+<p align="center">
+  <img src="docs/images/bots_page_listview.png" alt="MiniClosedAI Bots page — list view: saved bots as full-width rows with title, model, backend, and last-updated time" width="820">
+  <br><em>Bots page — list view.</em>
+</p>
+
+<p align="center">
+  <img src="docs/images/bots_page_gridview.png" alt="MiniClosedAI Bots page — grid view: saved bots as responsive auto-fill tiles" width="820">
+  <br><em>Bots page — grid view (toggle on the toolbar).</em>
+</p>
+
 - **Click a card** → spatial slide-in animation, you land in that chat with full history.
 - **Card with a pulse dot** → that bot has a streaming reply in progress OR a completed reply you haven't viewed yet. Clicking the card clears the dot.
 - **Hover a card → row actions appear** on the right (work the same in list and grid view): **`</>` API code** (snippet modal scoped to that bot), **📚 Manage knowledge** (opens a modal listing that bot's documents — filename · chunks · size · date — with per-doc delete and an **+ Add document** button), **🧩 Manage extensions** (opens a modal listing that bot's MCP plugins with a per-server enable toggle, remove, and an add-by-URL row), **📊 Evals** (opens the score/auto-improve modal for that bot), and **🗑 Delete** (confirms with the bot's title, clears stale unread/streaming dots, falls back to the empty state if it was the last bot). All buttons stop event propagation so clicking them doesn't also open the chat; a gradient mask fades the title/meta underneath so the buttons read as an intentional overlay. Editing a bot that's currently open keeps its sidebar panels in sync.
@@ -499,6 +509,11 @@ Copy button works on both HTTPS/localhost (via `navigator.clipboard`) and plain-
 ### Logs page
 
 Click the **terminal icon** in the activity bar (between Bots and Settings) to open the LLM-activity viewer — same intent as LM Studio's "Server logs" panel. Every chat call across every endpoint shows up here:
+
+<p align="center">
+  <img src="docs/images/logs_page.png" alt="MiniClosedAI Logs page — per-call rows showing status, endpoint, model, latency, and timestamp, with a sticky filter toolbar" width="820">
+  <br><em>Logs page — live request/response viewer across all endpoints.</em>
+</p>
 
 - `POST /api/chat` (legacy)
 - `POST /api/chat/stream` (legacy SSE)

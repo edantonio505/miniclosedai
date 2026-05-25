@@ -356,6 +356,13 @@ See [Security](#security) and the README's [LAN access](./README.md#lan-access) 
 
 The UI is a **list/detail** pattern, not flat tabs. The activity bar has three icons — **Bots** (home, message-square), **Logs** (terminal), **Settings** (gear). The "Dashboard" page still exists internally (it's the chat surface) but has no nav button; you reach it by drilling into a bot from the list.
 
+<p align="center">
+  <img src="docs/images/bots_page_listview.png" alt="Bots page — list view" width="800"><br><em>Bots page — list view</em>
+</p>
+<p align="center">
+  <img src="docs/images/bots_page_gridview.png" alt="Bots page — grid view" width="800"><br><em>Bots page — grid view</em>
+</p>
+
 - **Bots page** — searchable cards; click to enter that chat. Slide-in animation. The toolbar (filter input + bot count + a **list ↔ grid view toggle**, persisted to `localStorage` key `miniclosedai:botsView`) is `position: sticky; top: 0; z-index: 10` with `background: var(--bg)` so it pins to the top of the scrolling `.page-bots` container while cards scroll underneath. Grid view is `.bots-list.grid-view` (responsive auto-fill tiles); list is the default vertical stack. `⌘K` / `Ctrl+K` from anywhere (or `/` outside a text field) jumps here and focuses the filter.
 - **Bot card row actions** — appear on `:hover` / `:focus-within` only, in `.bot-card-actions` (an absolutely-positioned strip on the right edge with a gradient mask fade): `</>` API code, **📚 Manage knowledge**, **🧩 Manage extensions**, and 🗑 Delete. All call `e.stopPropagation()` and carry the card's `data-conv-id`.
   - **📚 → Manage Knowledge modal** (`openKnowledgeModal`): lists the bot's documents (filename · chunk count · size · date) with per-doc delete, plus **+ Add document** which routes the shared hidden file input (`#bots-kb-file`) via `_triggerKbUpload({convId, onStatus, onDone})` → `_uploadKnowledgeToConv`.
@@ -414,6 +421,10 @@ The sidebar's scrollbar is hidden across all browsers; scrolling still works via
 ### Logs page
 
 Vertical-nav button (terminal icon, between Bots and Settings in the activity bar) opens the LLM activity viewer. Implementation detail in [Activity logs](#activity-logs) below; from a user's perspective it's a per-call row showing status / endpoint / model / latency / timestamp, click-to-expand for params + messages + response. The toolbar (filter input + entry count) is `position: sticky` at top of the scrolling container — same treatment as the Bots page — so the filter stays visible while rows scroll under it. Polling auto-pauses when the page isn't visible.
+
+<p align="center">
+  <img src="docs/images/logs_page.png" alt="Logs page — per-call request/response viewer" width="800"><br><em>Logs page</em>
+</p>
 
 ---
 
