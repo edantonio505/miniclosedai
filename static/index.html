@@ -239,6 +239,12 @@
         <div id="mcp-status" class="kb-status" hidden></div>
       </div>
 
+      <div class="panel evals-panel">
+        <h3>Evals <span class="kb-subtitle">— score &amp; auto-improve</span></h3>
+        <div id="evals-summary" class="evals-summary">No test cases yet.</div>
+        <button id="evals-manage-btn" type="button" class="btn btn-small kb-add-btn">Manage evals</button>
+      </div>
+
       <div class="panel status-panel">
         <h3>Status</h3>
         <div id="status-line">Checking Ollama…</div>
@@ -540,6 +546,56 @@
         <button id="mcp-modal-add-btn" type="button" class="btn btn-primary btn-small">Add</button>
       </div>
       <div id="mcp-modal-status" class="kb-status" hidden></div>
+    </div>
+  </div>
+
+  <!-- Evals Modal — opened by a bot card's 📊 action or the sidebar panel -->
+  <div id="eval-modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Evals <span id="eval-modal-bot" class="kb-modal-bot"></span></h3>
+        <button id="eval-modal-close" class="icon-btn" data-tooltip="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <p class="kb-modal-hint">Test cases (input → expected). <strong>Run</strong> to score accuracy; <strong>Auto-improve</strong> rewrites the system prompt against the failures and re-scores until it hits your target.</p>
+
+      <div class="eval-add-row">
+        <input id="eval-input" type="text" placeholder="input (what the user sends)" />
+        <input id="eval-expected" type="text" placeholder="expected response" />
+        <button id="eval-add-btn" type="button" class="btn btn-small">Add</button>
+      </div>
+      <div class="eval-toolbar">
+        <button id="eval-seed-btn" type="button" class="btn btn-small">Seed from history</button>
+        <button id="eval-csv-btn" type="button" class="btn btn-small">Upload CSV</button>
+        <input id="eval-csv-file" type="file" accept=".csv,text/csv" hidden />
+        <button id="eval-clear-btn" type="button" class="btn btn-small">Clear all</button>
+      </div>
+
+      <div id="eval-list" class="eval-list"></div>
+      <div id="eval-empty" class="kb-modal-empty" hidden>No test cases yet.</div>
+
+      <div class="eval-run-row">
+        <label class="eval-mode-label">Mode
+          <select id="eval-mode">
+            <option value="exact">Exact match</option>
+            <option value="contains">Contains</option>
+            <option value="judge">LLM judge</option>
+          </select>
+        </label>
+        <button id="eval-run-btn" type="button" class="btn btn-primary btn-small">Run</button>
+        <span id="eval-score" class="eval-score"></span>
+      </div>
+      <div id="eval-results" class="eval-results"></div>
+
+      <div class="eval-improve">
+        <strong>Auto-improve</strong>
+        <label>target % <input id="eval-target" type="number" min="1" max="100" value="100" /></label>
+        <label>max iters <input id="eval-iters" type="number" min="1" max="10" value="3" /></label>
+        <button id="eval-improve-btn" type="button" class="btn btn-small">Start</button>
+      </div>
+      <div id="eval-improve-log" class="eval-improve-log"></div>
+      <div id="eval-status" class="kb-status" hidden></div>
     </div>
   </div>
 

@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import pypdf
 
 import db
+import evals
 import knowledge
 import llm
 import logs as chat_logs
@@ -902,9 +903,10 @@ def api_update_conversation(conv_id: int, data: ConversationUpdate):
 def api_delete_conversation(conv_id: int):
     with db.get_conn() as conn:
         conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
-        # Logical-FK cleanup: drop this bot's knowledge base too.
+        # Logical-FK cleanup: drop this bot's knowledge base + eval cases too.
         conn.execute("DELETE FROM kb_chunks WHERE conversation_id = ?", (conv_id,))
         conn.execute("DELETE FROM kb_documents WHERE conversation_id = ?", (conv_id,))
+        conn.execute("DELETE FROM eval_cases WHERE conversation_id = ?", (conv_id,))
         conn.commit()
     return {"ok": True}
 
@@ -1161,6 +1163,154 @@ async def _run_mcp_tool_loop(model: str, messages: list[dict], eff: dict,
     # Exhausted the iteration budget — ask for a final answer without tools.
     final = await llm.chat(backend, model, convo, **params)
     return final or "(stopped: reached the maximum number of tool-call rounds)"
+
+
+# ---------- Per-bot evaluation (scoring) ----------
+
+class EvalCaseSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    input: str = Field(..., min_length=1)
+    expected: str = Field(..., min_length=1)
+
+
+class EvalCasesCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cases: list[EvalCaseSpec]
+
+
+class EvalRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["exact", "contains", "judge"] = "exact"
+    # For judge mode — which model grades. Supplied by the frontend from the
+    # user's Prompt-Generator model choice. Ignored for exact/contains.
+    judge_backend_id: int | None = None
+    judge_model: str | None = None
+
+
+@app.post("/api/conversations/{conv_id}/eval/cases")
+def api_add_eval_cases(conv_id: int, body: EvalCasesCreate):
+    """Bulk-add test cases to a bot's eval set."""
+    _conv_exists(conv_id)
+    with db.get_conn() as conn:
+        for c in body.cases:
+            conn.execute(
+                "INSERT INTO eval_cases (conversation_id, input, expected) VALUES (?, ?, ?)",
+                (conv_id, c.input, c.expected),
+            )
+        conn.commit()
+    return {"added": len(body.cases)}
+
+
+@app.get("/api/conversations/{conv_id}/eval/cases")
+def api_list_eval_cases(conv_id: int):
+    """List a bot's eval cases (newest first)."""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, input, expected, created_at FROM eval_cases
+               WHERE conversation_id = ? ORDER BY id ASC""",
+            (conv_id,),
+        ).fetchall()
+    return {"cases": [dict(r) for r in rows]}
+
+
+@app.delete("/api/conversations/{conv_id}/eval/cases/{case_id}")
+def api_delete_eval_case(conv_id: int, case_id: int):
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM eval_cases WHERE id = ? AND conversation_id = ?",
+            (case_id, conv_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Eval case not found")
+    return {"ok": True}
+
+
+@app.delete("/api/conversations/{conv_id}/eval/cases")
+def api_clear_eval_cases(conv_id: int):
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM eval_cases WHERE conversation_id = ?", (conv_id,))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/conversations/{conv_id}/eval/seed")
+def api_seed_eval_cases(conv_id: int):
+    """Seed eval cases from this bot's saved chat history — each user→assistant
+    pair becomes a case (input=user turn, expected=assistant reply). Reuses the
+    same pair extraction as the dataset CSV export."""
+    conv = _conv_exists(conv_id)
+    pairs = list(_iter_pairs(conv.get("messages", []) or []))
+    added = 0
+    with db.get_conn() as conn:
+        for user_msg, assistant_msg in pairs:
+            inp = _content_text_for_export(user_msg.get("display_text", user_msg.get("content", "")))
+            exp = _content_text_for_export(assistant_msg.get("content", ""))
+            if not inp.strip() or not exp.strip():
+                continue
+            conn.execute(
+                "INSERT INTO eval_cases (conversation_id, input, expected) VALUES (?, ?, ?)",
+                (conv_id, inp, exp),
+            )
+            added += 1
+        conn.commit()
+    return {"added": added}
+
+
+@app.post("/api/conversations/{conv_id}/eval/run")
+async def api_run_eval(conv_id: int, req: EvalRunRequest):
+    """Run the bot over its eval set and score each case. Returns per-case
+    results + overall accuracy. Scoring mode: exact | contains | judge."""
+    _conv_exists(conv_id)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, input, expected FROM eval_cases WHERE conversation_id = ? ORDER BY id ASC",
+            (conv_id,),
+        ).fetchall()
+    cases = [dict(r) for r in rows]
+    if not cases:
+        return {"mode": req.mode, "total": 0, "passed": 0, "accuracy": 0.0, "results": []}
+
+    judge_backend = None
+    if req.mode == "judge":
+        if not req.judge_model:
+            raise HTTPException(400, "judge mode requires judge_model (and judge_backend_id).")
+        judge_backend = _load_backend(req.judge_backend_id)
+
+    results = []
+    passed = 0
+    for c in cases:
+        try:
+            reply = await _run_conv_message(conv_id, c["input"])
+        except (httpx.ConnectError, RuntimeError) as e:
+            reply = f"(error: {e})"
+        if req.mode == "judge":
+            try:
+                verdict = await llm.chat(
+                    judge_backend, req.judge_model,
+                    evals.build_judge_messages(c["input"], c["expected"], reply),
+                    temperature=0.0, max_tokens=8, think=False,
+                )
+                ok = evals.parse_judge(verdict)
+            except (httpx.ConnectError, RuntimeError):
+                ok = False
+        else:
+            ok = evals.score(req.mode, reply, c["expected"])
+        if ok:
+            passed += 1
+        results.append({
+            "case_id": c["id"], "input": c["input"], "expected": c["expected"],
+            "got": reply, "passed": ok,
+        })
+
+    total = len(cases)
+    return {
+        "mode": req.mode,
+        "total": total,
+        "passed": passed,
+        "accuracy": round(passed / total, 4),
+        "results": results,
+    }
 
 
 class MessageEditRequest(BaseModel):
@@ -1964,6 +2114,25 @@ def _persist_conv_chat_turn(
             (json.dumps(existing), conv_id),
         )
         conn.commit()
+
+
+async def _run_conv_message(conv_id: int, message: str) -> str:
+    """Run ONE message through a bot's full configured path (knowledge + MCP +
+    relay), one-shot: no history, no persist, no chat-log entry. Used by the
+    eval runner so a scored response is exactly what the bot would return in
+    production. Mirrors the core sequence of api_conv_chat."""
+    req = ConversationChatRequest(message=message, include_history=False, persist=False)
+    conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
+    mcp_servers = _enabled_mcp_servers(conv)
+    await _augment_messages_with_knowledge(conv_id, messages, message, backend)
+    backend = await _maybe_override_to_relay(backend, eff["model"])
+    if mcp_servers:
+        return await _run_mcp_tool_loop(eff["model"], messages, eff, backend, mcp_servers)
+    return await llm.chat(
+        backend, eff["model"], messages,
+        temperature=eff["temperature"], max_tokens=eff["max_tokens"],
+        top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
+    )
 
 
 @app.post("/api/conversations/{conv_id}/chat")

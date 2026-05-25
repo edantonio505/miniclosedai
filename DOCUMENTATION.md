@@ -26,24 +26,27 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 3. [Running](#running)
 4. [Docker deployment](#docker-deployment)
 5. [UI features](#ui-features)
-6. [Worked example — connecting Bonsai (1-bit 8B)](#worked-example--connecting-bonsai-1-bit-8b)
-7. [Per-chat microservice pattern](#per-chat-microservice-pattern)
-8. [API reference](#api-reference)
-9. [Thinking / reasoning control](#thinking--reasoning-control)
-10. [Stopping generation](#stopping-generation)
-11. [Fine-tuning data export](#fine-tuning-data-export)
-12. [Worked example — automated image labeling](#worked-example--automated-image-labeling)
-13. [Worked example — chatbot frontends (Python CLI + HTML widget)](#worked-example--chatbot-frontends-python-cli--html-widget)
-14. [Client SDK — composing bots from your code](#client-sdk--composing-bots-from-your-code)
-15. [Bot import / export](#bot-import--export)
-16. [Self-upgrade](#self-upgrade)
-17. [Prompt generator](#prompt-generator)
-18. [Activity logs](#activity-logs)
-19. [Database](#database)
-20. [Configuration](#configuration)
-21. [File layout](#file-layout)
-22. [Security](#security)
-23. [Troubleshooting](#troubleshooting)
+6. [Knowledge base (RAG)](#knowledge-base-rag)
+7. [Extensibility — MCP plugins](#extensibility--mcp-plugins)
+8. [Evaluation & auto-improve](#evaluation--auto-improve-scoring)
+9. [Worked example — connecting Bonsai (1-bit 8B)](#worked-example--connecting-bonsai-1-bit-8b)
+10. [Per-chat microservice pattern](#per-chat-microservice-pattern)
+11. [API reference](#api-reference)
+12. [Thinking / reasoning control](#thinking--reasoning-control)
+13. [Stopping generation](#stopping-generation)
+14. [Fine-tuning data export](#fine-tuning-data-export)
+15. [Worked example — automated image labeling](#worked-example--automated-image-labeling)
+16. [Worked example — chatbot frontends (Python CLI + HTML widget)](#worked-example--chatbot-frontends-python-cli--html-widget)
+17. [Client SDK — composing bots from your code](#client-sdk--composing-bots-from-your-code)
+18. [Bot import / export](#bot-import--export)
+19. [Self-upgrade](#self-upgrade)
+20. [Prompt generator](#prompt-generator)
+21. [Activity logs](#activity-logs)
+22. [Database](#database)
+23. [Configuration](#configuration)
+24. [File layout](#file-layout)
+25. [Security](#security)
+26. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -472,6 +475,45 @@ if __name__ == "__main__":
 Run it (`python docs/examples/mcp_server/server.py`), then add `http://localhost:8765/mcp` in a bot's **Extensions** panel. The function's type hints + docstring *are* the tool schema — no separate spec. The mount path is always `/mcp`; the transport must be `streamable-http` (stdio servers aren't reachable by the host's `streamablehttp_client`).
 
 **Verified live:** with this example server + a `qwen3:8b` bot, MiniClosedAI lists the three tools, and asking "what's the weather in Reykjavik?" triggers a real `CallToolRequest` and the bot answers using the tool's returned value — confirming the full host → model → tool → model loop.
+
+---
+
+## Evaluation & auto-improve (scoring)
+
+Bots are often fixed-response (classifiers / routers / extractors). The eval system lets you measure a bot's accuracy against a set of test cases and then auto-tune its system prompt against the failures — turning blind prompt-editing into a measure → improve → re-measure loop.
+
+**Data model** (`db.py`): one table, mirroring the knowledge pattern.
+- `eval_cases(id, conversation_id, input, expected, created_at)` — keyed to the bot by `conversation_id` (logical FK). Cleaned up in the conversation-delete handler (alongside the kb tables). Scores are computed on demand, never stored.
+
+**Scoring module** `evals.py` (stdlib): `normalize()` (trim + lowercase + collapse whitespace), `score_exact` / `score_contains`, and the LLM-judge helpers `build_judge_messages(input, expected, reply)` + `parse_judge(text)` (YES/NO).
+
+**Endpoints** (app.py):
+- `POST /api/conversations/{id}/eval/cases` — bulk add `{cases:[{input,expected}]}`.
+- `GET /api/conversations/{id}/eval/cases` — list.
+- `DELETE .../eval/cases/{case_id}` and `DELETE .../eval/cases` — remove one / clear all.
+- `POST .../eval/seed` — turn the bot's saved chat history into cases (reuses `_iter_pairs` / `_content_text_for_export`, the same pair extraction as the CSV export).
+- `POST .../eval/run` — body `{mode, judge_backend_id?, judge_model?}`. For each case, runs the bot via **`_run_conv_message`** (a one-shot, no-history, no-log helper extracted from `api_conv_chat`, so scoring exercises the bot's *real* path — knowledge + MCP + relay all apply), then scores by `mode`:
+  - `exact` — normalized equality (default; best for fixed-response bots).
+  - `contains` — normalized expected is a substring of the reply.
+  - `judge` — calls `llm.chat(judge_backend, judge_model, build_judge_messages(...))` and parses YES/NO. The grader model is supplied by the frontend from the user's Prompt-Generator choice; a 400 is returned if `judge_model` is missing.
+  - Returns `{mode, total, passed, accuracy, results:[{case_id, input, expected, got, passed}]}`.
+
+**Frontend** mirrors the Knowledge/Extensions surfaces — a sidebar **Evals** panel (case count + "Manage evals") and an **Evals modal** (`eval-modal-backdrop`) with: add-case row, **Seed from history** + **Upload CSV** + **Clear all**, the case list, a scoring-mode selector + **Run** (per-case pass/fail + accuracy %), and the **Auto-improve** controls (target %, max iters, Start). A 📊 bot-card action opens the modal too. Functions: `loadEvals`, `openEvalModal`, `_loadEvalModal`, `runEvals`, `autoImproveLoop`, `initEvalsUI`, `initEvalModalUI`.
+
+**Auto-improve loop** (`autoImproveLoop`, client-side, in the modal):
+```
+for i in range(maxIters):
+    res = await runEvals(mode)                  // POST /eval/run (scores server-side)
+    record {accuracy, prompt: systemPromptTextarea.value}; track best
+    if res.accuracy >= target: break
+    summary = failing cases → "INPUT / EXPECTED / GOT" lines
+    await _runPromptGeneration(summary)         // reuses the existing Improve-prompt flow → streams a new prompt into #system-prompt
+    await flushPendingSave()                     // persist so the next run scores the new prompt
+restore the best-scoring prompt + persist; show the score history
+```
+The loop is **orchestrated client-side** specifically so the improve meta-prompt stays single-sourced in the existing prompt-generator code (`_runPromptGeneration` / `_PROMPT_IMPROVE_META_PROMPT`) rather than being duplicated server-side. Judge mode + auto-improve require a Prompt-Generator model (Settings → Prompt Generator).
+
+**Verified live** with `qwen3:8b`: a sentiment classifier scored 100% (exact) on a clean 4-case set, dropped to 80% when a deliberately-wrong expected was added, and judge mode graded the same set; deleting the bot cascaded its eval cases away.
 
 ---
 

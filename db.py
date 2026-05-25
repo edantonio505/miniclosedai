@@ -88,6 +88,19 @@ CREATE TABLE IF NOT EXISTS kb_chunks (
 
 CREATE INDEX IF NOT EXISTS idx_kb_chunks_conv ON kb_chunks(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_kb_docs_conv  ON kb_documents(conversation_id);
+
+-- Per-bot evaluation set. Each row is one test case: an input and the expected
+-- response. Scoring (accuracy over the set) is computed on demand, not stored.
+-- Cleanup of a conversation's cases happens in app.py's delete handler.
+CREATE TABLE IF NOT EXISTS eval_cases (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL,
+    input           TEXT    NOT NULL,
+    expected        TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_cases_conv ON eval_cases(conversation_id);
 """
 
 
