@@ -2919,7 +2919,9 @@ function applyTheme(choice) {
   els.themeIconLight.style.display = choice === "light" ? "" : "none";
   els.themeIconDark.style.display = choice === "dark" ? "" : "none";
   els.themeIconSystem.style.display = choice === "system" ? "" : "none";
-  els.themeToggle.dataset.tooltip = `Theme: ${choice} (click to cycle)`;
+  // Native title (matches the other activity-bar items + avoids the custom
+  // tooltip clipping off the left edge of the narrow activity bar).
+  els.themeToggle.title = `Theme: ${choice} (click to cycle)`;
 }
 
 function initTheme() {
@@ -3619,7 +3621,7 @@ function applyActivePage(page) {
   }
 
   document.body.dataset.page = p;
-  document.querySelectorAll(".activity-bar .nav-item").forEach(btn => {
+  document.querySelectorAll(".activity-bar .nav-item[data-page]").forEach(btn => {
     // The Bots nav-item owns BOTH the bots list and the chat (dashboard).
     const owns = btn.dataset.page === "bots" ? _BOTS_AREA.has(p) : btn.dataset.page === p;
     btn.classList.toggle("active", owns);
@@ -3645,7 +3647,9 @@ function applyActivePage(page) {
 }
 
 function initActivityBar() {
-  document.querySelectorAll(".activity-bar .nav-item").forEach(btn => {
+  // Only page buttons get the page-switch handler. The theme toggle is a
+  // .nav-item WITHOUT data-page and owns its own click handler (see initTheme).
+  document.querySelectorAll(".activity-bar .nav-item[data-page]").forEach(btn => {
     btn.addEventListener("click", () => applyActivePage(btn.dataset.page));
   });
   const saved = (() => { try { return localStorage.getItem(ACTIVE_PAGE_KEY); } catch { return null; } })();
