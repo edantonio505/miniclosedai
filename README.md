@@ -26,7 +26,7 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 3. [Install](#install) · [One-line install](#quickest--one-line-install-macos-linux-wsl) · [Docker quick start (with baked models)](#docker-quick-start-with-baked-models)
 4. [Run](#run)
 5. [Your first bot — 60 seconds](#your-first-bot--60-seconds)
-6. [UI guide](#ui-guide)
+6. [UI guide](#ui-guide) · [Sidebar panels — Knowledge / Extensions / Evals](#sidebar)
 7. [Connecting LM Studio and other OpenAI-compatible endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)
 8. [Generating system prompts](#generating-system-prompts)
 9. [The microservice pattern](#the-microservice-pattern)

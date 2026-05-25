@@ -47,6 +47,7 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 24. [File layout](#file-layout)
 25. [Security](#security)
 26. [Troubleshooting](#troubleshooting)
+27. [Testing](#testing)
 
 ---
 
