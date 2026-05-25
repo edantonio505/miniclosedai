@@ -894,6 +894,13 @@ def _():
     assert 'id="kb-add-btn"' in body
     assert 'id="mcp-list"' in body
     assert 'id="mcp-url-input"' in body
+    # Shared hidden file input for per-card "add knowledge".
+    assert 'id="bots-kb-file"' in body
+    # Manage Knowledge + Manage Extensions modals.
+    assert 'id="kb-modal-backdrop"' in body
+    assert 'id="kb-modal-list"' in body
+    assert 'id="mcp-modal-backdrop"' in body
+    assert 'id="mcp-modal-list"' in body
 
 
 @test("static: app.js is served and contains recent helpers")
@@ -916,6 +923,12 @@ def _():
         # Knowledge (RAG) + Extensions (MCP) panels
         "loadKnowledge", "addKnowledgeFiles", "initKnowledgeUI",
         "loadMcp", "addMcpServer", "initMcpUI",
+        # Per-card quick-add actions
+        "_uploadKnowledgeToConv", "_addMcpToConv",
+        "_botCardFlash", "_triggerKbUpload",
+        # Manage Knowledge + Manage Extensions modals
+        "openKnowledgeModal", "_loadKbModal", "initKnowledgeModalUI",
+        "openMcpModal", "_loadMcpModal", "initMcpModalUI",
     ]
     for needle in needles:
         assert needle in r.text, f"missing {needle} in served app.js"

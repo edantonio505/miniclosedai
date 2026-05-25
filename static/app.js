@@ -23,6 +23,22 @@ const els = {
   mcpUrlInput: document.getElementById("mcp-url-input"),
   mcpAddBtn: document.getElementById("mcp-add-btn"),
   mcpStatus: document.getElementById("mcp-status"),
+  botsKbFile: document.getElementById("bots-kb-file"),
+  kbModalBackdrop: document.getElementById("kb-modal-backdrop"),
+  kbModalBot: document.getElementById("kb-modal-bot"),
+  kbModalClose: document.getElementById("kb-modal-close"),
+  kbModalList: document.getElementById("kb-modal-list"),
+  kbModalEmpty: document.getElementById("kb-modal-empty"),
+  kbModalAdd: document.getElementById("kb-modal-add"),
+  kbModalStatus: document.getElementById("kb-modal-status"),
+  mcpModalBackdrop: document.getElementById("mcp-modal-backdrop"),
+  mcpModalBot: document.getElementById("mcp-modal-bot"),
+  mcpModalClose: document.getElementById("mcp-modal-close"),
+  mcpModalList: document.getElementById("mcp-modal-list"),
+  mcpModalEmpty: document.getElementById("mcp-modal-empty"),
+  mcpModalUrl: document.getElementById("mcp-modal-url"),
+  mcpModalAddBtn: document.getElementById("mcp-modal-add-btn"),
+  mcpModalStatus: document.getElementById("mcp-modal-status"),
   newChatBtn: document.getElementById("new-chat-btn"),
   clearChatBtn: document.getElementById("clear-chat-btn"),
   downloadCsvBtn: document.getElementById("download-csv-btn"),
@@ -518,6 +534,7 @@ function renderBotsPage() {
   for (const c of filtered) {
     const card = document.createElement("div");
     card.className = "bot-card";
+    card.dataset.convId = String(c.id);
     if (c.id === state.conversationId) card.classList.add("active");
     if (_streaming.has(c.id) || _unread.has(c.id)) card.classList.add("has-pending");
     card.tabIndex = 0;
@@ -566,6 +583,30 @@ function renderBotsPage() {
       openApiCodeForConv(c.id);
     });
 
+    const kbBtn = document.createElement("button");
+    kbBtn.type = "button";
+    kbBtn.className = "bot-card-action";
+    kbBtn.setAttribute("aria-label", `Manage knowledge for ${c.title}`);
+    kbBtn.dataset.tooltip = "Manage knowledge";
+    kbBtn.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>';
+    kbBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      openKnowledgeModal(c.id, c.title);
+    });
+
+    const mcpBtn = document.createElement("button");
+    mcpBtn.type = "button";
+    mcpBtn.className = "bot-card-action";
+    mcpBtn.setAttribute("aria-label", `Manage extensions for ${c.title}`);
+    mcpBtn.dataset.tooltip = "Manage extensions (MCP plugins)";
+    mcpBtn.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>';
+    mcpBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      openMcpModal(c.id, c.title);
+    });
+
     const delBtn = document.createElement("button");
     delBtn.type = "button";
     delBtn.className = "bot-card-action danger";
@@ -579,6 +620,8 @@ function renderBotsPage() {
     });
 
     actions.appendChild(codeBtn);
+    actions.appendChild(kbBtn);
+    actions.appendChild(mcpBtn);
     actions.appendChild(delBtn);
     card.appendChild(actions);
 
@@ -715,9 +758,291 @@ function initBotsUI() {
   if (els.botsViewGrid) {
     els.botsViewGrid.addEventListener("click", () => _setBotsView("grid"));
   }
+  // Shared hidden file input for "add knowledge" flows (card + manage modal).
+  // `_kbUploadTarget` = { convId, onStatus(msg,err), onDone(added) }.
+  if (els.botsKbFile) {
+    els.botsKbFile.addEventListener("change", async () => {
+      const t = _kbUploadTarget;
+      const files = els.botsKbFile.files;
+      els.botsKbFile.value = "";   // allow re-picking the same file
+      if (!t || !files || !files.length) return;
+      const added = await _uploadKnowledgeToConv(t.convId, files, t.onStatus);
+      if (t.onDone) t.onDone(added);
+    });
+  }
   _applyBotsView();  // reflect the restored view on first paint
   // Global keyboard affordances — Esc exits chat, ⌘K / `/` opens the quick switcher.
   document.addEventListener("keydown", _botsHotkeyHandler);
+}
+
+// ─── Per-card quick-add actions (Knowledge + MCP, from the bots list) ────
+// Equip a bot without opening it. The file picker / URL box act on the card's
+// own conversation id; you never leave the list.
+
+let _kbUploadTarget = null;  // { convId, onStatus, onDone } for the shared input
+
+function _triggerKbUpload(target) {
+  if (!els.botsKbFile) return;
+  _kbUploadTarget = target;
+  els.botsKbFile.click();
+}
+
+function _findBotCard(convId) {
+  return els.botsList && els.botsList.querySelector(`.bot-card[data-conv-id="${convId}"]`);
+}
+
+// Transient one-line status under a card (e.g. "Added 2 to knowledge ✓").
+function _botCardFlash(convId, msg, isError) {
+  const card = _findBotCard(convId);
+  if (!card) return;
+  let flash = card.querySelector(".bot-card-flash");
+  if (!flash) {
+    flash = document.createElement("div");
+    flash.className = "bot-card-flash";
+    card.appendChild(flash);
+  }
+  flash.textContent = msg;
+  flash.classList.toggle("is-error", !!isError);
+  clearTimeout(flash._t);
+  flash._t = setTimeout(() => { flash.remove(); }, 3000);
+}
+
+// ─── Manage Knowledge modal (view + add + delete a bot's documents) ─────
+let _kbModalConvId = null;
+
+function _kbModalSetStatus(msg, isError) {
+  if (!els.kbModalStatus) return;
+  if (!msg) { els.kbModalStatus.hidden = true; els.kbModalStatus.textContent = ""; return; }
+  els.kbModalStatus.hidden = false;
+  els.kbModalStatus.textContent = msg;
+  els.kbModalStatus.classList.toggle("kb-error", !!isError);
+}
+
+function _fmtBytes(n) {
+  if (!n) return "0 B";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function _renderKbModalDocs(docs) {
+  if (!els.kbModalList) return;
+  els.kbModalList.innerHTML = "";
+  const list = docs || [];
+  if (els.kbModalEmpty) els.kbModalEmpty.hidden = list.length > 0;
+  for (const d of list) {
+    const row = document.createElement("div");
+    row.className = "kb-modal-doc";
+
+    const info = document.createElement("div");
+    info.className = "kb-modal-doc-info";
+    const name = document.createElement("div");
+    name.className = "kb-modal-doc-name";
+    name.textContent = d.filename;
+    name.title = d.filename;
+    const meta = document.createElement("div");
+    meta.className = "kb-modal-doc-meta";
+    const when = (d.created_at || "").replace("T", " ").slice(0, 16);
+    meta.textContent =
+      `${d.chunk_count} chunk${d.chunk_count === 1 ? "" : "s"} · ${_fmtBytes(d.char_count)}` +
+      (when ? ` · ${when}` : "");
+    info.appendChild(name);
+    info.appendChild(meta);
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "kb-modal-doc-del";
+    del.title = "Delete document";
+    del.setAttribute("aria-label", `Delete ${d.filename}`);
+    del.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>';
+    del.addEventListener("click", async () => {
+      const r = await fetch(`/api/conversations/${_kbModalConvId}/knowledge/${d.id}`, { method: "DELETE" });
+      if (r.ok) {
+        await _loadKbModal();
+        if (_kbModalConvId === state.conversationId) loadKnowledge();
+      }
+    });
+
+    row.appendChild(info);
+    row.appendChild(del);
+    els.kbModalList.appendChild(row);
+  }
+}
+
+async function _loadKbModal() {
+  if (_kbModalConvId == null) return;
+  try {
+    const r = await fetch(`/api/conversations/${_kbModalConvId}/knowledge`);
+    _renderKbModalDocs(r.ok ? ((await r.json()).documents || []) : []);
+  } catch (_) {
+    _renderKbModalDocs([]);
+  }
+}
+
+function openKnowledgeModal(convId, title) {
+  _kbModalConvId = convId;
+  if (els.kbModalBot) els.kbModalBot.textContent = title ? `— ${title}` : "";
+  _kbModalSetStatus("", false);
+  _renderKbModalDocs([]);
+  _loadKbModal();
+  if (els.kbModalBackdrop) els.kbModalBackdrop.classList.remove("hidden");
+}
+
+function closeKnowledgeModal() {
+  if (els.kbModalBackdrop) els.kbModalBackdrop.classList.add("hidden");
+  _kbModalConvId = null;
+}
+
+function initKnowledgeModalUI() {
+  if (els.kbModalClose) els.kbModalClose.addEventListener("click", closeKnowledgeModal);
+  if (els.kbModalBackdrop) {
+    els.kbModalBackdrop.addEventListener("click", e => {
+      if (e.target === els.kbModalBackdrop) closeKnowledgeModal();
+    });
+  }
+  if (els.kbModalAdd) {
+    els.kbModalAdd.addEventListener("click", () => {
+      _triggerKbUpload({
+        convId: _kbModalConvId,
+        onStatus: _kbModalSetStatus,
+        onDone: async (added) => {
+          if (added) _kbModalSetStatus(`Added ${added} document${added === 1 ? "" : "s"} ✓`, false);
+          await _loadKbModal();
+          if (_kbModalConvId === state.conversationId) loadKnowledge();
+        },
+      });
+    });
+  }
+}
+
+// ─── Manage Extensions modal (view + toggle + remove + add MCP plugins) ──
+let _mcpModalConvId = null;
+let _mcpModalServers = [];
+
+function _mcpModalSetStatus(msg, isError) {
+  if (!els.mcpModalStatus) return;
+  if (!msg) { els.mcpModalStatus.hidden = true; els.mcpModalStatus.textContent = ""; return; }
+  els.mcpModalStatus.hidden = false;
+  els.mcpModalStatus.textContent = msg;
+  els.mcpModalStatus.classList.toggle("kb-error", !!isError);
+}
+
+function _renderMcpModalServers() {
+  if (!els.mcpModalList) return;
+  els.mcpModalList.innerHTML = "";
+  const servers = _mcpModalServers || [];
+  if (els.mcpModalEmpty) els.mcpModalEmpty.hidden = servers.length > 0;
+  servers.forEach((srv, i) => {
+    const row = document.createElement("div");
+    row.className = "kb-modal-doc" + (srv.enabled === false ? " disabled" : "");
+
+    const toggle = document.createElement("input");
+    toggle.type = "checkbox";
+    toggle.className = "kb-modal-doc-toggle";
+    toggle.checked = srv.enabled !== false;
+    toggle.title = "Enable/disable this plugin";
+    toggle.addEventListener("change", async () => {
+      _mcpModalServers[i].enabled = toggle.checked;
+      await _saveMcpModal();
+      _renderMcpModalServers();
+    });
+
+    const info = document.createElement("div");
+    info.className = "kb-modal-doc-info";
+    const name = document.createElement("div");
+    name.className = "kb-modal-doc-name";
+    name.textContent = srv.name || srv.url;
+    const meta = document.createElement("div");
+    meta.className = "kb-modal-doc-meta";
+    meta.textContent = srv.url;
+    meta.title = srv.url;
+    info.appendChild(name);
+    info.appendChild(meta);
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "kb-modal-doc-del";
+    del.title = "Remove plugin";
+    del.setAttribute("aria-label", `Remove ${srv.name || srv.url}`);
+    del.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>';
+    del.addEventListener("click", async () => {
+      _mcpModalServers.splice(i, 1);
+      await _saveMcpModal();
+      _renderMcpModalServers();
+    });
+
+    row.appendChild(toggle);
+    row.appendChild(info);
+    row.appendChild(del);
+    els.mcpModalList.appendChild(row);
+  });
+}
+
+async function _saveMcpModal() {
+  if (_mcpModalConvId == null) return;
+  await fetch(`/api/conversations/${_mcpModalConvId}/mcp`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ servers: _mcpModalServers }),
+  });
+  if (_mcpModalConvId === state.conversationId) loadMcp();  // sync sidebar
+}
+
+async function _loadMcpModal() {
+  if (_mcpModalConvId == null) return;
+  try {
+    const r = await fetch(`/api/conversations/${_mcpModalConvId}/mcp`);
+    _mcpModalServers = r.ok ? ((await r.json()).servers || []) : [];
+  } catch (_) {
+    _mcpModalServers = [];
+  }
+  _renderMcpModalServers();
+}
+
+function openMcpModal(convId, title) {
+  _mcpModalConvId = convId;
+  _mcpModalServers = [];
+  if (els.mcpModalBot) els.mcpModalBot.textContent = title ? `— ${title}` : "";
+  if (els.mcpModalUrl) els.mcpModalUrl.value = "";
+  _mcpModalSetStatus("", false);
+  _renderMcpModalServers();
+  _loadMcpModal();
+  if (els.mcpModalBackdrop) els.mcpModalBackdrop.classList.remove("hidden");
+}
+
+function closeMcpModal() {
+  if (els.mcpModalBackdrop) els.mcpModalBackdrop.classList.add("hidden");
+  _mcpModalConvId = null;
+}
+
+async function _mcpModalAdd() {
+  const url = (els.mcpModalUrl.value || "").trim();
+  if (!url || _mcpModalConvId == null) return;
+  els.mcpModalAddBtn.disabled = true;
+  const ok = await _addMcpToConv(_mcpModalConvId, url, _mcpModalSetStatus);
+  els.mcpModalAddBtn.disabled = false;
+  if (ok) {
+    els.mcpModalUrl.value = "";
+    await _loadMcpModal();
+    if (_mcpModalConvId === state.conversationId) loadMcp();
+  }
+}
+
+function initMcpModalUI() {
+  if (els.mcpModalClose) els.mcpModalClose.addEventListener("click", closeMcpModal);
+  if (els.mcpModalBackdrop) {
+    els.mcpModalBackdrop.addEventListener("click", e => {
+      if (e.target === els.mcpModalBackdrop) closeMcpModal();
+    });
+  }
+  if (els.mcpModalAddBtn) els.mcpModalAddBtn.addEventListener("click", _mcpModalAdd);
+  if (els.mcpModalUrl) {
+    els.mcpModalUrl.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); _mcpModalAdd(); }
+    });
+  }
 }
 
 // ─── Per-bot Knowledge base (RAG) ───────────────────────────────────────
@@ -808,38 +1133,47 @@ async function _kbExtractText(file) {
   return await file.text();
 }
 
-async function addKnowledgeFiles(files) {
-  if (!state.conversationId) {
-    alert("Open or create a bot first (send a message, or use + New bot), then add knowledge.");
-    return;
-  }
+// Upload + embed a set of files into a SPECIFIC bot's knowledge base. Conv id
+// is explicit (not state.conversationId) so the bots-list cards can target
+// their own bot. `onStatus(msg, isError)` receives progress. Returns the count
+// of documents successfully added.
+async function _uploadKnowledgeToConv(convId, files, onStatus) {
   const list = Array.from(files || []);
-  if (!list.length) return;
+  if (!list.length) return 0;
   let added = 0;
   for (let i = 0; i < list.length; i++) {
     const file = list[i];
-    _kbSetStatus(`Processing ${file.name} (${i + 1}/${list.length})…`, false);
+    if (onStatus) onStatus(`Processing ${file.name} (${i + 1}/${list.length})…`, false);
     try {
       const text = await _kbExtractText(file);
       if (!text.trim()) {
-        _kbSetStatus(`${file.name}: no extractable text — skipped.`, true);
+        if (onStatus) onStatus(`${file.name}: no extractable text — skipped.`, true);
         continue;
       }
-      const r = await fetch(`/api/conversations/${state.conversationId}/knowledge`, {
+      const r = await fetch(`/api/conversations/${convId}/knowledge`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filename: file.name, text }),
       });
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
-        _kbSetStatus(err.detail || `${file.name}: failed (${r.status}).`, true);
+        if (onStatus) onStatus(err.detail || `${file.name}: failed (${r.status}).`, true);
         continue;  // keep going with the rest
       }
       added++;
     } catch (e) {
-      _kbSetStatus(`${file.name}: ${e.message}`, true);
+      if (onStatus) onStatus(`${file.name}: ${e.message}`, true);
     }
   }
+  return added;
+}
+
+async function addKnowledgeFiles(files) {
+  if (!state.conversationId) {
+    alert("Open or create a bot first (send a message, or use + New bot), then add knowledge.");
+    return;
+  }
+  const added = await _uploadKnowledgeToConv(state.conversationId, files, _kbSetStatus);
   if (added) _kbSetStatus(`Added ${added} document${added === 1 ? "" : "s"}.`, false);
   await loadKnowledge();
 }
@@ -941,6 +1275,45 @@ async function saveMcp() {
   });
 }
 
+// Validate an MCP server URL (lists its tools) and append it to a SPECIFIC
+// bot's plugin list. Conv id is explicit so the bots-list cards can target
+// their own bot. Returns true on success. `onStatus(msg, isError)` for feedback.
+async function _addMcpToConv(convId, url, onStatus) {
+  if (onStatus) onStatus("Connecting to MCP server…", false);
+  let resp;
+  try {
+    const r = await fetch(`/api/conversations/${convId}/mcp/test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    resp = await r.json();
+  } catch (e) {
+    if (onStatus) onStatus(`Could not reach ${url}.`, true);
+    return false;
+  }
+  if (!resp.ok) {
+    if (onStatus) onStatus(`Couldn't connect: ${resp.error || "unknown error"}`, true);
+    return false;
+  }
+  // Append to the bot's existing server list and persist.
+  let servers = [];
+  try {
+    servers = (await (await fetch(`/api/conversations/${convId}/mcp`)).json()).servers || [];
+  } catch (_) {}
+  let host = url;
+  try { host = new URL(url).host; } catch (_) {}
+  servers.push({ name: host, url, enabled: true });
+  await fetch(`/api/conversations/${convId}/mcp`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ servers }),
+  });
+  const n = (resp.tools || []).length;
+  if (onStatus) onStatus(`Added — ${n} tool${n === 1 ? "" : "s"} available.`, false);
+  return true;
+}
+
 async function addMcpServer() {
   if (!state.conversationId) {
     alert("Open or create a bot first, then add plugins.");
@@ -948,31 +1321,11 @@ async function addMcpServer() {
   }
   const url = (els.mcpUrlInput.value || "").trim();
   if (!url) return;
-  _mcpSetStatus("Connecting to MCP server…", false);
-  let resp;
-  try {
-    const r = await fetch(`/api/conversations/${state.conversationId}/mcp/test`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-    resp = await r.json();
-  } catch (e) {
-    _mcpSetStatus(`Could not reach ${url}.`, true);
-    return;
+  const ok = await _addMcpToConv(state.conversationId, url, _mcpSetStatus);
+  if (ok) {
+    els.mcpUrlInput.value = "";
+    await loadMcp();
   }
-  if (!resp.ok) {
-    _mcpSetStatus(`Couldn't connect: ${resp.error || "unknown error"}`, true);
-    return;
-  }
-  let host = url;
-  try { host = new URL(url).host; } catch (_) {}
-  _mcpState.servers.push({ name: host, url, enabled: true });
-  await saveMcp();
-  renderMcp();
-  els.mcpUrlInput.value = "";
-  const n = (resp.tools || []).length;
-  _mcpSetStatus(`Added — ${n} tool${n === 1 ? "" : "s"} available.`, false);
 }
 
 function initMcpUI() {
@@ -4078,7 +4431,9 @@ async function init() {
   initLogsUI();
   initBotsUI();
   initKnowledgeUI();
+  initKnowledgeModalUI();
   initMcpUI();
+  initMcpModalUI();
   startPullPoller();
   initUpgradeUI();
   initImportBotUI();
