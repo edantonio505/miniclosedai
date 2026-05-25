@@ -2,6 +2,13 @@
 
 const els = {
   modelSelect: document.getElementById("model-select"),
+  modelPicker: document.getElementById("model-picker"),
+  modelPickerBtn: document.getElementById("model-picker-btn"),
+  modelPickerLabel: document.getElementById("model-picker-label"),
+  modelPickerPop: document.getElementById("model-picker-pop"),
+  modelPickerSearch: document.getElementById("model-picker-search"),
+  modelPickerList: document.getElementById("model-picker-list"),
+  modelPickerEmpty: document.getElementById("model-picker-empty"),
   // The conversation dropdown was replaced by the Bots tab + a topbar
   // breadcrumb ("← Bots / <Bot name>"). See `renderBreadcrumb()`.
   breadcrumbBack: document.getElementById("breadcrumb-back"),
@@ -428,6 +435,7 @@ async function loadModels() {
     els.modelSelect.add(opt);
     setStatus("err", "No endpoints configured. Open Settings → Add endpoint.");
     _showNoBackendsEmptyState();
+    _rebuildModelPicker();
     return [];
   }
   // We DO have backends now — restore the regular empty state if it was swapped.
@@ -445,6 +453,7 @@ async function loadModels() {
     const total = backends.length;
     setStatus("ok", `${reachableCount}/${total} endpoint${total === 1 ? "" : "s"} reachable · ${totalModels} model${totalModels === 1 ? "" : "s"}`);
   }
+  _rebuildModelPicker();
   return backends;
 }
 
@@ -462,6 +471,7 @@ function _selectModelOption(modelName, backendId) {
         els.modelSelect.value = opt.value;  // doesn't pick the right option cross-group
         // setting .value alone can pick a different group; mark explicitly:
         opt.selected = true;
+        if (typeof _syncModelPickerLabel === "function") _syncModelPickerLabel();
         return true;
       }
     }
@@ -470,12 +480,161 @@ function _selectModelOption(modelName, backendId) {
   if (bid != null) return _selectModelOption(modelName, null);
   // No match — deselect.
   els.modelSelect.selectedIndex = -1;
+  if (typeof _syncModelPickerLabel === "function") _syncModelPickerLabel();
   return false;
 }
 
 function setStatus(kind, text) {
   els.statusLine.className = kind;
   els.statusLine.textContent = text;
+}
+
+// ─── Searchable model picker ────────────────────────────────────────────
+// A filter layer over the (hidden) native #model-select, which stays the
+// source of truth. Built from the select's optgroups/options, so it reflects
+// whatever loadModels() produced. Selecting an item writes back to the select
+// (via _selectModelOption) + dispatches `change` so all existing logic fires.
+
+function _syncModelPickerLabel() {
+  if (!els.modelPickerLabel) return;
+  const sel = els.modelSelect.selectedOptions[0];
+  els.modelPickerLabel.textContent = sel && sel.value ? sel.value : "Select model";
+}
+
+function _rebuildModelPicker() {
+  if (!els.modelPickerList) return;
+  els.modelPickerList.innerHTML = "";
+  const current = els.modelSelect.selectedOptions[0];
+  const curKey = current ? `${current.value}::${current.dataset.backendId || ""}` : null;
+
+  for (const group of els.modelSelect.querySelectorAll("optgroup")) {
+    const header = document.createElement("div");
+    header.className = "model-picker-group";
+    header.textContent = group.label;
+    header.dataset.group = group.label.toLowerCase();
+    els.modelPickerList.appendChild(header);
+
+    for (const opt of group.querySelectorAll("option")) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "model-picker-item" + (opt.disabled ? " disabled" : "");
+      item.textContent = opt.textContent;
+      // Searchable haystack: model text + backend group label.
+      item.dataset.search = `${opt.textContent} ${group.label}`.toLowerCase();
+      item.dataset.group = group.label.toLowerCase();
+      if (!opt.disabled) {
+        const key = `${opt.value}::${opt.dataset.backendId || ""}`;
+        if (key === curKey) item.classList.add("active");
+        item.addEventListener("click", () => {
+          _selectModelOption(opt.value, opt.dataset.backendId);
+          els.modelSelect.dispatchEvent(new Event("change", { bubbles: true }));
+          _syncModelPickerLabel();
+          _closeModelPicker();
+        });
+      }
+      els.modelPickerList.appendChild(item);
+    }
+  }
+  _syncModelPickerLabel();
+}
+
+function _filterModelPicker(q) {
+  q = (q || "").trim().toLowerCase();
+  const items = els.modelPickerList.querySelectorAll(".model-picker-item");
+  let anyVisible = false;
+  items.forEach(it => {
+    const show = !q || it.dataset.search.includes(q);
+    it.hidden = !show;
+    if (show) anyVisible = true;
+  });
+  // Hide a group header when none of its items are visible.
+  els.modelPickerList.querySelectorAll(".model-picker-group").forEach(h => {
+    let sib = h.nextElementSibling;
+    let groupHasVisible = false;
+    while (sib && sib.classList.contains("model-picker-item")) {
+      if (!sib.hidden) { groupHasVisible = true; break; }
+      sib = sib.nextElementSibling;
+    }
+    h.hidden = !groupHasVisible;
+  });
+  if (els.modelPickerEmpty) els.modelPickerEmpty.hidden = anyVisible;
+  // Move the keyboard cursor to the first match (the prior one may be hidden now).
+  _highlightModelItem(_modelPickerVisibleItems()[0] || null);
+}
+
+// Visible, selectable items (skips hidden + disabled) — the keyboard cursor set.
+function _modelPickerVisibleItems() {
+  return Array.from(
+    els.modelPickerList.querySelectorAll(".model-picker-item:not([hidden]):not(.disabled)")
+  );
+}
+
+function _highlightModelItem(item) {
+  els.modelPickerList.querySelectorAll(".model-picker-item.highlighted")
+    .forEach(el => el.classList.remove("highlighted"));
+  if (item) {
+    item.classList.add("highlighted");
+    item.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function _moveModelHighlight(delta) {
+  const items = _modelPickerVisibleItems();
+  if (!items.length) return;
+  const cur = els.modelPickerList.querySelector(".model-picker-item.highlighted");
+  let idx = cur ? items.indexOf(cur) : -1;
+  idx = Math.max(0, Math.min(items.length - 1, idx + delta));
+  if (!cur) idx = delta > 0 ? 0 : items.length - 1;  // first ArrowDown→top, ArrowUp→bottom
+  _highlightModelItem(items[idx]);
+}
+
+function _openModelPicker() {
+  if (!els.modelPickerPop) return;
+  els.modelPickerPop.hidden = false;
+  els.modelPickerBtn.setAttribute("aria-expanded", "true");
+  els.modelPickerSearch.value = "";
+  _filterModelPicker("");
+  els.modelPickerSearch.focus();
+  // Start the keyboard cursor on the currently-selected model (if visible),
+  // else the first item. _filterModelPicker already put it on the first; only
+  // override when there's an active selection to land on.
+  const active = els.modelPickerList.querySelector(".model-picker-item.active:not([hidden])");
+  if (active) _highlightModelItem(active);
+}
+
+function _closeModelPicker() {
+  if (!els.modelPickerPop) return;
+  els.modelPickerPop.hidden = true;
+  els.modelPickerBtn.setAttribute("aria-expanded", "false");
+}
+
+function initModelPicker() {
+  if (!els.modelPickerBtn) return;
+  els.modelPickerBtn.addEventListener("click", e => {
+    e.stopPropagation();
+    els.modelPickerPop.hidden ? _openModelPicker() : _closeModelPicker();
+  });
+  els.modelPickerSearch.addEventListener("input", () => _filterModelPicker(els.modelPickerSearch.value));
+  els.modelPickerSearch.addEventListener("keydown", e => {
+    if (e.key === "Escape") { e.preventDefault(); _closeModelPicker(); els.modelPickerBtn.focus(); return; }
+    if (e.key === "ArrowDown") { e.preventDefault(); _moveModelHighlight(1); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); _moveModelHighlight(-1); return; }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      // Select the keyboard-highlighted item, falling back to the first match.
+      const target = els.modelPickerList.querySelector(".model-picker-item.highlighted:not([hidden]):not(.disabled)")
+        || _modelPickerVisibleItems()[0];
+      if (target) target.click();
+    }
+  });
+  // Click outside closes.
+  document.addEventListener("click", e => {
+    if (els.modelPickerPop.hidden) return;
+    if (!els.modelPicker.contains(e.target)) _closeModelPicker();
+  });
+  // Keep the label in sync when the model changes programmatically (e.g.
+  // opening a conversation calls _selectModelOption then dispatches change).
+  els.modelSelect.addEventListener("change", _syncModelPickerLabel);
 }
 
 // ─── Bots page ───────────────────────────────────────────────
@@ -4789,6 +4948,7 @@ async function init() {
   initMcpModalUI();
   initEvalsUI();
   initEvalModalUI();
+  initModelPicker();
   startPullPoller();
   initUpgradeUI();
   initImportBotUI();

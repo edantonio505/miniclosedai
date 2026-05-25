@@ -64,9 +64,23 @@
     </div>
 
     <div class="top-controls">
-      <select id="model-select" title="Switch the local Ollama model">
-        <option value="">Loading models…</option>
-      </select>
+      <!-- Searchable model picker. The native <select> stays as the backing
+           state (lots of code reads its value/selectedOptions); the button +
+           popover are a filter layer that write back to it. -->
+      <div class="model-picker" id="model-picker">
+        <select id="model-select" class="model-select-hidden" title="Switch the model">
+          <option value="">Loading models…</option>
+        </select>
+        <button type="button" id="model-picker-btn" class="model-picker-btn" data-tooltip="Choose / filter model" aria-haspopup="listbox" aria-expanded="false">
+          <span id="model-picker-label">Loading models…</span>
+          <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><path d="M7 10l5 5 5-5z"/></svg>
+        </button>
+        <div id="model-picker-pop" class="model-picker-pop" hidden>
+          <input type="search" id="model-picker-search" placeholder="Filter models…" spellcheck="false" autocomplete="off" />
+          <div id="model-picker-list" class="model-picker-list" role="listbox"></div>
+          <div id="model-picker-empty" class="model-picker-empty" hidden>No models match.</div>
+        </div>
+      </div>
 
       <span id="breadcrumb-current" class="breadcrumb-current" data-tooltip="Currently open bot">(no bot selected)</span>
 

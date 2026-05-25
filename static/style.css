@@ -1386,6 +1386,103 @@ body[data-bots-transition="back"] .page-bots {
 }
 
 /* =====================================================================
+   Searchable model picker (topbar) — trigger button + filter popover.
+   The native #model-select is hidden but remains the source of truth.
+   ===================================================================== */
+.model-select-hidden { display: none !important; }
+.model-picker { position: relative; flex: 0 1 280px; min-width: 0; }
+.model-picker-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.12s;
+}
+.model-picker-btn:hover { border-color: var(--border-strong); }
+.model-picker-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
+.model-picker-btn #model-picker-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.model-picker-btn svg { width: 12px; height: 12px; flex-shrink: 0; opacity: 0.7; }
+
+.model-picker-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  min-width: 280px;
+  max-width: 460px;
+  z-index: 950;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-md);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.model-picker-pop input[type="search"] {
+  width: 100%;
+  padding: 7px 10px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  color: var(--text);
+}
+/* NOTE: plain block, NOT a flex column — a capped-height flex column would
+   shrink each item (flex-shrink:1) to a sliver and clip the text. */
+.model-picker-list { max-height: 50vh; overflow-y: auto; overflow-x: hidden; }
+.model-picker-item, .model-picker-group { flex: none; }
+.model-picker-group {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 8px 8px 4px;
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+.model-picker-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.model-picker-item:hover { background: var(--panel-hover); }
+.model-picker-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+/* Keyboard cursor (↑/↓) — a left accent bar so it's distinct from hover and
+   from the .active currently-selected model. */
+.model-picker-item.highlighted { background: var(--panel-hover); box-shadow: inset 3px 0 0 var(--accent); }
+.model-picker-item.disabled { color: var(--text-muted); cursor: default; }
+.model-picker-item.disabled:hover { background: transparent; }
+.model-picker-empty { color: var(--text-muted); font-size: 12px; padding: 8px; text-align: center; }
+
+/* =====================================================================
    Form elements
    ===================================================================== */
 
