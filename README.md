@@ -2142,9 +2142,45 @@ reply  = writer.ask(f"Draft a friendly apology about: {intent}", history=False)
 print(reply)
 ```
 
-The `Bot` class wraps the per-conversation endpoints: `Bot(id)` / `Bot.find(title)` / `Bot.list()` to address or discover bots; `.ask(msg, history=, persist=)` for a reply; `.stream(msg)` to yield chunks; `.add_text()` / `.add_file()` / `.knowledge()` to manage a bot's knowledge base. Point it at your instance with the `MINICLOSEDAI_BASE_URL` env var (default `http://localhost:8095`). A runnable two-bot pipeline is in [`docs/examples/client/example.py`](./docs/examples/client/example.py).
+The `Bot` class wraps the per-conversation endpoints: `Bot(id)` / `Bot.find(title)` / `Bot.list()` to address or discover bots; `Bot.create(...)` / `Bot.get_or_create(...)` / `.delete()` to manage them from code; `.ask(msg, history=, persist=)` for a reply; `.stream(msg)` to yield chunks; `.add_text()` / `.add_file()` / `.knowledge()` to manage a bot's knowledge base. Point it at your instance with the `MINICLOSEDAI_BASE_URL` env var (default `http://localhost:8095`).
+
+Two runnable examples ship alongside it:
+- [`docs/examples/client/example.py`](./docs/examples/client/example.py) — a two-bot pipeline.
+- [`docs/examples/client/router_example.py`](./docs/examples/client/router_example.py) — a **self-bootstrapping router**: it creates a router bot + three specialist bots, classifies an incoming support message, and dispatches to the matching expert. Verified live — "charged twice" → billing, "app crashes on PDF" → technical, "annual discount?" → sales. Run `python router_example.py` (then `--cleanup` to remove the demo bots).
 
 This is the **multi-LLM pattern**: MiniClosedAI hosts each bot (its model, system prompt, knowledge, tools); your script is the orchestration layer that wires them together. Drop the same logic into a FastAPI route and you have a self-hosted multi-agent backend. (You can also just use the official `openai` SDK against `…:8095/v1` with `model="conv-<id>"` — the client adds the native niceties like `include_history`, `persist`, and knowledge upload that the OpenAI surface doesn't expose.)
+
+#### Router walkthrough — a fleet of specialists behind one classifier
+
+[`router_example.py`](./docs/examples/client/router_example.py) is a complete, self-contained version of the dispatch pattern. Step by step:
+
+1. **Bootstrap the fleet** (idempotent — re-running won't duplicate; the bots show up in the GUI):
+   ```python
+   router    = Bot.get_or_create("Router Demo — Router", MODEL, ROUTER_PROMPT, temperature=0.0)
+   billing   = Bot.get_or_create("Router Demo — Billing",   MODEL, "...billing specialist...")
+   technical = Bot.get_or_create("Router Demo — Technical", MODEL, "...technical specialist...")
+   sales     = Bot.get_or_create("Router Demo — Sales",     MODEL, "...sales specialist...")
+   ```
+   The router's prompt says *"reply with EXACTLY ONE word: billing, technical, or sales"*; `temperature=0.0` makes that deterministic.
+
+2. **Classify, then dispatch** — the orchestration is three lines:
+   ```python
+   label  = router.ask(message, history=False).strip().lower().split()[0]
+   expert = {"billing": billing, "technical": technical, "sales": sales}.get(label, technical)
+   reply  = expert.ask(message, history=False)
+   ```
+   `history=False` keeps every call a one-shot pure function — no cross-talk between requests.
+
+3. **Run it** — `python router_example.py` (verified live against `qwen3:8b`):
+   ```
+   > I was charged twice this month.        routed → billing    → "...refund within 5–7 business days..."
+   > The app crashes when I upload a PDF.    routed → technical  → "Check if the PDF is corrupted or too large..."
+   > Do you offer an annual discount?        routed → sales      → "Yes, 10% off for annual payments..."
+   ```
+
+4. **Clean up** — `python router_example.py --cleanup` deletes the four demo bots via `Bot.delete()`.
+
+Why it matters: each specialist is an independent self-hosted expert, so you can give any of them its own model, knowledge base, or MCP tools **without touching the orchestration code**. Swap the three demo specialists for your real bots and you have a production support router; the same classify-then-dispatch shape generalizes to any routing system.
 
 ---
 

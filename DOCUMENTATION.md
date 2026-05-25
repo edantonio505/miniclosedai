@@ -1369,13 +1369,32 @@ The `Bot` class is a thin wrapper over the per-conversation endpoints:
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `Bot(id)` / `Bot.find(title)` / `Bot.list()` | `GET /api/conversations` | address / discover bots |
+| `Bot.create(...)` / `Bot.get_or_create(...)` | `POST /api/conversations` | create a bot from code (get_or_create is idempotent by exact title) |
 | `.ask(msg, history=, persist=)` | `POST /api/conversations/{id}/chat` | reply text (sets `include_history`, `persist`) |
 | `.stream(msg)` | `POST .../chat/stream` | generator of SSE `chunk`s |
 | `.add_text()` / `.add_file()` / `.knowledge()` | `…/knowledge` | manage the bot's RAG library |
+| `.delete()` | `DELETE /api/conversations/{id}` | remove the bot (+ its knowledge base) |
 
-Base URL comes from `MINICLOSEDAI_BASE_URL` (default `http://localhost:8095`). Errors raise `MiniClosedAIError`. A runnable two-bot pipeline is in [`docs/examples/client/example.py`](./docs/examples/client/example.py).
+Base URL comes from `MINICLOSEDAI_BASE_URL` (default `http://localhost:8095`). Errors raise `MiniClosedAIError`. Two runnable examples: [`example.py`](./docs/examples/client/example.py) (a two-bot pipeline) and [`router_example.py`](./docs/examples/client/router_example.py) — a self-bootstrapping router that creates a router + three specialist bots, classifies a support message, and dispatches to the matching expert (verified live; `--cleanup` removes the demo bots).
 
 This is the intended **multi-LLM management** shape: MiniClosedAI is the registry/host (each bot = a configured expert with its own model, knowledge, tools); the orchestration logic lives in *your* code, not inside MCAi. (Implementation note: the client uses `from __future__ import annotations` because the `Bot.list` classmethod shadows the builtin `list` in the class namespace, which would otherwise break the `-> list[dict]` hints.) For OpenAI-SDK ergonomics you can alternatively use the official `openai` package against `…:8095/v1` with `model="conv-<id>"`; the bespoke client exists for the native-only features (`include_history`, `persist`, knowledge upload).
+
+#### Router walkthrough — classify-then-dispatch over a bot fleet
+
+[`router_example.py`](./docs/examples/client/router_example.py) is the canonical multi-LLM example: one router bot classifies an inbound message, and the orchestration code dispatches to the matching specialist. It's self-contained — it bootstraps its own bots, so it runs against any instance with a tool-capable chat model.
+
+1. **Bootstrap (idempotent).** `Bot.get_or_create(title, MODEL, system_prompt, **params)` creates a router + three specialists keyed by exact title, so re-runs don't duplicate. The router prompt forces a single-word reply (`billing` / `technical` / `sales`) at `temperature=0.0` for determinism; specialists run at `0.3`.
+2. **Dispatch (the whole orchestration):**
+   ```python
+   label  = router.ask(message, history=False).strip().lower().split()[0]
+   expert = LABEL_TO_TITLE_MAP[label] (fallback: technical)
+   reply  = expert.ask(message, history=False)
+   ```
+   `history=False` on every call = pure-function semantics (each request independent; no shared history). `.split()[0]` defensively takes the first token in case a model adds stray words around the label.
+3. **Verified live** against `qwen3:8b`: "charged twice" → `billing`, "crashes on PDF upload" → `technical`, "annual discount?" → `sales`, each answered by the correct specialist.
+4. **Cleanup:** `--cleanup` enumerates `Bot.list()`, matches the demo titles, and calls `Bot.delete()` on each.
+
+Design point: the specialists are independent server-side experts — give any of them a different model, a RAG knowledge base, or MCP tools and the orchestration code is unchanged. The engine stays in the user's script; MCAi only hosts the bots. This is deliberately *not* a workflow runtime baked into MCAi (which would compete with LangGraph/CrewAI and bloat the core) — the classify-then-dispatch logic is ~10 lines of plain Python the user owns.
 
 ### Deployment surfaces — HTML widget
 

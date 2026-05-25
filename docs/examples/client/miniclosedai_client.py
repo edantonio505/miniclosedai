@@ -75,6 +75,25 @@ class Bot:
                 return cls(c["id"], base_url)
         raise MiniClosedAIError(f"No bot whose title contains {title_contains!r}")
 
+    @classmethod
+    def create(cls, title: str, model: str, system_prompt: str = "You are a helpful AI assistant.",
+               backend_id: int = 1, base_url: str = DEFAULT_BASE_URL, **params) -> "Bot":
+        """Create a new bot and return a handle to it. Extra kwargs (temperature,
+        max_tokens, top_p, top_k, think, max_thinking_tokens) are passed through."""
+        payload = {"title": title, "model": model, "system_prompt": system_prompt,
+                   "backend_id": backend_id, **params}
+        out = _request("POST", f"{base_url.rstrip('/')}/api/conversations", payload)
+        return cls(out["id"], base_url)
+
+    @classmethod
+    def get_or_create(cls, title: str, model: str, system_prompt: str = "You are a helpful AI assistant.",
+                      backend_id: int = 1, base_url: str = DEFAULT_BASE_URL, **params) -> "Bot":
+        """Idempotent: return the existing bot with this exact title, else create it."""
+        for c in cls.list(base_url):
+            if (c.get("title") or "") == title:
+                return cls(c["id"], base_url)
+        return cls.create(title, model, system_prompt, backend_id, base_url, **params)
+
     # ---- chat ----------------------------------------------------------
     def ask(self, message: str, history: bool = True, persist: bool = False) -> str:
         """Send a message; return the assistant's reply text.
@@ -135,3 +154,8 @@ class Bot:
         return _request(
             "GET", f"{self.base_url}/api/conversations/{self.id}/knowledge"
         ).get("documents", [])
+
+    # ---- lifecycle -----------------------------------------------------
+    def delete(self) -> None:
+        """Delete this bot (and its knowledge base) from the server."""
+        _request("DELETE", f"{self.base_url}/api/conversations/{self.id}")
