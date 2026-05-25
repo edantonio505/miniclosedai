@@ -37,14 +37,15 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 14. [Curating fine-tuning data](#curating-fine-tuning-data)
 15. [Automated image labeling — hot dog / not hot dog](#automated-image-labeling--hot-dog--not-hot-dog)
 16. [Building a chatbot against a saved bot](#building-a-chatbot-against-a-saved-bot)
-17. [Sharing bots between instances](#sharing-bots-between-instances)
-18. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
-19. [LAN access](#lan-access)
-20. [Troubleshooting](#troubleshooting)
-21. [Testing](#testing)
-22. [Project layout](#project-layout)
-23. [Security](#security)
-24. [License](#license)
+17. [Python client SDK](#python-client-sdk--compose-bots-in-your-own-code)
+18. [Sharing bots between instances](#sharing-bots-between-instances)
+19. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
+20. [LAN access](#lan-access)
+21. [Troubleshooting](#troubleshooting)
+22. [Testing](#testing)
+23. [Project layout](#project-layout)
+24. [Security](#security)
+25. [License](#license)
 
 ---
 
@@ -57,6 +58,8 @@ MiniClosedAI is a single-user, single-process web app that wraps **local** LLMs 
 - 🎛️ **Live parameter sliders** — temperature, max tokens, top-p, top-k, thinking level, max thinking tokens. Every change auto-saves to the active conversation.
 - 🔁 **Per-chat microservice endpoints** — each saved conversation is an addressable URL that replays your GUI-configured bot. Callers just send `{"message": "..."}`.
 - 💭 **Reasoning-model aware** — `thinking` and `content` tokens from models like qwen3, deepseek-r1, and gpt-oss stream separately; "thoughts" appear in a collapsible block. `max_thinking_tokens` is a soft cap: visible reasoning is hidden but the model keeps running so the answer still arrives.
+- 📚 **Per-bot knowledge base (RAG) — "give your bot books"** — upload PDFs / `.txt` / `.md` to a bot from the sidebar **Knowledge** panel and it answers grounded in them. **No vector database to install:** SQLite *is* the store and Ollama provides the embeddings (`nomic-embed-text` by default). Chunks are embedded once at upload; each turn, the user's question is embedded and the top-k passages are injected into the system prompt. Each bot has its own isolated library. All local, $0 per query. (Needs the embedding model pulled once: `ollama pull nomic-embed-text`.)
+- 🧩 **MCP plugins — "give your bot tools"** — MiniClosedAI is an [MCP](https://modelcontextprotocol.io) host. Paste a remote MCP server URL into the sidebar **Extensions** panel and the bot can call that server's tools mid-conversation (bounded model→tools→model loop). "Writing a plugin" = pointing at any of the thousands of existing MCP servers, or writing your own — no MiniClosedAI-specific plugin format. Remote (Streamable HTTP) servers; needs a tool-calling-capable model (qwen3, llama3.x, mistral, …).
 - 📎 **File attachments — images, PDFs, and text files** — paperclip in the composer (and clipboard paste) attaches files to a chat turn. Vision models (`llava`, `gemma4`, `qwen3.6`, `*-vision`, `*-vl`, etc.) see images natively over both Ollama's `/api/chat` and OpenAI's `chat/completions` formats. PDFs are extracted to text server-side with `pypdf` (50-page / 30 000-char caps), and `.txt` / `.md` / `.csv` / source-code files are read inline. Attached file bodies get prepended to the user's message; the bubble shows just the user's question + thumbnails / doc chips. Soft-warns when an image is attached to a model that doesn't pattern-match a vision model. **No extra setup** — `pypdf` ships in `requirements.txt`.
 - ⏹ **Manual stop** — a Stop button in the composer aborts the stream cleanly.
 - 🔁 **OpenAI-SDK-compatible server** — drop MiniClosedAI in place of `api.openai.com` with a one-line `base_url` change. Every bot appears as a "model" to the SDK; calls route to whichever backend that bot is pinned to.
@@ -378,7 +381,7 @@ Single full-page surface listing every saved conversation, newest first. Each ca
 
 - **Click a card** → spatial slide-in animation, you land in that chat with full history.
 - **Card with a pulse dot** → that bot has a streaming reply in progress OR a completed reply you haven't viewed yet. Clicking the card clears the dot.
-- **Hover a card → row actions appear** on the right: **`</>` API code** (opens the snippet modal scoped to that bot without disturbing your current open chat) and **🗑 Delete** (confirms with the bot's actual title, drops the id from the unread/streaming sets so a stale dot doesn't linger, and falls back to the Bots empty state if it was the last bot). Both buttons stop event propagation so clicking them doesn't also open the chat. A gradient mask fades the title/meta text underneath into the card background so the buttons feel like an intentional overlay, not a crash-on-top.
+- **Hover a card → row actions appear** on the right (work the same in list and grid view): **`</>` API code** (snippet modal scoped to that bot), **📚 Manage knowledge** (opens a modal listing that bot's documents — filename · chunks · size · date — with per-doc delete and an **+ Add document** button), **🧩 Manage extensions** (opens a modal listing that bot's MCP plugins with a per-server enable toggle, remove, and an add-by-URL row), and **🗑 Delete** (confirms with the bot's title, clears stale unread/streaming dots, falls back to the empty state if it was the last bot). All buttons stop event propagation so clicking them doesn't also open the chat; a gradient mask fades the title/meta underneath so the buttons read as an intentional overlay. Editing a bot that's currently open keeps its sidebar panels in sync.
 - **Quick-switch shortcut**: `⌘K` / `Ctrl+K` from anywhere, or `/` when you're not in a text field, jumps to the Bots page and focuses the filter.
 
 ### Chat view — topbar
@@ -418,6 +421,17 @@ Two panels, separated by a **horizontal splitter** you can drag to resize:
 | Max thinking tokens | blank or N | Auto-stop after N thinking tokens. Protects against runaway reasoning. |
 
 **Reset defaults** snaps everything back to stock values.
+
+**Knowledge** — the per-bot RAG library. Click **+ Add document** to upload PDFs / `.txt` / `.md`; each file is chunked, embedded (via the bot's backend using `nomic-embed-text` by default), and stored in SQLite keyed to this bot. On every turn the user's question is embedded and the most relevant passages are prepended to the system prompt, so the bot answers from your documents. Remove a document with its trash icon. Requires the embedding model once (`ollama pull nomic-embed-text`); override with `MINICLOSEDAI_EMBED_MODEL`. No external vector database.
+
+**Extensions** — the per-bot MCP plugins. Paste a remote MCP server URL and click **Add**; MiniClosedAI connects, lists the server's tools, and (if reachable) saves it. When the bot has enabled plugins, a chat turn runs a bounded tool-calling loop: the model can call the server's tools and incorporate the results before answering. Toggle a plugin on/off or remove it. Needs a tool-calling-capable model. See [Extensibility — MCP plugins](./DOCUMENTATION.md#extensibility--mcp-plugins) for details.
+
+> **Try it in 30 seconds.** A ready-to-run example MCP server ships in the repo:
+> [`docs/examples/mcp_server/server.py`](./docs/examples/mcp_server/server.py) — ~15 lines, three demo tools (`add`, `current_utc_time`, `weather`).
+> ```bash
+> python docs/examples/mcp_server/server.py     # serves at http://localhost:8765/mcp
+> ```
+> Then open a bot → **Extensions** → paste `http://localhost:8765/mcp` → **Add**, and ask "what's the weather in Tokyo?". Writing your own plugin is the same pattern: decorate a Python function with `@mcp.tool()` — its type hints + docstring become the tool schema the model sees. **Use `transport="streamable-http"`** (MiniClosedAI connects over Streamable HTTP, so the URL always ends in `/mcp`).
 
 **Status** at the bottom reports the reachable / total endpoint count plus a combined model count (green dot = at least one endpoint reachable; amber = some down; red = none reachable).
 
@@ -2113,6 +2127,63 @@ Both examples are recipe-agnostic — the fence-detection and action-extraction 
 2. **The system prompt of that conversation** — set in MCAi's GUI, defines what the bot collects and what action it emits.
 
 The renderers (`render_action` in Python, `renderAction` in JS) walk the dict generically with `snake_case → "Title Case"` labels and nested-section grouping, so a `create_appointment` from the doctor's recipe renders just as cleanly as a `create_booking` from the hotel's.
+
+---
+
+## Python client SDK — compose bots in your own code
+
+For orchestration (one script that calls several bots, or each bot used as a function inside an internal app), there's a **zero-dependency single-file client**: [`docs/examples/client/miniclosedai_client.py`](./docs/examples/client/miniclosedai_client.py). Copy it into your project — it's stdlib only (`urllib` + `json`), no `pip install`.
+
+```python
+from miniclosedai_client import Bot
+
+triage = Bot.find("triage")        # or Bot(12) by id (the </> "Copy bot ID" pill)
+writer = Bot.find("writer")        # or Bot(56)
+
+intent = triage.ask("My order #4471 is two weeks late!", history=False)  # one-shot
+reply  = writer.ask(f"Draft a friendly apology about: {intent}", history=False)
+print(reply)
+```
+
+The `Bot` class wraps the per-conversation endpoints: `Bot(id)` / `Bot.find(title)` / `Bot.list()` to address or discover bots; `Bot.create(...)` / `Bot.get_or_create(...)` / `.delete()` to manage them from code; `.ask(msg, history=, persist=)` for a reply; `.stream(msg)` to yield chunks; `.add_text()` / `.add_file()` / `.knowledge()` to manage a bot's knowledge base. Point it at your instance with the `MINICLOSEDAI_BASE_URL` env var (default `http://localhost:8095`).
+
+Two runnable examples ship alongside it:
+- [`docs/examples/client/example.py`](./docs/examples/client/example.py) — a two-bot pipeline.
+- [`docs/examples/client/router_example.py`](./docs/examples/client/router_example.py) — a **self-bootstrapping router**: it creates a router bot + three specialist bots, classifies an incoming support message, and dispatches to the matching expert. Verified live — "charged twice" → billing, "app crashes on PDF" → technical, "annual discount?" → sales. Run `python router_example.py` (then `--cleanup` to remove the demo bots).
+
+This is the **multi-LLM pattern**: MiniClosedAI hosts each bot (its model, system prompt, knowledge, tools); your script is the orchestration layer that wires them together. Drop the same logic into a FastAPI route and you have a self-hosted multi-agent backend. (You can also just use the official `openai` SDK against `…:8095/v1` with `model="conv-<id>"` — the client adds the native niceties like `include_history`, `persist`, and knowledge upload that the OpenAI surface doesn't expose.)
+
+### Router walkthrough — a fleet of specialists behind one classifier
+
+[`router_example.py`](./docs/examples/client/router_example.py) is a complete, self-contained version of the dispatch pattern. Step by step:
+
+1. **Bootstrap the fleet** (idempotent — re-running won't duplicate; the bots show up in the GUI):
+   ```python
+   router    = Bot.get_or_create("Router Demo — Router", MODEL, ROUTER_PROMPT, temperature=0.0)
+   billing   = Bot.get_or_create("Router Demo — Billing",   MODEL, "...billing specialist...")
+   technical = Bot.get_or_create("Router Demo — Technical", MODEL, "...technical specialist...")
+   sales     = Bot.get_or_create("Router Demo — Sales",     MODEL, "...sales specialist...")
+   ```
+   The router's prompt says *"reply with EXACTLY ONE word: billing, technical, or sales"*; `temperature=0.0` makes that deterministic.
+
+2. **Classify, then dispatch** — the orchestration is three lines:
+   ```python
+   label  = router.ask(message, history=False).strip().lower().split()[0]
+   expert = {"billing": billing, "technical": technical, "sales": sales}.get(label, technical)
+   reply  = expert.ask(message, history=False)
+   ```
+   `history=False` keeps every call a one-shot pure function — no cross-talk between requests.
+
+3. **Run it** — `python router_example.py` (verified live against `qwen3:8b`):
+   ```
+   > I was charged twice this month.        routed → billing    → "...refund within 5–7 business days..."
+   > The app crashes when I upload a PDF.    routed → technical  → "Check if the PDF is corrupted or too large..."
+   > Do you offer an annual discount?        routed → sales      → "Yes, 10% off for annual payments..."
+   ```
+
+4. **Clean up** — `python router_example.py --cleanup` deletes the four demo bots via `Bot.delete()`.
+
+Why it matters: each specialist is an independent self-hosted expert, so you can give any of them its own model, knowledge base, or MCP tools **without touching the orchestration code**. Swap the three demo specialists for your real bots and you have a production support router; the same classify-then-dispatch shape generalizes to any routing system.
 
 ---
 

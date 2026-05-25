@@ -31,7 +31,17 @@
       <!-- Feather: terminal — represents request/response stream activity -->
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
     </button>
-    <button class="nav-item nav-item-bottom" data-page="settings" title="Settings" aria-label="Settings">
+    <!-- Theme toggle — cycles System → Light → Dark. Lives at the bottom of the
+         activity bar, on top of Settings. nav-item-bottom carries the
+         margin-top:auto so this + Settings group at the bottom. No data-page,
+         so initActivityBar's page-switch wiring skips it (it has its own
+         click handler). -->
+    <button id="theme-toggle" class="nav-item nav-item-bottom" title="Theme: system" aria-label="Toggle theme">
+      <svg id="theme-icon-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      <svg id="theme-icon-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg id="theme-icon-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+    </button>
+    <button class="nav-item" data-page="settings" title="Settings" aria-label="Settings">
       <!-- Feather: settings -->
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
@@ -117,14 +127,6 @@
       <button id="upgrade-badge" class="btn btn-small btn-upgrade" data-tooltip="Update available — click to upgrade" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px"><path d="M12 2v6m0 0l-3-3m3 3l3-3"/><path d="M3 12a9 9 0 0 0 9 9 9 9 0 0 0 9-9"/></svg>
         <span id="upgrade-badge-count">·</span>
-      </button>
-
-      <span class="divider-v"></span>
-
-      <button id="theme-toggle" class="icon-btn" data-tooltip="Theme: system" aria-label="Toggle theme">
-        <svg id="theme-icon-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
-        <svg id="theme-icon-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-        <svg id="theme-icon-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
       </button>
     </div>
   </header>
@@ -214,6 +216,27 @@
         </div>
 
         <button id="reset-params" class="btn btn-small">Reset defaults</button>
+      </div>
+
+      <div class="panel knowledge-panel">
+        <h3>Knowledge <span class="kb-subtitle">— books this bot can read</span></h3>
+        <div id="kb-list" class="kb-list"></div>
+        <div id="kb-empty" class="kb-empty">No documents yet. Add PDFs, .txt, or .md files to make this bot an expert.</div>
+        <button id="kb-add-btn" type="button" class="btn btn-small kb-add-btn">+ Add document</button>
+        <input id="kb-file-input" type="file" multiple hidden
+               accept=".txt,.md,.markdown,.csv,.json,.yaml,.yml,.log,.pdf,text/*" />
+        <div id="kb-status" class="kb-status" hidden></div>
+      </div>
+
+      <div class="panel mcp-panel">
+        <h3>Extensions <span class="kb-subtitle">— MCP plugins (tools)</span></h3>
+        <div id="mcp-list" class="mcp-list"></div>
+        <div id="mcp-empty" class="kb-empty">No plugins. Paste an MCP server URL to give this bot tools.</div>
+        <div class="mcp-add-row">
+          <input id="mcp-url-input" type="text" placeholder="https://server.example/mcp" spellcheck="false" />
+          <button id="mcp-add-btn" type="button" class="btn btn-small">Add</button>
+        </div>
+        <div id="mcp-status" class="kb-status" hidden></div>
       </div>
 
       <div class="panel status-panel">
@@ -325,6 +348,9 @@
         </div>
       </div>
       <div id="bots-list" class="bots-list"></div>
+      <!-- Shared hidden file input for the per-card "add knowledge" action. -->
+      <input id="bots-kb-file" type="file" multiple hidden
+             accept=".txt,.md,.markdown,.csv,.json,.yaml,.yml,.log,.pdf,text/*" />
       <div id="bots-empty" class="bots-empty" hidden>
         <p>No bots saved yet.</p>
         <p>Click <strong>+ New bot</strong> above to author your first one, or open <strong>Settings → Add endpoint</strong> first if you haven't registered an LLM endpoint yet.</p>
@@ -475,6 +501,45 @@
         <button type="button" id="import-cancel-btn" class="btn btn-small">Cancel</button>
         <button type="button" id="import-confirm-btn" class="btn btn-primary btn-small" disabled>Import</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Manage Knowledge Modal — opened by a bot card's 📚 action -->
+  <div id="kb-modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Manage knowledge <span id="kb-modal-bot" class="kb-modal-bot"></span></h3>
+        <button id="kb-modal-close" class="icon-btn" data-tooltip="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <p class="kb-modal-hint">Documents this bot can read. Add PDFs, <code>.txt</code>, or <code>.md</code> — the bot answers grounded in them.</p>
+      <div id="kb-modal-list" class="kb-modal-list"></div>
+      <div id="kb-modal-empty" class="kb-modal-empty" hidden>No documents yet.</div>
+      <div class="modal-actions">
+        <button id="kb-modal-add" type="button" class="btn btn-primary btn-small">+ Add document</button>
+        <span id="kb-modal-status" class="kb-status" hidden></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Manage Extensions (MCP) Modal — opened by a bot card's 🧩 action -->
+  <div id="mcp-modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Manage extensions <span id="mcp-modal-bot" class="kb-modal-bot"></span></h3>
+        <button id="mcp-modal-close" class="icon-btn" data-tooltip="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <p class="kb-modal-hint">MCP plugin servers this bot can call. Toggle to enable/disable — the bot uses the tools of every <em>enabled</em> server. Needs a tool-calling-capable model.</p>
+      <div id="mcp-modal-list" class="kb-modal-list"></div>
+      <div id="mcp-modal-empty" class="kb-modal-empty" hidden>No plugins yet.</div>
+      <div class="mcp-modal-add">
+        <input id="mcp-modal-url" type="text" placeholder="MCP server URL (https://…/mcp)" spellcheck="false" />
+        <button id="mcp-modal-add-btn" type="button" class="btn btn-primary btn-small">Add</button>
+      </div>
+      <div id="mcp-modal-status" class="kb-status" hidden></div>
     </div>
   </div>
 

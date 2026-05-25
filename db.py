@@ -61,6 +61,33 @@ CREATE TABLE IF NOT EXISTS backends (
     is_builtin  INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Per-bot knowledge base ("books"). A document is one uploaded file; it's
+-- split into chunks, each with an embedding stored as a packed float32 BLOB.
+-- Retrieval is brute-force cosine over a single conversation's chunks (no
+-- external vector DB — SQLite IS the store). Cleanup of a conversation's KB
+-- rows happens in app.py's delete handler (logical FK, like backend_id).
+CREATE TABLE IF NOT EXISTS kb_documents (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL,
+    filename        TEXT    NOT NULL,
+    char_count      INTEGER NOT NULL DEFAULT 0,
+    chunk_count     INTEGER NOT NULL DEFAULT 0,
+    embed_model     TEXT    NOT NULL DEFAULT '',
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS kb_chunks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id     INTEGER NOT NULL,
+    conversation_id INTEGER NOT NULL,
+    ordinal         INTEGER NOT NULL,
+    text            TEXT    NOT NULL,
+    embedding       BLOB    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_kb_chunks_conv ON kb_chunks(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_kb_docs_conv  ON kb_documents(conversation_id);
 """
 
 
@@ -86,6 +113,13 @@ def init_db() -> None:
         if not _column_exists(conn, "conversations", "backend_id"):
             conn.execute(
                 "ALTER TABLE conversations ADD COLUMN backend_id INTEGER NOT NULL DEFAULT 1"
+            )
+
+        # Additive migration: per-bot MCP servers (plugin extensions). JSON list
+        # of {name, url, enabled}. Empty list = no plugins (the common case).
+        if not _column_exists(conn, "conversations", "mcp_servers"):
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN mcp_servers TEXT NOT NULL DEFAULT '[]'"
             )
 
         # Seed the built-in Ollama backend at id=1, but ONLY when the backends
@@ -131,4 +165,6 @@ def row_to_dict(row: sqlite3.Row) -> dict:
         d["params"] = json.loads(d["params"] or "{}")
     if "headers" in d and isinstance(d["headers"], str):
         d["headers"] = json.loads(d["headers"] or "{}")
+    if "mcp_servers" in d and isinstance(d["mcp_servers"], str):
+        d["mcp_servers"] = json.loads(d["mcp_servers"] or "[]")
     return d

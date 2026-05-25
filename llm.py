@@ -581,3 +581,162 @@ async def chat(backend: dict, model: str, messages: list[dict], **params) -> str
         if "content" in ev:
             parts.append(ev["content"])
     return "".join(parts)
+
+
+# =====================================================================
+# Embeddings (for the per-bot knowledge base / RAG)
+# =====================================================================
+
+async def _ollama_embed(backend: dict, model: str, texts: list[str]) -> list[list[float]]:
+    # Ollama's batch embed endpoint: POST /api/embed {model, input:[...]}.
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        r = await client.post(
+            f"{_base_url(backend)}/api/embed",
+            json={"model": model, "input": texts},
+            headers=_ollama_headers(backend),
+        )
+        if r.status_code != 200:
+            body = (await r.aread()).decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"{backend.get('name', 'Ollama')} embed returned {r.status_code}: {body[:400]}"
+            )
+        return r.json().get("embeddings", []) or []
+
+
+async def _openai_embed(backend: dict, model: str, texts: list[str]) -> list[list[float]]:
+    # OpenAI-compat: POST /v1/embeddings {model, input:[...]} → {data:[{embedding}]}.
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        r = await client.post(
+            f"{_base_url(backend)}/embeddings",
+            json={"model": model, "input": texts},
+            headers=_openai_headers(backend),
+        )
+        if r.status_code != 200:
+            body = (await r.aread()).decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"{backend.get('name', 'OpenAI-compat backend')} embed returned {r.status_code}: {body[:400]}"
+            )
+        data = (r.json() or {}).get("data", []) or []
+        return [d.get("embedding", []) for d in data]
+
+
+async def embed(backend: dict, model: str, texts: list[str]) -> list[list[float]]:
+    """Return one embedding vector per input text, via the backend's embed API.
+
+    Kind-agnostic, like chat_stream: Ollama uses /api/embed, OpenAI-compat uses
+    /v1/embeddings. The embedding model (e.g. `nomic-embed-text`) must be served
+    by the backend. Raises RuntimeError on a non-200 so callers can surface a
+    clear "pull the embedding model first" message.
+    """
+    if not texts:
+        return []
+    kind = backend.get("kind")
+    if kind == "ollama":
+        return await _ollama_embed(backend, model, texts)
+    if kind == "openai":
+        return await _openai_embed(backend, model, texts)
+    raise ValueError(f"Unknown backend kind: {kind!r}")
+
+
+# =====================================================================
+# Tool calling (non-streaming) — powers the MCP tool-use loop
+# =====================================================================
+#
+# Returns a normalized dict:
+#   {
+#     "assistant_message": <raw assistant message to append back to the convo>,
+#     "tool_calls": [{"id", "name", "arguments": dict}, ...],   # [] if none
+#     "content": str,                                            # visible text
+#   }
+# The assistant message is echoed back verbatim (per-kind shape) so the next
+# request has the right history; `tool_result_message` builds the matching
+# tool-result turn. Both kinds support tools only in non-streaming mode here.
+
+async def _ollama_chat_tools(backend, model, messages, tools, temperature, max_tokens, top_p, top_k, think):
+    msgs = [_to_ollama_message(m) for m in messages]
+    payload = {
+        "model": model, "messages": msgs, "stream": False,
+        "options": {"temperature": temperature, "num_predict": max_tokens,
+                    "top_p": top_p, "top_k": top_k},
+    }
+    if tools:
+        payload["tools"] = tools
+    if think is not None:
+        payload["think"] = think
+    async with httpx.AsyncClient(timeout=None) as client:
+        r = await client.post(
+            f"{_base_url(backend)}/api/chat", json=payload, headers=_ollama_headers(backend)
+        )
+        if r.status_code != 200:
+            body = r.text
+            raise RuntimeError(f"{backend.get('name','Ollama')} returned {r.status_code}: {body[:400]}")
+        data = r.json()
+    msg = data.get("message", {}) or {}
+    raw_calls = msg.get("tool_calls") or []
+    norm = []
+    for i, tc in enumerate(raw_calls):
+        fn = tc.get("function", {}) or {}
+        norm.append({
+            "id": tc.get("id") or f"call_{i}",
+            "name": fn.get("name", ""),
+            "arguments": fn.get("arguments") or {},
+        })
+    assistant_message = {"role": "assistant", "content": msg.get("content", "") or ""}
+    if raw_calls:
+        assistant_message["tool_calls"] = raw_calls
+    return {"assistant_message": assistant_message, "tool_calls": norm,
+            "content": _clean(msg.get("content", "") or "")}
+
+
+async def _openai_chat_tools(backend, model, messages, tools, temperature, max_tokens, top_p, top_k, think):
+    payload = {
+        "model": model, "messages": messages, "stream": False,
+        "temperature": temperature, "top_p": top_p,
+    }
+    if max_tokens and max_tokens > 0:
+        payload["max_tokens"] = max_tokens
+    if tools:
+        payload["tools"] = tools
+    async with httpx.AsyncClient(timeout=None) as client:
+        r = await client.post(
+            f"{_base_url(backend)}/chat/completions", json=payload, headers=_openai_headers(backend)
+        )
+        if r.status_code != 200:
+            body = r.text
+            raise RuntimeError(
+                f"{backend.get('name','OpenAI-compat backend')} returned {r.status_code}: {body[:400]}"
+            )
+        data = r.json()
+    choice = (data.get("choices") or [{}])[0]
+    msg = choice.get("message", {}) or {}
+    raw_calls = msg.get("tool_calls") or []
+    norm = []
+    for tc in raw_calls:
+        fn = tc.get("function", {}) or {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args or "{}")
+            except json.JSONDecodeError:
+                args = {}
+        norm.append({"id": tc.get("id") or "", "name": fn.get("name", ""), "arguments": args or {}})
+    return {"assistant_message": msg, "tool_calls": norm, "content": _clean(msg.get("content") or "")}
+
+
+async def chat_with_tools(backend, model, messages, tools, *, temperature=0.7,
+                          max_tokens=2048, top_p=0.9, top_k=40, think=None) -> dict:
+    """One non-streaming model call that may return tool calls. Kind-agnostic."""
+    kind = backend.get("kind")
+    if kind == "ollama":
+        return await _ollama_chat_tools(backend, model, messages, tools, temperature, max_tokens, top_p, top_k, think)
+    if kind == "openai":
+        return await _openai_chat_tools(backend, model, messages, tools, temperature, max_tokens, top_p, top_k, think)
+    raise ValueError(f"Unknown backend kind: {kind!r}")
+
+
+def tool_result_message(backend: dict, call: dict, result_text: str) -> dict:
+    """Build the role:'tool' turn that feeds a tool result back to the model,
+    in the shape the backend kind expects."""
+    if backend.get("kind") == "ollama":
+        return {"role": "tool", "content": result_text, "tool_name": call.get("name", "")}
+    return {"role": "tool", "tool_call_id": call.get("id", ""), "content": result_text}

@@ -338,6 +338,174 @@ body[data-page="bots"] .page-bots {
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 12px;
 }
+
+/* =====================================================================
+   Sidebar Knowledge panel (per-bot RAG library)
+   ===================================================================== */
+.kb-subtitle {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.kb-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.kb-doc {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev-1);
+  font-size: 12px;
+}
+.kb-doc-info { min-width: 0; flex: 1 1 auto; }
+.kb-doc-name {
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.kb-doc-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.kb-doc-del {
+  flex-shrink: 0;
+  width: 24px; height: 24px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.kb-doc-del:hover { background: rgba(220, 38, 38, 0.10); color: var(--danger); }
+.kb-doc-del svg { width: 13px; height: 13px; }
+.kb-empty {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
+.kb-add-btn { width: 100%; }
+.kb-status {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+.kb-status.kb-error { color: var(--danger); }
+
+/* Manage Knowledge modal (opened from a bot card's 📚 action). */
+.kb-modal-bot { font-weight: 400; color: var(--text-muted); font-size: 14px; }
+.kb-modal-hint { margin: 0 0 14px; color: var(--text-muted); font-size: 13px; line-height: 1.5; }
+.kb-modal-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 50vh;
+  overflow: auto;
+  margin-bottom: 14px;
+}
+.kb-modal-empty { color: var(--text-muted); font-size: 13px; padding: 20px 0; text-align: center; }
+.kb-modal-doc {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev-1);
+}
+.kb-modal-doc-info { min-width: 0; flex: 1 1 auto; }
+.kb-modal-doc-name {
+  color: var(--text);
+  font-weight: 500;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.kb-modal-doc-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.kb-modal-doc-del {
+  flex-shrink: 0;
+  width: 28px; height: 28px;
+  display: grid; place-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.kb-modal-doc-del:hover { background: rgba(220, 38, 38, 0.10); color: var(--danger); border-color: var(--danger); }
+.kb-modal-doc-del svg { width: 14px; height: 14px; }
+
+/* MCP Extensions panel — reuses the kb-doc row look, adds a toggle + URL row. */
+.mcp-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.mcp-srv {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev-1);
+  font-size: 12px;
+}
+.mcp-srv-info { min-width: 0; flex: 1 1 auto; }
+.mcp-srv-name {
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mcp-srv.disabled .mcp-srv-name { color: var(--text-muted); text-decoration: line-through; }
+.mcp-srv-url {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mcp-srv-toggle { flex-shrink: 0; cursor: pointer; }
+.mcp-srv-del {
+  flex-shrink: 0;
+  width: 24px; height: 24px;
+  display: grid; place-items: center;
+  border: 0; border-radius: 5px;
+  background: transparent; color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.mcp-srv-del:hover { background: rgba(220, 38, 38, 0.10); color: var(--danger); }
+.mcp-srv-del svg { width: 13px; height: 13px; }
+.mcp-add-row { display: flex; gap: 6px; }
+.mcp-add-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 8px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  color: var(--text);
+}
+.mcp-add-row .btn { flex-shrink: 0; }
 .bots-empty {
   text-align: center;
   color: var(--text-muted);
@@ -444,6 +612,31 @@ body[data-page="bots"] .page-bots {
   color: var(--danger);
   border-color: var(--danger);
 }
+
+/* Transient per-card status line (knowledge upload / MCP add feedback). */
+.bot-card-flash {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.bot-card-flash.is-error { color: var(--danger); }
+
+/* Manage Extensions modal — add-by-URL row. List rows reuse .kb-modal-doc. */
+.mcp-modal-add { display: flex; gap: 8px; margin-bottom: 10px; }
+.mcp-modal-add input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 7px 10px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  color: var(--text);
+}
+.mcp-modal-add .btn { flex-shrink: 0; }
+.kb-modal-doc-toggle { flex-shrink: 0; cursor: pointer; }
+.kb-modal-doc.disabled .kb-modal-doc-name { color: var(--text-muted); text-decoration: line-through; }
 .bot-card:hover,
 .bot-card:focus-within {
   background: var(--panel-hover);
