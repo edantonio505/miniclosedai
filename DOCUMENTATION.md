@@ -434,7 +434,7 @@ Each bot can have its own library of documents ("books") that it answers from. T
 - `GET /api/conversations/{id}/knowledge` — list documents (no chunk text).
 - `DELETE /api/conversations/{id}/knowledge/{doc_id}` — drop a document + its chunks.
 
-**Retrieval** happens in `_augment_messages_with_knowledge`, called from both conv-chat handlers. It embeds the query on the **local embed backend** (same resolver as ingestion, so chunks + query share one model even when the bot chats through a relay). Only the single-`message` form is augmented (same rule as `include_history`). It runs `top_k` (default `MINICLOSEDAI_KB_TOP_K=5`) over this bot's chunks and prepends a `## Knowledge base excerpts` block to the system message. **Best-effort**: any failure (model not pulled, backend down) is swallowed so a knowledge hiccup never blocks a normal chat turn.
+**Retrieval** happens in `_augment_messages_with_knowledge`, called from both conv-chat handlers. It embeds the query on the **local embed backend** (same resolver as ingestion, so chunks + query share one model even when the bot chats through a relay). Only the single-`message` form is augmented (same rule as `include_history`). It runs balanced retrieval (`top_k_balanced`, default `MINICLOSEDAI_KB_TOP_K=8`) over this bot's chunks — capping each document to ~`ceil(k/num_docs)` slots so one huge/noisy book can't monopolize the context — and prepends a `## Knowledge base excerpts` block to the system message. **Best-effort**: any failure (model not pulled, backend down) is swallowed so a knowledge hiccup never blocks a normal chat turn.
 
 ---
 
@@ -1951,7 +1951,7 @@ Environment variables the app reads:
 | `MINICLOSEDAI_DISABLE_RELAY_AUTO_ROUTE` | unset | Set to `1` to disable the auto-route that sends a chat to a matching relay (e.g. Interdata) when the relay serves the bot's model. Keeps every bot strictly on its pinned backend. |
 | `MINICLOSEDAI_EMBED_MODEL` | `nomic-embed-text` | Embedding model for the knowledge base (RAG). Must be pulled on an Ollama backend. |
 | `MINICLOSEDAI_EMBED_BACKEND_ID` | unset | Force a specific backend id for embeddings. By default embeddings resolve to the built-in/local Ollama (see [Knowledge base](#knowledge-base-rag)), so a bot chatting on a cloud relay still embeds locally. |
-| `MINICLOSEDAI_KB_TOP_K` | `5` | How many retrieved knowledge chunks are injected into the prompt per turn. |
+| `MINICLOSEDAI_KB_TOP_K` | `8` | How many retrieved knowledge chunks are injected into the prompt per turn (balanced across the bot's documents). |
 | `MINICLOSEDAI_MCP_MAX_ITERS` | `6` | Safety cap on MCP tool-call rounds per turn (model→tools→model…). |
 | `MINICLOSEDAI_PDF_MAX_MB` / `_PAGES` / `_CHARS` | `10` / `50` / `30000` | Caps for the **chat-attachment** PDF path (a PDF stuffed into one chat turn). |
 | `MINICLOSEDAI_PDF_FULL_MAX_MB` / `_PAGES` / `_CHARS` | `200` / `5000` / `5000000` | Book-friendly caps for the **knowledge-base** PDF path (`/api/extract-pdf?full=1`) — the text is chunked + embedded, so length isn't a context concern. |

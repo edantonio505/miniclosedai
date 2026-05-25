@@ -101,6 +101,57 @@ def top_k(query_vec: list[float], chunks: list[dict], k: int = 5) -> list[dict]:
     return out
 
 
+def top_k_balanced(query_vec: list[float], chunks: list[dict], k: int = 5,
+                   doc_key: str = "filename") -> list[dict]:
+    """Like top_k, but no single source document may monopolize the results.
+
+    Plain top-k over a bot with one huge (or noisy/OCR'd) book will fill every
+    slot from that book and drown out smaller books — so a chunk that is rank #1
+    *within its own book* never surfaces if it's rank #30 globally. This caps
+    each document to ~ceil(k / num_docs) chunks (highest-scoring first), then
+    fills any remaining slots with the next-best chunks regardless of source.
+    Single-document bots behave exactly like top_k.
+    """
+    q = normalize(query_vec)
+    scored = []
+    for c in chunks:
+        emb = c.get("embedding")
+        if not emb:
+            continue
+        scored.append((dot(q, emb), c))
+    if not scored:
+        return []
+    scored.sort(key=lambda t: t[0], reverse=True)
+
+    ndocs = len({c.get(doc_key) for _, c in scored}) or 1
+    per_doc_cap = max(1, -(-k // ndocs))  # ceil(k / ndocs)
+
+    def _emit(score, c):
+        item = {key: val for key, val in c.items() if key != "embedding"}
+        item["score"] = score
+        return item
+
+    out, per_count, taken = [], {}, set()
+    # Pass 1 — honor the per-document cap (global score order within each doc).
+    for i, (score, c) in enumerate(scored):
+        doc = c.get(doc_key)
+        if per_count.get(doc, 0) >= per_doc_cap:
+            continue
+        per_count[doc] = per_count.get(doc, 0) + 1
+        taken.add(i)
+        out.append(_emit(score, c))
+        if len(out) >= k:
+            return out
+    # Pass 2 — fewer docs than slots: fill the rest with next-best overall.
+    for i, (score, c) in enumerate(scored):
+        if i in taken:
+            continue
+        out.append(_emit(score, c))
+        if len(out) >= k:
+            break
+    return out
+
+
 def build_context_block(passages: list[dict]) -> str:
     """Format retrieved passages into a system-prompt augmentation block.
 
