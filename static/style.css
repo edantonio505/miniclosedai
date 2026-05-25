@@ -404,6 +404,23 @@ body[data-page="bots"] .page-bots {
   line-height: 1.45;
 }
 .kb-status.kb-error { color: var(--danger); }
+/* Small inline spinner shown while a document is being extracted + embedded. */
+.kb-status.loading::before {
+  content: "";
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 7px;
+  vertical-align: -2px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: kb-spin 0.7s linear infinite;
+}
+@keyframes kb-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .kb-status.loading::before { animation: none; }
+}
 
 /* Manage Knowledge modal (opened from a bot card's 📚 action). */
 .kb-modal-bot { font-weight: 400; color: var(--text-muted); font-size: 14px; }

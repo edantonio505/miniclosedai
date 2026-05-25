@@ -847,12 +847,13 @@ function _botCardFlash(convId, msg, isError) {
 // ─── Manage Knowledge modal (view + add + delete a bot's documents) ─────
 let _kbModalConvId = null;
 
-function _kbModalSetStatus(msg, isError) {
+function _kbModalSetStatus(msg, isError, loading) {
   if (!els.kbModalStatus) return;
-  if (!msg) { els.kbModalStatus.hidden = true; els.kbModalStatus.textContent = ""; return; }
+  if (!msg) { els.kbModalStatus.hidden = true; els.kbModalStatus.textContent = ""; els.kbModalStatus.classList.remove("loading"); return; }
   els.kbModalStatus.hidden = false;
   els.kbModalStatus.textContent = msg;
   els.kbModalStatus.classList.toggle("kb-error", !!isError);
+  els.kbModalStatus.classList.toggle("loading", !!loading);
 }
 
 function _fmtBytes(n) {
@@ -1394,12 +1395,13 @@ function initEvalModalUI() {
 // /api/extract-pdf endpoint; text files are read in-browser. The extracted
 // text is POSTed to the bot's knowledge endpoint, which chunks + embeds it.
 
-function _kbSetStatus(msg, isError) {
+function _kbSetStatus(msg, isError, loading) {
   if (!els.kbStatus) return;
-  if (!msg) { els.kbStatus.hidden = true; els.kbStatus.textContent = ""; return; }
+  if (!msg) { els.kbStatus.hidden = true; els.kbStatus.textContent = ""; els.kbStatus.classList.remove("loading"); return; }
   els.kbStatus.hidden = false;
   els.kbStatus.textContent = msg;
   els.kbStatus.classList.toggle("kb-error", !!isError);
+  els.kbStatus.classList.toggle("loading", !!loading);
 }
 
 function renderKnowledge(docs) {
@@ -1467,7 +1469,8 @@ async function _kbExtractText(file) {
   if (isPdf) {
     const fd = new FormData();
     fd.append("file", file);
-    const r = await fetch("/api/extract-pdf", { method: "POST", body: fd });
+    // full=1 → book-friendly caps; the extracted text is chunked + embedded.
+    const r = await fetch("/api/extract-pdf?full=1", { method: "POST", body: fd });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       throw new Error(err.detail || `PDF extraction failed (${r.status})`);
@@ -1487,7 +1490,7 @@ async function _uploadKnowledgeToConv(convId, files, onStatus) {
   let added = 0;
   for (let i = 0; i < list.length; i++) {
     const file = list[i];
-    if (onStatus) onStatus(`Processing ${file.name} (${i + 1}/${list.length})…`, false);
+    if (onStatus) onStatus(`Processing ${file.name} (${i + 1}/${list.length})…`, false, true);  // loading
     try {
       const text = await _kbExtractText(file);
       if (!text.trim()) {

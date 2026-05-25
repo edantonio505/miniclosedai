@@ -703,25 +703,37 @@ async def api_cancel_pull(backend_id: int, name: str):
 # This endpoint is the only file-upload path; everything else (.txt, .md,
 # .csv, .json, source code, images) is read in JS via FileReader.
 
-PDF_MAX_BYTES = 10 * 1024 * 1024     # 10 MB raw upload cap
-PDF_MAX_PAGES = 50                   # only the first 50 pages are scanned
-PDF_MAX_CHARS = 30_000               # output truncated past this many chars
+# Caps for the CHAT-ATTACHMENT path (a PDF stuffed into one chat turn): modest,
+# so a giant doc can't blow the model's context.
+PDF_MAX_BYTES = int(os.environ.get("MINICLOSEDAI_PDF_MAX_MB", "10")) * 1024 * 1024
+PDF_MAX_PAGES = int(os.environ.get("MINICLOSEDAI_PDF_MAX_PAGES", "50"))
+PDF_MAX_CHARS = int(os.environ.get("MINICLOSEDAI_PDF_MAX_CHARS", "30000"))
+# Book-friendly caps for the KNOWLEDGE-BASE path (?full=1): the full text is
+# chunked + embedded, so length is not a context concern — let whole books in.
+PDF_FULL_MAX_BYTES = int(os.environ.get("MINICLOSEDAI_PDF_FULL_MAX_MB", "200")) * 1024 * 1024
+PDF_FULL_MAX_PAGES = int(os.environ.get("MINICLOSEDAI_PDF_FULL_MAX_PAGES", "5000"))
+PDF_FULL_MAX_CHARS = int(os.environ.get("MINICLOSEDAI_PDF_FULL_MAX_CHARS", "5000000"))
 
 
 @app.post("/api/extract-pdf")
-async def api_extract_pdf(file: UploadFile = File(...)):
+async def api_extract_pdf(file: UploadFile = File(...), full: bool = False):
     """Extract plain text from an uploaded PDF.
 
-    Returns ``{filename, page_count, char_count, truncated, text}``. ``truncated``
-    is true if either the page cap or the character cap was hit; the caller
-    can surface that to the user. Image-only / scanned PDFs come back with
-    short or empty ``text`` — that's a pypdf limitation, not a bug here.
+    `full=true` uses the book-friendly caps (knowledge-base ingestion — whole
+    books); the default modest caps are for the chat-attachment path. Returns
+    ``{filename, page_count, char_count, truncated, text}``. ``truncated`` is
+    true if a page/char cap was hit. Image-only / scanned PDFs come back with
+    short or empty ``text`` — a pypdf limitation, not a bug here.
     """
+    max_bytes = PDF_FULL_MAX_BYTES if full else PDF_MAX_BYTES
+    max_pages = PDF_FULL_MAX_PAGES if full else PDF_MAX_PAGES
+    max_chars = PDF_FULL_MAX_CHARS if full else PDF_MAX_CHARS
+
     raw = await file.read()
-    if len(raw) > PDF_MAX_BYTES:
+    if len(raw) > max_bytes:
         raise HTTPException(
             status_code=413,
-            detail=f"PDF too large ({len(raw) / 1024 / 1024:.1f} MB > {PDF_MAX_BYTES // 1024 // 1024} MB cap)",
+            detail=f"PDF too large ({len(raw) / 1024 / 1024:.1f} MB > {max_bytes // 1024 // 1024} MB cap)",
         )
     try:
         reader = pypdf.PdfReader(io.BytesIO(raw))
@@ -729,10 +741,10 @@ async def api_extract_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
 
     total_pages = len(reader.pages)
-    pages_scanned = min(total_pages, PDF_MAX_PAGES)
+    pages_scanned = min(total_pages, max_pages)
     chunks: list[str] = []
     chars = 0
-    truncated = total_pages > PDF_MAX_PAGES
+    truncated = total_pages > max_pages
     for i in range(pages_scanned):
         try:
             page_text = reader.pages[i].extract_text() or ""
@@ -741,13 +753,13 @@ async def api_extract_pdf(file: UploadFile = File(...)):
         # Header lets the model see page boundaries when scanning multi-page docs.
         chunks.append(f"--- Page {i + 1} ---\n{page_text.strip()}")
         chars += len(page_text)
-        if chars >= PDF_MAX_CHARS:
+        if chars >= max_chars:
             truncated = True
             break
 
     text = "\n\n".join(chunks)
-    if len(text) > PDF_MAX_CHARS:
-        text = text[:PDF_MAX_CHARS]
+    if len(text) > max_chars:
+        text = text[:max_chars]
         truncated = True
 
     return {
@@ -949,11 +961,44 @@ def _conv_exists(conv_id: int) -> dict:
     return db.row_to_dict(row)
 
 
+def _resolve_embed_backend() -> dict:
+    """Pick a backend to compute embeddings on.
+
+    Embeddings are a LOCAL concern: `nomic-embed-text` lives on a local Ollama,
+    not on a cloud chat relay. A bot can be pinned to a remote/relay backend for
+    *chat* (e.g. Interdata) that doesn't serve the embedding model — so we do NOT
+    use the bot's chat backend here. Resolution order:
+      1. MINICLOSEDAI_EMBED_BACKEND_ID env override.
+      2. The built-in local Ollama (is_builtin=1), if enabled.
+      3. Any other enabled Ollama backend (lowest id first).
+    Raises 503 if no Ollama-kind backend is available at all.
+    """
+    override = os.environ.get("MINICLOSEDAI_EMBED_BACKEND_ID")
+    with db.get_conn() as conn:
+        if override and override.strip().isdigit():
+            row = conn.execute("SELECT * FROM backends WHERE id = ?", (int(override),)).fetchone()
+            if row:
+                return db.row_to_dict(row)
+        row = conn.execute(
+            "SELECT * FROM backends WHERE kind = 'ollama' AND enabled = 1 "
+            "ORDER BY is_builtin DESC, id ASC LIMIT 1"
+        ).fetchone()
+    if not row:
+        raise HTTPException(
+            503,
+            f"No local Ollama backend is available to compute embeddings. The "
+            f"knowledge base needs an enabled Ollama endpoint with '{EMBED_MODEL}' "
+            f"pulled (`ollama pull {EMBED_MODEL}`). Your bot's chat backend can "
+            f"still be a cloud/relay endpoint — embeddings just run locally.",
+        )
+    return db.row_to_dict(row)
+
+
 @app.post("/api/conversations/{conv_id}/knowledge")
 async def api_add_knowledge(conv_id: int, doc: KnowledgeDocCreate):
     """Chunk + embed a document and store it in this bot's knowledge base."""
-    conv = _conv_exists(conv_id)
-    backend = _load_backend(conv.get("backend_id", 1))
+    _conv_exists(conv_id)
+    backend = _resolve_embed_backend()
 
     chunks = knowledge.chunk_text(doc.text)
     if not chunks:
@@ -964,9 +1009,10 @@ async def api_add_knowledge(conv_id: int, doc: KnowledgeDocCreate):
     except (httpx.ConnectError, RuntimeError, ValueError) as e:
         raise HTTPException(
             502,
-            f"Embedding failed with model '{EMBED_MODEL}': {e}. "
-            f"Make sure the embedding model is available on this bot's backend "
-            f"(e.g. run `ollama pull {EMBED_MODEL}`).",
+            f"Embedding failed with model '{EMBED_MODEL}' on backend "
+            f"'{backend.get('name', '?')}': {e}. Pull it there with "
+            f"`ollama pull {EMBED_MODEL}`, or set MINICLOSEDAI_EMBED_BACKEND_ID "
+            f"to an Ollama endpoint that serves it.",
         )
     if len(vecs) != len(chunks):
         raise HTTPException(502, "Embedding backend returned the wrong number of vectors.")
@@ -1036,6 +1082,10 @@ async def _augment_messages_with_knowledge(
     prepend them to the system message. Best-effort: any failure (embedding
     model not pulled, backend down) is swallowed so a knowledge hiccup never
     blocks a normal chat turn — the bot just answers without augmentation.
+
+    `backend` is the bot's CHAT backend (unused for embedding): the query is
+    embedded on the local embed backend so chunks + query use the same model,
+    even when the bot chats through a cloud relay. See _resolve_embed_backend.
     """
     if not query_text or not query_text.strip():
         return
@@ -1052,7 +1102,8 @@ async def _augment_messages_with_knowledge(
         ).fetchall()
     names = {r["id"]: r["filename"] for r in docrows}
     try:
-        qvecs = await llm.embed(backend, EMBED_MODEL, [query_text])
+        embed_backend = _resolve_embed_backend()
+        qvecs = await llm.embed(embed_backend, EMBED_MODEL, [query_text])
     except Exception:
         return
     if not qvecs or not qvecs[0]:

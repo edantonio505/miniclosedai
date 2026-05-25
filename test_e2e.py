@@ -1034,6 +1034,20 @@ def _():
     assert "gamma sector seven" in sys_msg["content"]
 
 
+@test("knowledge: a bot on a non-Ollama backend still embeds via local Ollama")
+def _():
+    # Reproduces the relay bug: a bot pinned to an OpenAI-compat / cloud backend
+    # that doesn't serve the embed model must still embed locally (built-in Ollama).
+    _reseed_builtin_to_fake_ollama()        # built-in id=1 = fake Ollama (has /api/embed)
+    bid = _add_openai_backend()             # fake OpenAI-compat (no /api/embed)
+    cid = client.post("/api/conversations", json={
+        "title": "kb-relay", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    r = client.post(f"/api/conversations/{cid}/knowledge",
+                    json={"filename": "n.txt", "text": "alpha alpha facts about alpha."})
+    assert r.status_code == 200, r.text     # embeds on built-in Ollama, not the OpenAI bot backend
+    assert r.json()["chunk_count"] >= 1
+
+
 @test("knowledge: deleting a conversation cascades to its knowledge base")
 def _():
     cid = _new_fake_conv("kb-cascade")
@@ -2308,7 +2322,7 @@ def _():
 
 @test("extract-pdf: oversize upload is rejected (413)")
 def _():
-    # 11 MB of zero bytes — past the 10 MB cap.
+    # 11 MB of zero bytes — past the 10 MB chat-attachment cap.
     big = b"\x00" * (11 * 1024 * 1024)
     r = client.post(
         "/api/extract-pdf",
@@ -2316,6 +2330,20 @@ def _():
     )
     assert r.status_code == 413, r.text
     assert "too large" in r.json()["detail"].lower()
+
+
+@test("extract-pdf: full=1 raises the byte cap (knowledge-base path)")
+def _():
+    # Same 11 MB that the default path rejects — full=1 must NOT 413 it (it's
+    # under the book-friendly cap). The zero bytes aren't a valid PDF, so it
+    # gets a 400 parse error instead — proving the size gate was lifted, not hit.
+    big = b"\x00" * (11 * 1024 * 1024)
+    r = client.post(
+        "/api/extract-pdf?full=1",
+        files={"file": ("book.pdf", big, "application/pdf")},
+    )
+    assert r.status_code != 413, r.text
+    assert r.status_code == 400, r.text
 
 
 @test("extract-pdf: malformed bytes return 400")
