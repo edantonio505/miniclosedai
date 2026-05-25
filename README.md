@@ -58,7 +58,7 @@ MiniClosedAI is a single-user, single-process web app that wraps **local** LLMs 
 - 🎛️ **Live parameter sliders** — temperature, max tokens, top-p, top-k, thinking level, max thinking tokens. Every change auto-saves to the active conversation.
 - 🔁 **Per-chat microservice endpoints** — each saved conversation is an addressable URL that replays your GUI-configured bot. Callers just send `{"message": "..."}`.
 - 💭 **Reasoning-model aware** — `thinking` and `content` tokens from models like qwen3, deepseek-r1, and gpt-oss stream separately; "thoughts" appear in a collapsible block. `max_thinking_tokens` is a soft cap: visible reasoning is hidden but the model keeps running so the answer still arrives.
-- 📚 **Per-bot knowledge base (RAG) — "give your bot books"** — upload PDFs / `.txt` / `.md` to a bot from the sidebar **Knowledge** panel and it answers grounded in them. **No vector database to install:** SQLite *is* the store and Ollama provides the embeddings (`nomic-embed-text` by default). Chunks are embedded once at upload; each turn, the user's question is embedded and the top-k passages are injected into the system prompt. Each bot has its own isolated library. All local, $0 per query. (Needs the embedding model pulled once: `ollama pull nomic-embed-text`.)
+- 📚 **Per-bot knowledge base (RAG) — "give your bot books"** — upload PDFs / `.txt` / `.md` to a bot from the sidebar **Knowledge** panel and it answers grounded in them. **No vector database to install:** SQLite *is* the store and Ollama provides the embeddings (`nomic-embed-text` by default). Chunks are embedded once at upload; each turn, the user's question is embedded and the top-k passages are injected into the system prompt. Each bot has its own isolated library. Whole books are fine (book-friendly PDF caps, 200 MB / 5000 pages). **Embeddings always run on your local Ollama** even if the bot chats through a cloud relay. All local, $0 per query. (Needs the embedding model pulled once: `ollama pull nomic-embed-text`.)
 - 🧩 **MCP plugins — "give your bot tools"** — MiniClosedAI is an [MCP](https://modelcontextprotocol.io) host. Paste a remote MCP server URL into the sidebar **Extensions** panel and the bot can call that server's tools mid-conversation (bounded model→tools→model loop). "Writing a plugin" = pointing at any of the thousands of existing MCP servers, or writing your own — no MiniClosedAI-specific plugin format. Remote (Streamable HTTP) servers; needs a tool-calling-capable model (qwen3, llama3.x, mistral, …).
 - 📊 **Bot evals + auto-improve** — give a bot a set of test cases (input → expected), score its accuracy (**exact** / **contains** / **LLM-judge**), and run an **auto-improve loop** that rewrites the system prompt against the failing cases and re-scores until it hits your target % (or a max-iterations cap), keeping the best-scoring prompt. Seed cases from the bot's own chat history or upload a CSV. Sidebar **Evals** panel + a 📊 card action. All local — turns blind prompt-tuning into a measure → improve → re-measure loop.
 - 📎 **File attachments — images, PDFs, and text files** — paperclip in the composer (and clipboard paste) attaches files to a chat turn. Vision models (`llava`, `gemma4`, `qwen3.6`, `*-vision`, `*-vl`, etc.) see images natively over both Ollama's `/api/chat` and OpenAI's `chat/completions` formats. PDFs are extracted to text server-side with `pypdf` (50-page / 30 000-char caps), and `.txt` / `.md` / `.csv` / source-code files are read inline. Attached file bodies get prepended to the user's message; the bubble shows just the user's question + thumbnails / doc chips. Soft-warns when an image is attached to a model that doesn't pattern-match a vision model. **No extra setup** — `pypdf` ships in `requirements.txt`.
@@ -372,13 +372,14 @@ Vertical nav with three icons — clicking swaps the main content area without u
 
 - **Bots** (top, message-square icon) — the home for everything chat-related. Shows a searchable list of every saved conversation; click a card to enter that chat. The icon stays highlighted whether you're on the list OR inside a chat (chats are children of Bots, not a sibling tab). A small **pulse dot** on this icon lights up when a bot has a streaming or unread reply you haven't seen yet.
 - **Logs** (middle, terminal icon) — live LM-Studio-style viewer of every chat request and response across all endpoints. See [Logs page](#logs-page) below.
+- **Theme toggle** (bottom, sits on top of the gear) — cycles System → Light → Dark → System. Respects `prefers-color-scheme` while on System.
 - **Settings** (bottom, gear icon) — register and manage LLM endpoints (see [Connecting LM Studio and other endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)).
 
 Your selection persists across reloads. Streaming chats keep playing when you flip between tabs — the DOM is never unmounted, and the Logs polling auto-pauses on the other tabs so it doesn't burn cycles when invisible.
 
 ### Bots page (home)
 
-Single full-page surface listing every saved conversation, newest first. Each card shows title · model · backend · relative last-updated time. The toolbar (search input + bot count) **stays pinned to the top via `position: sticky`** while the cards scroll under it — you can filter without losing your place. The **+ New bot** button at the top-right prompts for a name, creates the conversation, and drills straight into chat.
+Single full-page surface listing every saved conversation, newest first. Each card shows title · model · backend · relative last-updated time. The toolbar (search input + bot count) **stays pinned to the top via `position: sticky`** while the cards scroll under it — you can filter without losing your place. A **list ↔ grid view toggle** sits on the toolbar (your choice persists in `localStorage`): list is a vertical stack of full-width rows; grid is responsive auto-fill tiles. The **+ New bot** button at the top-right prompts for a name, creates the conversation, and drills straight into chat.
 
 - **Click a card** → spatial slide-in animation, you land in that chat with full history.
 - **Card with a pulse dot** → that bot has a streaming reply in progress OR a completed reply you haven't viewed yet. Clicking the card clears the dot.
@@ -402,7 +403,8 @@ When you drill into a bot, the chat surface gets a topbar with these controls:
 | **Download dataset / bot** (download icon) | Popover menu with five export formats: text CSV, multimodal JSONL+images ZIP, image-classification ZIP, **bot config JSON** (portable, no secrets), and **bot config + history JSON**. The two `.miniclosed-bot.json` formats are for moving a bot to another instance. |
 | **🗑 Delete** | Removes the current conversation entirely. If it was the last bot, returns you to the Bots list. |
 | **`</>` API code** (icon-only) | Opens the snippet modal (see below). Hover for label. |
-| **Theme toggle** | Cycles System → Light → Dark → System. Respects `prefers-color-scheme` while on System. |
+
+(The **theme toggle** lives in the left activity bar now — on top of the gear — not in this topbar.)
 
 ### Sidebar
 
@@ -423,7 +425,7 @@ Two panels, separated by a **horizontal splitter** you can drag to resize:
 
 **Reset defaults** snaps everything back to stock values.
 
-**Knowledge** — the per-bot RAG library. Click **+ Add document** to upload PDFs / `.txt` / `.md`; each file is chunked, embedded (via the bot's backend using `nomic-embed-text` by default), and stored in SQLite keyed to this bot. On every turn the user's question is embedded and the most relevant passages are prepended to the system prompt, so the bot answers from your documents. Remove a document with its trash icon. Requires the embedding model once (`ollama pull nomic-embed-text`); override with `MINICLOSEDAI_EMBED_MODEL`. No external vector database.
+**Knowledge** — the per-bot RAG library. Click **+ Add document** to upload PDFs / `.txt` / `.md`; each file is chunked, embedded, and stored in SQLite keyed to this bot. **Embeddings always run on your local Ollama** (`nomic-embed-text` by default) regardless of where the bot *chats* — so a bot pinned to a cloud relay (e.g. Interdata) still embeds locally rather than failing. On every turn the user's question is embedded and the most relevant passages are prepended to the system prompt. PDFs use book-friendly caps (up to 200 MB / 5000 pages — full books welcome), with a small spinner while a doc is processed. Remove a document with its trash icon. Requires the embedding model once (`ollama pull nomic-embed-text`); override the model with `MINICLOSEDAI_EMBED_MODEL` or force a specific embed endpoint with `MINICLOSEDAI_EMBED_BACKEND_ID`. No external vector database.
 
 **Extensions** — the per-bot MCP plugins. Paste a remote MCP server URL and click **Add**; MiniClosedAI connects, lists the server's tools, and (if reachable) saves it. When the bot has enabled plugins, a chat turn runs a bounded tool-calling loop: the model can call the server's tools and incorporate the results before answering. Toggle a plugin on/off or remove it. Needs a tool-calling-capable model. See [Extensibility — MCP plugins](./DOCUMENTATION.md#extensibility--mcp-plugins) for details.
 
@@ -2258,7 +2260,7 @@ Two ways to pull the latest from `https://github.com/edantonio505/miniclosedai`.
 
 ### Option 1 — One click in the GUI
 
-When new commits land on `main`, a small **"Update available"** badge appears in the header (between **API Code** and the theme toggle). Click it.
+When new commits land on `main`, a small **"Update available"** badge appears in the chat topbar (next to **API Code**). Click it.
 
 The modal shows:
 - Current commit short-SHA → latest commit short-SHA
