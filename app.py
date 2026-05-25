@@ -42,7 +42,7 @@ import mcp_host
 # requested through the bot's own backend, so this model must be served there.
 EMBED_MODEL = os.environ.get("MINICLOSEDAI_EMBED_MODEL", "nomic-embed-text")
 # Cap on how many retrieved chunks get injected into the prompt per turn.
-KB_TOP_K = int(os.environ.get("MINICLOSEDAI_KB_TOP_K", "5"))
+KB_TOP_K = int(os.environ.get("MINICLOSEDAI_KB_TOP_K", "8"))
 # Safety cap on MCP tool-call rounds per turn (model→tools→model→…). Prevents a
 # runaway loop where the model keeps calling tools without ever answering.
 MCP_MAX_TOOL_ITERS = int(os.environ.get("MINICLOSEDAI_MCP_MAX_ITERS", "6"))
@@ -1116,7 +1116,9 @@ async def _augment_messages_with_knowledge(
         }
         for r in rows
     ]
-    passages = knowledge.top_k(qvecs[0], chunks, k=KB_TOP_K)
+    # Balanced retrieval so one huge/noisy book can't monopolize every slot and
+    # bury a smaller book's relevant chunk. Single-doc bots behave like top_k.
+    passages = knowledge.top_k_balanced(qvecs[0], chunks, k=KB_TOP_K)
     block = knowledge.build_context_block(passages)
     if block and messages and messages[0].get("role") == "system":
         messages[0]["content"] = block + "\n\n" + messages[0]["content"]

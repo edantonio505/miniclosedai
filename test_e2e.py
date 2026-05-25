@@ -1322,6 +1322,14 @@ def _():
     assert top[0]["text"] == "A" and top[0]["score"] > 0.5
     block = kn.build_context_block(top)
     assert "Knowledge base excerpts" in block and "[source: a.txt]" in block
+    # top_k_balanced: a big book whose chunks all outscore a small book must NOT
+    # fill every slot — the small book's relevant chunk has to surface.
+    big = [{"embedding": kn.normalize([1.0, 0.01 * i]), "text": f"big{i}", "filename": "BIG.pdf"}
+           for i in range(10)]
+    small = [{"embedding": kn.normalize([0.9, 0.2]), "text": "small-hit", "filename": "small.pdf"}]
+    bal = kn.top_k_balanced([1.0, 0.0], big + small, k=5)
+    assert any(c["filename"] == "small.pdf" for c in bal), [c["filename"] for c in bal]
+    assert all(c["filename"] == "BIG.pdf" for c in kn.top_k([1.0, 0.0], big + small, k=5))  # plain buries it
 
 
 @test("llm.tool_result_message: per-kind shape (ollama vs openai)")
