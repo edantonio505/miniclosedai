@@ -905,6 +905,10 @@ def _():
     assert 'id="evals-manage-btn"' in body
     assert 'id="eval-modal-backdrop"' in body
     assert 'id="eval-run-btn"' in body
+    # Searchable model picker (native <select> kept as hidden backing state).
+    assert 'id="model-picker-btn"' in body
+    assert 'id="model-picker-search"' in body
+    assert 'id="model-select"' in body
 
 
 @test("static: app.js is served and contains recent helpers")
@@ -936,6 +940,8 @@ def _():
         # Evals
         "loadEvals", "openEvalModal", "runEvals", "autoImproveLoop",
         "initEvalsUI", "initEvalModalUI",
+        # Searchable model picker
+        "initModelPicker", "_rebuildModelPicker", "_syncModelPickerLabel",
     ]
     for needle in needles:
         assert needle in r.text, f"missing {needle} in served app.js"
