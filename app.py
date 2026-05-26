@@ -47,6 +47,26 @@ KB_TOP_K = int(os.environ.get("MINICLOSEDAI_KB_TOP_K", "8"))
 # runaway loop where the model keeps calling tools without ever answering.
 MCP_MAX_TOOL_ITERS = int(os.environ.get("MINICLOSEDAI_MCP_MAX_ITERS", "6"))
 
+# In-flight server-side generations, keyed by conversation_id. A generation runs
+# in a background asyncio task decoupled from the client's SSE connection, so a
+# reply keeps generating — and gets persisted — even if the user refreshes or
+# closes the tab. The client streams from (and can re-attach to) the buffer.
+# See _run_generation / _attach_generation_sse.
+_generations: dict[int, dict] = {}
+_GEN_EVICT_GRACE_S = 20  # keep a finished generation this long so a reloading client can read the tail
+
+
+def _new_generation() -> dict:
+    return {
+        "status": "running",   # running | done | error
+        "chunks": [],          # visible content chunks (strings)
+        "thinking": [],        # reasoning chunks
+        "truncated": False,
+        "error": None,
+        "task": None,          # the background asyncio.Task, so Stop can cancel it
+        "cond": asyncio.Condition(),
+    }
+
 STATIC_DIR = Path(__file__).parent / "static"
 
 
@@ -157,6 +177,10 @@ class ConversationUpdate(BaseModel):
     think: ThinkValue = None
     max_thinking_tokens: int | None = Field(None, ge=1, le=100000)
     backend_id: int | None = None
+
+
+class AvatarUpdate(BaseModel):
+    avatar: str   # a `data:image/*;base64,...` URL (downscaled client-side)
 
 
 class ConversationChatRequest(BaseModel):
@@ -823,7 +847,7 @@ async def api_models():
 def api_list_conversations():
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, title, model, backend_id, updated_at FROM conversations ORDER BY updated_at DESC"
+            "SELECT id, title, model, backend_id, avatar, updated_at FROM conversations ORDER BY updated_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -855,7 +879,12 @@ def api_get_conversation(conv_id: int):
         ).fetchone()
     if not row:
         raise HTTPException(404, "Conversation not found")
-    return db.row_to_dict(row)
+    d = db.row_to_dict(row)
+    # True when a reply is being generated server-side (survives client refresh).
+    # The client uses this to resume the waiting/streaming state on reload.
+    g = _generations.get(conv_id)
+    d["generating"] = bool(g and g["status"] == "running")
+    return d
 
 
 @app.patch("/api/conversations/{conv_id}")
@@ -904,6 +933,44 @@ def api_update_conversation(conv_id: int, data: ConversationUpdate):
         cur = conn.execute(
             f"UPDATE conversations SET {', '.join(fields)}, updated_at = datetime('now') WHERE id = ?",
             values,
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Conversation not found")
+    return {"ok": True}
+
+
+# ~1MB cap on the stored data URL. The client downscales avatars to a small
+# square before upload, so a real avatar is a few KB; this just guards against
+# someone POSTing a full-res image straight to the API.
+AVATAR_MAX_CHARS = 1_500_000
+
+
+@app.put("/api/conversations/{conv_id}/avatar")
+def api_set_avatar(conv_id: int, data: AvatarUpdate):
+    """Set the bot's circle avatar (a base64 image data URL). Doesn't bump
+    updated_at — changing an avatar isn't conversation activity."""
+    url = (data.avatar or "").strip()
+    if not url.startswith("data:image/"):
+        raise HTTPException(400, "avatar must be a data:image/* URL")
+    if len(url) > AVATAR_MAX_CHARS:
+        raise HTTPException(413, "avatar image too large")
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE conversations SET avatar = ? WHERE id = ?", (url, conv_id)
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Conversation not found")
+    return {"ok": True}
+
+
+@app.delete("/api/conversations/{conv_id}/avatar")
+def api_clear_avatar(conv_id: int):
+    """Remove the bot's avatar, falling back to the initial-letter circle."""
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE conversations SET avatar = NULL WHERE id = ?", (conv_id,)
         )
         conn.commit()
         if cur.rowcount == 0:
@@ -2133,16 +2200,29 @@ def _resolve_conversation_chat(
     return conv, ollama_messages, effective, backend
 
 
-def _persist_conv_chat_turn(
-    conv_id: int, user_msgs: list[dict], assistant_text: str, effective: dict, backend: dict
-) -> None:
+def _chat_snapshot(effective: dict, backend: dict) -> dict:
     params = {k: effective[k] for k in _PARAM_KEYS}
-    snapshot = {
-        **params,
-        "model": effective["model"],
-        "backend_id": backend["id"],
-        "backend_name": backend["name"],
-    }
+    return {**params, "model": effective["model"],
+            "backend_id": backend["id"], "backend_name": backend["name"]}
+
+
+def _user_entries(user_msgs: list[dict], snapshot: dict) -> list[dict]:
+    out = []
+    for m in user_msgs:
+        entry = {"role": m["role"], "content": m["content"], "params": snapshot}
+        # Preserve UI-only metadata so the bubble can be reconstructed on reload.
+        if m.get("display_text") is not None:
+            entry["display_text"] = m["display_text"]
+        if m.get("attachments"):
+            entry["attachments"] = m["attachments"]
+        out.append(entry)
+    return out
+
+
+def _append_conv_messages(conv_id: int, entries: list[dict]) -> None:
+    """Append message entries to a conversation's stored history (atomic)."""
+    if not entries:
+        return
     with db.get_conn() as conn:
         row = conn.execute(
             "SELECT messages FROM conversations WHERE id = ?", (conv_id,)
@@ -2150,23 +2230,23 @@ def _persist_conv_chat_turn(
         if not row:
             return
         existing = json.loads(row["messages"] or "[]")
-        for m in user_msgs:
-            entry = {"role": m["role"], "content": m["content"], "params": snapshot}
-            # Preserve UI-only metadata so the bubble can be reconstructed on
-            # reload. `display_text` is the user's typed text without the
-            # "[Attached: …]" file-body prefixes; `attachments` is per-file
-            # metadata used for rendering chips.
-            if m.get("display_text") is not None:
-                entry["display_text"] = m["display_text"]
-            if m.get("attachments"):
-                entry["attachments"] = m["attachments"]
-            existing.append(entry)
-        existing.append({"role": "assistant", "content": assistant_text.strip(), "params": snapshot})
+        existing.extend(entries)
         conn.execute(
             "UPDATE conversations SET messages = ?, updated_at = datetime('now') WHERE id = ?",
             (json.dumps(existing), conv_id),
         )
         conn.commit()
+
+
+def _persist_conv_chat_turn(
+    conv_id: int, user_msgs: list[dict], assistant_text: str, effective: dict, backend: dict
+) -> None:
+    """Append a user turn + the assistant reply atomically (non-streaming path)."""
+    snap = _chat_snapshot(effective, backend)
+    _append_conv_messages(
+        conv_id,
+        _user_entries(user_msgs, snap) + [{"role": "assistant", "content": assistant_text.strip(), "params": snap}],
+    )
 
 
 async def _run_conv_message(conv_id: int, message: str) -> str:
@@ -2246,9 +2326,150 @@ async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
     }
 
 
+async def _run_generation(conv_id, model, messages, eff, backend, mcp_servers,
+                          gen, snapshot, attachments, endpoint):
+    """Generate the assistant reply in a background task, decoupled from any
+    client SSE connection. Accumulates chunks into `gen` (clients stream from
+    it), persists the assistant turn on completion, and marks status — so the
+    reply lands in the DB even if the user refreshed/closed the tab."""
+    t0 = time.perf_counter()
+    max_think = eff.get("max_thinking_tokens")
+    think_count = 0
+    try:
+        if mcp_servers:
+            text = await _run_mcp_tool_loop(model, messages, eff, backend, mcp_servers)
+            async with gen["cond"]:
+                gen["chunks"].append(text)
+                gen["cond"].notify_all()
+        else:
+            async for ev in llm.chat_stream(
+                backend, model, messages,
+                temperature=eff["temperature"], max_tokens=eff["max_tokens"],
+                top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
+            ):
+                async with gen["cond"]:
+                    if "content" in ev:
+                        gen["chunks"].append(ev["content"])
+                    elif "thinking" in ev:
+                        think_count += 1
+                        if max_think and think_count > max_think:
+                            gen["truncated"] = True  # soft cap: stop surfacing reasoning
+                        else:
+                            gen["thinking"].append(ev["thinking"])
+                    gen["cond"].notify_all()
+        full = "".join(gen["chunks"])
+        _append_conv_messages(conv_id, [{"role": "assistant", "content": full.strip(), "params": snapshot}])
+        chat_logs.record_chat(
+            endpoint=endpoint, kind="stream", backend=backend, model=model,
+            messages=messages, params=eff, attachments=attachments,
+            response_text=full, thinking_text="".join(gen["thinking"]) or None,
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
+        async with gen["cond"]:
+            gen["status"] = "done"
+            gen["cond"].notify_all()
+    except asyncio.CancelledError:
+        # User pressed Stop. Persist whatever partial reply we have so it isn't
+        # lost, mark the generation finished, and swallow the cancellation so
+        # the task ends cleanly (it's a fire-and-forget background task).
+        partial = "".join(gen["chunks"]).strip()
+        if partial:
+            _append_conv_messages(conv_id, [{"role": "assistant", "content": partial, "params": snapshot}])
+        chat_logs.record_chat(
+            endpoint=endpoint, kind="stream", backend=backend, model=model,
+            messages=messages, params=eff, attachments=attachments,
+            response_text=partial or None, status="error", error="stopped by user",
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
+        async with gen["cond"]:
+            gen["status"] = "done"
+            gen["cond"].notify_all()
+    except (httpx.ConnectError, Exception) as e:
+        emsg = _backend_err(backend) if isinstance(e, httpx.ConnectError) else str(e)
+        chat_logs.record_chat(
+            endpoint=endpoint, kind="stream", backend=backend, model=model,
+            messages=messages, params=eff, attachments=attachments,
+            response_text="".join(gen["chunks"]) or None, status="error", error=str(e),
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
+        async with gen["cond"]:
+            gen["status"] = "error"
+            gen["error"] = emsg
+            gen["cond"].notify_all()
+    finally:
+        asyncio.create_task(_evict_generation(conv_id))
+
+
+async def _evict_generation(conv_id):
+    await asyncio.sleep(_GEN_EVICT_GRACE_S)
+    g = _generations.get(conv_id)
+    if g and g["status"] != "running":
+        _generations.pop(conv_id, None)
+
+
+async def _attach_generation_sse(conv_id):
+    """SSE view into a (possibly already in-progress) generation: replays what's
+    accumulated so far, then streams new chunks live. Safe to cancel on client
+    disconnect — the underlying _run_generation task keeps running."""
+    gen = _generations.get(conv_id)
+    if not gen:
+        # Nothing in flight (finished + evicted, or never started). The answer,
+        # if any, is already persisted; client should just re-read the conv.
+        yield f"data: {json.dumps({'end': True, 'truncated': False})}\n\n"
+        return
+    sent_c = sent_t = 0
+    trunc_sent = False
+    while True:
+        async with gen["cond"]:
+            while (len(gen["chunks"]) == sent_c and len(gen["thinking"]) == sent_t
+                   and gen["status"] == "running" and (trunc_sent or not gen["truncated"])):
+                await gen["cond"].wait()
+            new_t = gen["thinking"][sent_t:]; sent_t = len(gen["thinking"])
+            new_c = gen["chunks"][sent_c:]; sent_c = len(gen["chunks"])
+            status, err, truncated = gen["status"], gen["error"], gen["truncated"]
+        for t in new_t:
+            yield f"data: {json.dumps({'thinking': t})}\n\n"
+        if truncated and not trunc_sent:
+            trunc_sent = True
+            yield f"data: {json.dumps({'thinking_truncated': True})}\n\n"
+        for c in new_c:
+            yield f"data: {json.dumps({'chunk': c})}\n\n"
+        if status != "running":
+            if status == "error":
+                yield f"data: {json.dumps({'error': err})}\n\n"
+            yield f"data: {json.dumps({'end': True, 'truncated': truncated})}\n\n"
+            return
+
+
+@app.post("/api/conversations/{conv_id}/generation/cancel")
+async def api_cancel_generation(conv_id: int):
+    """Cancel an in-flight background generation (the Stop button). The task's
+    CancelledError handler persists any partial reply and marks it done."""
+    gen = _generations.get(conv_id)
+    if gen and gen["status"] == "running" and gen.get("task"):
+        gen["task"].cancel()
+        return {"ok": True, "cancelled": True}
+    return {"ok": True, "cancelled": False}
+
+
+@app.get("/api/conversations/{conv_id}/generation/stream")
+async def api_attach_generation(conv_id: int):
+    """Re-attach (SSE) to an in-flight generation — used by the client to resume
+    the streaming/waiting state after a page refresh."""
+    return StreamingResponse(
+        _attach_generation_sse(conv_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/api/conversations/{conv_id}/chat/stream")
 async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
-    """Call the saved conversation as a configured function (SSE streaming)."""
+    """Call the saved conversation as a configured function (SSE streaming).
+
+    Persisted single-message turns (the GUI chat) run a background generation
+    that survives a client refresh; the SSE just views its buffer. Non-persist
+    or messages=[] callers stream directly (no resilience needed)."""
     conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
     mcp_servers = _enabled_mcp_servers(conv) if req.message is not None else []
     if req.message is not None:
@@ -2256,6 +2477,26 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
     backend = await _maybe_override_to_relay(backend, eff["model"])
     attachments = [a.name for a in (req.attachments or [])] if req.attachments else []
     endpoint = f"/api/conversations/{conv_id}/chat/stream"
+
+    # Resilient path: persist the user message NOW, then generate in a background
+    # task. The reply survives refresh; this SSE just views the task buffer.
+    if req.persist and req.message is not None:
+        attachments_raw = [a.model_dump() for a in req.attachments] if req.attachments else None
+        user_msgs = [_build_user_message(req.message, attachments_raw)]
+        snapshot = _chat_snapshot(eff, backend)
+        existing = _generations.get(conv_id)
+        if not existing or existing["status"] != "running":
+            _append_conv_messages(conv_id, _user_entries(user_msgs, snapshot))
+            gen = _new_generation()
+            _generations[conv_id] = gen
+            gen["task"] = asyncio.create_task(_run_generation(
+                conv_id, eff["model"], messages, eff, backend, mcp_servers,
+                gen, snapshot, attachments, endpoint))
+        return StreamingResponse(
+            _attach_generation_sse(conv_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     async def event_stream():
         collected: list[str] = []

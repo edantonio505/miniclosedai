@@ -52,6 +52,7 @@ const els = {
   deleteChatBtn: document.getElementById("delete-chat-btn"),
   apiCodeBtn: document.getElementById("api-code-btn"),
   systemPrompt: document.getElementById("system-prompt"),
+  sysPromptAvatar: document.getElementById("sys-prompt-avatar"),
   temperature: document.getElementById("temperature"),
   tempVal: document.getElementById("temp-val"),
   maxTokens: document.getElementById("max-tokens"),
@@ -139,6 +140,9 @@ let state = {
   activeMode: "stream",    // "stream" | "sync"
   activeStyle: "native",   // "native" | "openai"
   abortController: null,
+  // Conv id of the in-flight stream (POST send or resumed generation). Used by
+  // the Stop button to tell the server to cancel the background generation.
+  streamConvId: null,
   // Pending attachments for the next outgoing user message. Cleared after
   // each successful send. See ATTACH_* constants and _ingestFile() below
   // for the entry shape.
@@ -706,6 +710,103 @@ function _botMatchesFilter(c, q) {
   return hay.includes(q);
 }
 
+const AVATAR_DIM = 128;   // stored avatars are a small square; circles are CSS
+
+// Little bot glyph used as the avatar fallback (lucide-style "bot": a head with
+// an antenna and two eyes). Inherits the circle's white `currentColor`.
+const _BOT_AVATAR_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>';
+
+// Paint a bot's avatar into the given circle element: the uploaded image if it
+// has one, else a little bot icon on a per-bot color. Reused by every re-render
+// (cheap; no network).
+function _renderAvatarInto(el, c) {
+  el.innerHTML = "";
+  el.style.removeProperty("--avatar-hue");
+  if (c.avatar) {
+    const img = document.createElement("img");
+    img.src = c.avatar;
+    img.alt = "";
+    el.appendChild(img);
+    el.classList.remove("is-fallback");
+  } else {
+    el.innerHTML = _BOT_AVATAR_SVG;
+    el.classList.add("is-fallback");
+    // Stable hue per bot id so the fallback color doesn't shuffle on re-render.
+    el.style.setProperty("--avatar-hue", String((c.id * 47) % 360));
+  }
+}
+
+// Center-crop an image file to a square and downscale to AVATAR_DIM px, returned
+// as a JPEG data URL. Keeps the stored avatar a few KB regardless of the source.
+async function _makeAvatarDataUrl(file) {
+  const dataUrl = await _readFileAsDataUrl(file);
+  const img = new Image();
+  await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = dataUrl; });
+  const side = Math.min(img.width, img.height);
+  const sx = (img.width - side) / 2;
+  const sy = (img.height - side) / 2;
+  const canvas = document.createElement("canvas");
+  canvas.width = AVATAR_DIM;
+  canvas.height = AVATAR_DIM;
+  canvas.getContext("2d").drawImage(img, sx, sy, side, side, 0, 0, AVATAR_DIM, AVATAR_DIM);
+  return canvas.toDataURL("image/jpeg", 0.85);
+}
+
+// Shared hidden file input — open the OS picker, then upload the chosen image as
+// this bot's avatar and refresh the cards.
+let _avatarPickInput = null;
+function _pickAvatarFor(c) {
+  if (!_avatarPickInput) {
+    _avatarPickInput = document.createElement("input");
+    _avatarPickInput.type = "file";
+    _avatarPickInput.accept = "image/*";
+    _avatarPickInput.style.display = "none";
+    document.body.appendChild(_avatarPickInput);
+  }
+  _avatarPickInput.value = "";   // allow re-picking the same file
+  _avatarPickInput.onchange = async () => {
+    const file = _avatarPickInput.files && _avatarPickInput.files[0];
+    if (!file) return;
+    try {
+      const dataUrl = await _makeAvatarDataUrl(file);
+      const r = await fetch(`/api/conversations/${c.id}/avatar`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ avatar: dataUrl }),
+      });
+      if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+      const hit = (_botsState.cache || []).find(x => x.id === c.id);
+      if (hit) hit.avatar = dataUrl;
+      renderBotsPage();
+      renderSysPromptAvatar();   // keep the chat sidebar's avatar in sync
+    } catch (e) {
+      alert(`Avatar upload failed: ${e.message}`);
+    }
+  };
+  _avatarPickInput.click();
+}
+
+// Mirror the open bot's avatar into the chat sidebar's System Prompt header.
+// Clicking it uploads/replaces the picture, same as the Bots-page card. With no
+// bot saved yet (e.g. a brand-new unsaved chat) it shows a disabled fallback.
+function renderSysPromptAvatar(conv) {
+  const el = els.sysPromptAvatar;
+  if (!el) return;
+  const c = conv || (_botsState.cache || []).find(x => x.id === state.conversationId);
+  if (!c) {
+    _renderAvatarInto(el, { id: 0, title: "", avatar: null });
+    el.onclick = null;
+    el.disabled = true;
+    el.dataset.tooltip = "";
+    return;
+  }
+  _renderAvatarInto(el, c);
+  el.disabled = false;
+  el.dataset.tooltip = c.avatar ? "Change avatar" : "Add avatar";
+  el.onclick = e => { e.stopPropagation(); _pickAvatarFor(c); };
+}
+
 function renderBotsPage() {
   if (!els.botsList) return; // page not in DOM yet
   _applyBotsView();  // keep the grid/list class in sync on every re-render
@@ -722,6 +823,19 @@ function renderBotsPage() {
     if (_streaming.has(c.id) || _unread.has(c.id)) card.classList.add("has-pending");
     card.tabIndex = 0;
     card.setAttribute("role", "button");
+
+    // Circle avatar — sits left of the name in both views. Clicking it lets the
+    // user upload/replace the bot's picture; with none it shows an initial.
+    const avatar = document.createElement("button");
+    avatar.type = "button";
+    avatar.className = "bot-card-avatar";
+    avatar.dataset.tooltip = c.avatar ? "Change avatar" : "Add avatar";
+    avatar.setAttribute("aria-label", `${c.avatar ? "Change" : "Add"} avatar for ${c.title || "bot"}`);
+    _renderAvatarInto(avatar, c);
+    avatar.addEventListener("click", e => {
+      e.stopPropagation();
+      _pickAvatarFor(c);
+    });
 
     const title = document.createElement("div");
     title.className = "bot-card-title";
@@ -746,8 +860,13 @@ function renderBotsPage() {
       meta.appendChild(span);
     });
 
-    card.appendChild(title);
-    card.appendChild(meta);
+    const textWrap = document.createElement("div");
+    textWrap.className = "bot-card-text";
+    textWrap.appendChild(title);
+    textWrap.appendChild(meta);
+
+    card.appendChild(avatar);
+    card.appendChild(textWrap);
 
     // Row actions — hidden until hover/focus. Each button stops propagation so
     // clicking it doesn't also fire the card's "open this bot" handler.
@@ -827,6 +946,10 @@ function renderBotsPage() {
     };
     card.addEventListener("click", open);
     card.addEventListener("keydown", e => {
+      // Only the card itself navigates on Enter/Space. Without this guard a
+      // keypress on a focused child button (avatar, row actions) would bubble
+      // up and open the bot in addition to the button's own action.
+      if (e.target !== card) return;
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
         open();
@@ -1952,10 +2075,17 @@ async function loadConversations() {
   _botsState.cache = list;
   renderBotsPage();
   renderTopbarBotLabel();
+  renderSysPromptAvatar();
   return list;
 }
 
 async function openConversation(id) {
+  // If this same conversation is mid-stream, do NOT re-fetch/re-render. Rebuilding
+  // the message list from the DB snapshot (which lacks the not-yet-persisted
+  // in-flight turn) would wipe the live streaming bubble and leave the Stop
+  // button stuck. The chat is already showing the live stream — just stay on it.
+  // (Navigating away + back during generation is the trigger.)
+  if (id === state.conversationId && state.abortController) return;
   const r = await fetch(`/api/conversations/${id}`);
   if (!r.ok) return;
   const c = await r.json();
@@ -1967,6 +2097,9 @@ async function openConversation(id) {
   // without this nudge. The bound listener also re-runs saveSettings, which
   // is a no-op for an unchanged localStorage payload.
   if (typeof _updatePromptGenAffordance === "function") _updatePromptGenAffordance();
+  renderSysPromptAvatar(c);   // show this bot's avatar in the sidebar header
+  const _cacheHit = (_botsState.cache || []).find(x => x.id === c.id);
+  if (_cacheHit) _cacheHit.avatar = c.avatar;   // keep card cache fresh
 
   // Match by (model, backend_id) pair. Falls back to model-only if the exact
   // pair can't be found (e.g. the endpoint was deleted). If nothing matches,
@@ -1987,6 +2120,20 @@ async function openConversation(id) {
   _markConvViewed(id);  // opening = "I'm reading this now"
   renderBotsPage();
   renderMessages();
+  if (c.generating && !state.abortController) {
+    // The server is still generating a reply for this conv (we sent a message
+    // then reloaded/navigated). Re-attach to the in-flight generation so the
+    // streaming/waiting state is restored instead of silently lost.
+    resumeGeneration(c);
+  } else if (!state.abortController) {
+    // Self-heal the composer: this conv isn't streaming, so the Send button
+    // must be showing and the input enabled — corrects a Stop button left
+    // stuck by an earlier desync.
+    els.stopBtn.style.display = "none";
+    els.sendBtn.style.display = "";
+    els.sendBtn.disabled = false;
+    els.input.disabled = false;
+  }
   loadKnowledge();
   loadMcp();
   loadEvals();
@@ -2716,13 +2863,9 @@ async function sendMessage(text) {
   const body = assistantEl.querySelector(".msg-body");
   assistantEl.classList.add("cursor");
   scrollToBottom();
-  let assistantText = "";
-  let thinkingText = "";
-  let thinkingEl = null;
-  let contentEl = null;
-  let truncatedNotice = null;
   const ac = new AbortController();
   state.abortController = ac;
+  state.streamConvId = state.conversationId;
   els.stopBtn.style.display = "";
   els.sendBtn.style.display = "none";
 
@@ -2735,8 +2878,10 @@ async function sendMessage(text) {
   // function endpoint with just `{message}` and rely on saved state.
   await flushPendingSave();
 
-  try {
-    const res = await fetch(`/api/conversations/${state.conversationId}/chat/stream`, {
+  const convId = state.conversationId;
+  await _consumeAssistantStream({
+    assistantEl, body, model, params, streamConvId: _streamConvId,
+    fetchFn: () => fetch(`/api/conversations/${convId}/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: ac.signal,
@@ -2751,13 +2896,50 @@ async function sendMessage(text) {
         // turn (text bodies prepended, images become image_url parts).
         attachments: attachmentsForSend.length ? attachmentsForSend : undefined,
       }),
-    });
+    }),
+  });
+}
 
+// Re-attach to a generation that's still running server-side (the user sent a
+// message and then reloaded/closed the tab). The user turn is already persisted
+// and rendered by openConversation; we add the assistant placeholder and stream
+// the in-flight reply from the resume endpoint. The generation runs
+// independently of this connection, so this is a pure viewer.
+async function resumeGeneration(c) {
+  const assistantEl = renderMessage({ role: "assistant", content: "" });
+  const body = assistantEl.querySelector(".msg-body");
+  assistantEl.classList.add("cursor");
+  scrollToBottom();
+  const ac = new AbortController();
+  state.abortController = ac;
+  state.streamConvId = c.id;
+  els.stopBtn.style.display = "";
+  els.sendBtn.style.display = "none";
+  els.sendBtn.disabled = true;
+  els.input.disabled = true;
+  _onStreamStart(c.id);
+  await _consumeAssistantStream({
+    assistantEl, body, model: c.model, params: c.params || {}, streamConvId: c.id,
+    fetchFn: () => fetch(`/api/conversations/${c.id}/generation/stream`, { signal: ac.signal }),
+  });
+}
+
+// Drive the assistant bubble from an SSE response — shared by sendMessage (POST
+// chat/stream) and resumeGeneration (GET generation/stream) so both render
+// identically and reset the composer the same way. `fetchFn` runs inside the
+// try so network/abort errors are handled uniformly.
+async function _consumeAssistantStream({ fetchFn, assistantEl, body, model, params, streamConvId }) {
+  let assistantText = "";
+  let thinkingText = "";
+  let thinkingEl = null;
+  let contentEl = null;
+  let truncatedNotice = null;
+  try {
+    const res = await fetchFn();
     if (!res.ok || !res.body) {
-      const body = await res.text().catch(() => "");
-      throw new Error(body || `HTTP ${res.status}`);
+      const t = await res.text().catch(() => "");
+      throw new Error(t || `HTTP ${res.status}`);
     }
-
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -2829,36 +3011,41 @@ async function sendMessage(text) {
     }
   } finally {
     state.abortController = null;
+    state.streamConvId = null;
     els.stopBtn.style.display = "none";
     els.sendBtn.style.display = "";
     assistantEl.classList.remove("cursor");
-    // Params badge inside the body so the flex layout stays clean.
-    const badge = document.createElement("div");
-    badge.className = "params-badge";
-    badge.textContent = `${model} · T=${params.temperature} · max=${params.max_tokens} · top_p=${params.top_p} · top_k=${params.top_k}`;
-    body.appendChild(badge);
-
-    // Final pass: pretty-print JSON (render() already calls prettifyJSONInMarkdown
-    // on every chunk, but the content only parses once the closing brace arrives)
-    // and run syntax highlighting once, now that streaming is done.
-    if (contentEl) {
-      contentEl.innerHTML = render(assistantText);
-      highlightCodeBlocks(contentEl);
+    const hasContent = assistantText.trim().length > 0 || thinkingText.trim().length > 0;
+    if (!hasContent) {
+      // Empty stream — e.g. a resumed generation that already finished and was
+      // persisted+evicted, or a no-op reply. Drop the ghost bubble instead of
+      // leaving a blank one; the real reply (if any) is already in the DB.
+      assistantEl.remove();
+    } else {
+      // Params badge inside the body so the flex layout stays clean.
+      const badge = document.createElement("div");
+      badge.className = "params-badge";
+      badge.textContent = `${model} · T=${params.temperature} · max=${params.max_tokens} · top_p=${params.top_p} · top_k=${params.top_k}`;
+      body.appendChild(badge);
+      // Final pass: pretty-print JSON (render() already runs per chunk, but the
+      // content only parses once the closing brace arrives) and highlight once.
+      if (contentEl) {
+        contentEl.innerHTML = render(assistantText);
+        highlightCodeBlocks(contentEl);
+      }
+      state.messages.push({ role: "assistant", content: assistantText, params: { model, ...params } });
+      // Now that the message is in state, attach the edit pencil — the
+      // placeholder was rendered without an index.
+      const finalIndex = state.messages.length - 1;
+      assistantEl.dataset.index = String(finalIndex);
+      _appendEditButton(assistantEl, finalIndex);
     }
-
-    state.messages.push({ role: "assistant", content: assistantText, params: { model, ...params } });
-    // Now that streaming is done and the message is in state, attach the edit
-    // pencil — the placeholder was rendered without an index since we didn't
-    // know the final message count yet.
-    const finalIndex = state.messages.length - 1;
-    assistantEl.dataset.index = String(finalIndex);
-    _appendEditButton(assistantEl, finalIndex);
     els.sendBtn.disabled = false;
     els.input.disabled = false;
     els.input.focus();
     scrollToBottom();   // settle the viewport on the fully-rendered final message
     loadConversations();
-    _onStreamEnd(_streamConvId);
+    _onStreamEnd(streamConvId);
   }
 }
 
@@ -3234,6 +3421,12 @@ function bindChat() {
   els.deleteChatBtn.addEventListener("click", deleteCurrentConversation);
   els.stopBtn.addEventListener("click", () => {
     if (state.abortController) state.abortController.abort();
+    // Generation now runs server-side independent of this SSE connection, so
+    // aborting the fetch only stops *watching*. Tell the server to truly cancel
+    // the background task (it persists whatever partial reply it produced).
+    if (state.streamConvId != null) {
+      fetch(`/api/conversations/${state.streamConvId}/generation/cancel`, { method: "POST" }).catch(() => {});
+    }
   });
 }
 

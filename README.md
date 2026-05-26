@@ -379,7 +379,7 @@ Your selection persists across reloads. Streaming chats keep playing when you fl
 
 ### Bots page (home)
 
-Single full-page surface listing every saved conversation, newest first. Each card shows title · model · backend · relative last-updated time. The toolbar (search input + bot count) **stays pinned to the top via `position: sticky`** while the cards scroll under it — you can filter without losing your place. A **list ↔ grid view toggle** sits on the toolbar (your choice persists in `localStorage`): list is a vertical stack of full-width rows; grid is responsive auto-fill tiles. The **+ New bot** button at the top-right prompts for a name, creates the conversation, and drills straight into chat.
+Single full-page surface listing every saved conversation, newest first. Each card shows a **circle avatar** · title · model · backend · relative last-updated time. The toolbar (search input + bot count) **stays pinned to the top via `position: sticky`** while the cards scroll under it — you can filter without losing your place. A **list ↔ grid view toggle** sits on the toolbar (your choice persists in `localStorage`): list is a vertical stack of full-width rows; grid is responsive auto-fill tiles. The **+ New bot** button at the top-right prompts for a name, creates the conversation, and drills straight into chat.
 
 <p align="center">
   <img src="docs/images/bots_page_listview.png" alt="MiniClosedAI Bots page — list view: saved bots as full-width rows with title, model, backend, and last-updated time" width="820">
@@ -391,6 +391,12 @@ Single full-page surface listing every saved conversation, newest first. Each ca
   <br><em>Bots page — grid view (toggle on the toolbar).</em>
 </p>
 
+<p align="center">
+  <img src="docs/images/bots_page_avatars.png" alt="MiniClosedAI Bots page — grid view with circle avatars: each bot card shows a round avatar (a little bot icon on a per-bot color, or an uploaded image) to the left of its name" width="820">
+  <br><em>Bots page — grid view showing per-bot circle avatars. Each bot gets a round avatar to the left of its name: by default a little bot glyph on a color derived from the bot's id, or click the circle to upload your own image (center-cropped + downscaled in-browser, stored inline on the bot).</em>
+</p>
+
+- **Per-bot avatar** → a circle to the left of each name in both list and grid views. With no upload it shows a little bot icon on a stable per-bot color; **click the circle to upload an image** (cropped to a square and downscaled client-side, then saved to the bot). The same avatar also appears in the chat sidebar's System Prompt header, where you can change it too.
 - **Click a card** → spatial slide-in animation, you land in that chat with full history.
 - **Card with a pulse dot** → that bot has a streaming reply in progress OR a completed reply you haven't viewed yet. Clicking the card clears the dot.
 - **Hover a card → row actions appear** on the right (work the same in list and grid view): **`</>` API code** (snippet modal scoped to that bot), **📚 Manage knowledge** (opens a modal listing that bot's documents — filename · chunks · size · date — with per-doc delete and an **+ Add document** button), **🧩 Manage extensions** (opens a modal listing that bot's MCP plugins with a per-server enable toggle, remove, and an add-by-URL row), **📊 Evals** (opens the score/auto-improve modal for that bot), and **🗑 Delete** (confirms with the bot's title, clears stale unread/streaming dots, falls back to the empty state if it was the last bot). All buttons stop event propagation so clicking them doesn't also open the chat; a gradient mask fades the title/meta underneath so the buttons read as an intentional overlay. Editing a bot that's currently open keeps its sidebar panels in sync.
