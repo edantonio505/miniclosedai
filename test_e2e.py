@@ -651,6 +651,68 @@ def _():
         client.delete(f"/api/conversations/{c['id']}")
 
 
+@test("avatar: new bot has none; PUT sets it; list + GET expose it; DELETE clears")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "avatar", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    cid = c["id"]
+    # 1x1 transparent PNG data URL — a valid `data:image/*` payload.
+    png = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0"
+           "lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+    try:
+        # New bot: avatar is null.
+        assert client.get(f"/api/conversations/{cid}").json()["avatar"] is None
+        assert next(b for b in client.get("/api/conversations").json()
+                    if b["id"] == cid)["avatar"] is None
+
+        # Set it.
+        r = client.put(f"/api/conversations/{cid}/avatar", json={"avatar": png})
+        assert r.status_code == 200, r.text
+        assert client.get(f"/api/conversations/{cid}").json()["avatar"] == png
+        # The list endpoint must include it so cards render without N extra fetches.
+        assert next(b for b in client.get("/api/conversations").json()
+                    if b["id"] == cid)["avatar"] == png
+
+        # Clear it.
+        assert client.delete(f"/api/conversations/{cid}/avatar").status_code == 200
+        assert client.get(f"/api/conversations/{cid}").json()["avatar"] is None
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("avatar: rejects non-image data URLs (400) and oversize images (413)")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "avatar-bad", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    cid = c["id"]
+    try:
+        # Not a data:image/* URL.
+        assert client.put(f"/api/conversations/{cid}/avatar",
+                          json={"avatar": "https://example.com/x.png"}).status_code == 400
+        assert client.put(f"/api/conversations/{cid}/avatar",
+                          json={"avatar": "data:text/plain;base64,aGVsbG8="}).status_code == 400
+        # Over the size cap.
+        huge = "data:image/png;base64," + ("A" * 1_600_000)
+        assert client.put(f"/api/conversations/{cid}/avatar",
+                          json={"avatar": huge}).status_code == 413
+        # None of the rejects should have stuck.
+        assert client.get(f"/api/conversations/{cid}").json()["avatar"] is None
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("avatar: set/clear on a missing conversation → 404")
+def _():
+    png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+    assert client.put("/api/conversations/99999999/avatar",
+                      json={"avatar": png}).status_code == 404
+    assert client.delete("/api/conversations/99999999/avatar").status_code == 404
+
+
 @test("per-conv /chat: config lock rejects extra fields (422)")
 def _():
     _reseed_builtin_to_fake_ollama()

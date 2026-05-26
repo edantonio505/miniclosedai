@@ -179,6 +179,10 @@ class ConversationUpdate(BaseModel):
     backend_id: int | None = None
 
 
+class AvatarUpdate(BaseModel):
+    avatar: str   # a `data:image/*;base64,...` URL (downscaled client-side)
+
+
 class ConversationChatRequest(BaseModel):
     """Body for POST /api/conversations/{id}/chat.
 
@@ -843,7 +847,7 @@ async def api_models():
 def api_list_conversations():
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, title, model, backend_id, updated_at FROM conversations ORDER BY updated_at DESC"
+            "SELECT id, title, model, backend_id, avatar, updated_at FROM conversations ORDER BY updated_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -929,6 +933,44 @@ def api_update_conversation(conv_id: int, data: ConversationUpdate):
         cur = conn.execute(
             f"UPDATE conversations SET {', '.join(fields)}, updated_at = datetime('now') WHERE id = ?",
             values,
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Conversation not found")
+    return {"ok": True}
+
+
+# ~1MB cap on the stored data URL. The client downscales avatars to a small
+# square before upload, so a real avatar is a few KB; this just guards against
+# someone POSTing a full-res image straight to the API.
+AVATAR_MAX_CHARS = 1_500_000
+
+
+@app.put("/api/conversations/{conv_id}/avatar")
+def api_set_avatar(conv_id: int, data: AvatarUpdate):
+    """Set the bot's circle avatar (a base64 image data URL). Doesn't bump
+    updated_at — changing an avatar isn't conversation activity."""
+    url = (data.avatar or "").strip()
+    if not url.startswith("data:image/"):
+        raise HTTPException(400, "avatar must be a data:image/* URL")
+    if len(url) > AVATAR_MAX_CHARS:
+        raise HTTPException(413, "avatar image too large")
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE conversations SET avatar = ? WHERE id = ?", (url, conv_id)
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Conversation not found")
+    return {"ok": True}
+
+
+@app.delete("/api/conversations/{conv_id}/avatar")
+def api_clear_avatar(conv_id: int):
+    """Remove the bot's avatar, falling back to the initial-letter circle."""
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE conversations SET avatar = NULL WHERE id = ?", (conv_id,)
         )
         conn.commit()
         if cur.rowcount == 0:

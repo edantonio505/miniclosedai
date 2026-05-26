@@ -52,6 +52,7 @@ const els = {
   deleteChatBtn: document.getElementById("delete-chat-btn"),
   apiCodeBtn: document.getElementById("api-code-btn"),
   systemPrompt: document.getElementById("system-prompt"),
+  sysPromptAvatar: document.getElementById("sys-prompt-avatar"),
   temperature: document.getElementById("temperature"),
   tempVal: document.getElementById("temp-val"),
   maxTokens: document.getElementById("max-tokens"),
@@ -709,6 +710,103 @@ function _botMatchesFilter(c, q) {
   return hay.includes(q);
 }
 
+const AVATAR_DIM = 128;   // stored avatars are a small square; circles are CSS
+
+// Little bot glyph used as the avatar fallback (lucide-style "bot": a head with
+// an antenna and two eyes). Inherits the circle's white `currentColor`.
+const _BOT_AVATAR_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg>';
+
+// Paint a bot's avatar into the given circle element: the uploaded image if it
+// has one, else a little bot icon on a per-bot color. Reused by every re-render
+// (cheap; no network).
+function _renderAvatarInto(el, c) {
+  el.innerHTML = "";
+  el.style.removeProperty("--avatar-hue");
+  if (c.avatar) {
+    const img = document.createElement("img");
+    img.src = c.avatar;
+    img.alt = "";
+    el.appendChild(img);
+    el.classList.remove("is-fallback");
+  } else {
+    el.innerHTML = _BOT_AVATAR_SVG;
+    el.classList.add("is-fallback");
+    // Stable hue per bot id so the fallback color doesn't shuffle on re-render.
+    el.style.setProperty("--avatar-hue", String((c.id * 47) % 360));
+  }
+}
+
+// Center-crop an image file to a square and downscale to AVATAR_DIM px, returned
+// as a JPEG data URL. Keeps the stored avatar a few KB regardless of the source.
+async function _makeAvatarDataUrl(file) {
+  const dataUrl = await _readFileAsDataUrl(file);
+  const img = new Image();
+  await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = dataUrl; });
+  const side = Math.min(img.width, img.height);
+  const sx = (img.width - side) / 2;
+  const sy = (img.height - side) / 2;
+  const canvas = document.createElement("canvas");
+  canvas.width = AVATAR_DIM;
+  canvas.height = AVATAR_DIM;
+  canvas.getContext("2d").drawImage(img, sx, sy, side, side, 0, 0, AVATAR_DIM, AVATAR_DIM);
+  return canvas.toDataURL("image/jpeg", 0.85);
+}
+
+// Shared hidden file input — open the OS picker, then upload the chosen image as
+// this bot's avatar and refresh the cards.
+let _avatarPickInput = null;
+function _pickAvatarFor(c) {
+  if (!_avatarPickInput) {
+    _avatarPickInput = document.createElement("input");
+    _avatarPickInput.type = "file";
+    _avatarPickInput.accept = "image/*";
+    _avatarPickInput.style.display = "none";
+    document.body.appendChild(_avatarPickInput);
+  }
+  _avatarPickInput.value = "";   // allow re-picking the same file
+  _avatarPickInput.onchange = async () => {
+    const file = _avatarPickInput.files && _avatarPickInput.files[0];
+    if (!file) return;
+    try {
+      const dataUrl = await _makeAvatarDataUrl(file);
+      const r = await fetch(`/api/conversations/${c.id}/avatar`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ avatar: dataUrl }),
+      });
+      if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+      const hit = (_botsState.cache || []).find(x => x.id === c.id);
+      if (hit) hit.avatar = dataUrl;
+      renderBotsPage();
+      renderSysPromptAvatar();   // keep the chat sidebar's avatar in sync
+    } catch (e) {
+      alert(`Avatar upload failed: ${e.message}`);
+    }
+  };
+  _avatarPickInput.click();
+}
+
+// Mirror the open bot's avatar into the chat sidebar's System Prompt header.
+// Clicking it uploads/replaces the picture, same as the Bots-page card. With no
+// bot saved yet (e.g. a brand-new unsaved chat) it shows a disabled fallback.
+function renderSysPromptAvatar(conv) {
+  const el = els.sysPromptAvatar;
+  if (!el) return;
+  const c = conv || (_botsState.cache || []).find(x => x.id === state.conversationId);
+  if (!c) {
+    _renderAvatarInto(el, { id: 0, title: "", avatar: null });
+    el.onclick = null;
+    el.disabled = true;
+    el.dataset.tooltip = "";
+    return;
+  }
+  _renderAvatarInto(el, c);
+  el.disabled = false;
+  el.dataset.tooltip = c.avatar ? "Change avatar" : "Add avatar";
+  el.onclick = e => { e.stopPropagation(); _pickAvatarFor(c); };
+}
+
 function renderBotsPage() {
   if (!els.botsList) return; // page not in DOM yet
   _applyBotsView();  // keep the grid/list class in sync on every re-render
@@ -725,6 +823,19 @@ function renderBotsPage() {
     if (_streaming.has(c.id) || _unread.has(c.id)) card.classList.add("has-pending");
     card.tabIndex = 0;
     card.setAttribute("role", "button");
+
+    // Circle avatar — sits left of the name in both views. Clicking it lets the
+    // user upload/replace the bot's picture; with none it shows an initial.
+    const avatar = document.createElement("button");
+    avatar.type = "button";
+    avatar.className = "bot-card-avatar";
+    avatar.dataset.tooltip = c.avatar ? "Change avatar" : "Add avatar";
+    avatar.setAttribute("aria-label", `${c.avatar ? "Change" : "Add"} avatar for ${c.title || "bot"}`);
+    _renderAvatarInto(avatar, c);
+    avatar.addEventListener("click", e => {
+      e.stopPropagation();
+      _pickAvatarFor(c);
+    });
 
     const title = document.createElement("div");
     title.className = "bot-card-title";
@@ -749,8 +860,13 @@ function renderBotsPage() {
       meta.appendChild(span);
     });
 
-    card.appendChild(title);
-    card.appendChild(meta);
+    const textWrap = document.createElement("div");
+    textWrap.className = "bot-card-text";
+    textWrap.appendChild(title);
+    textWrap.appendChild(meta);
+
+    card.appendChild(avatar);
+    card.appendChild(textWrap);
 
     // Row actions — hidden until hover/focus. Each button stops propagation so
     // clicking it doesn't also fire the card's "open this bot" handler.
@@ -830,6 +946,10 @@ function renderBotsPage() {
     };
     card.addEventListener("click", open);
     card.addEventListener("keydown", e => {
+      // Only the card itself navigates on Enter/Space. Without this guard a
+      // keypress on a focused child button (avatar, row actions) would bubble
+      // up and open the bot in addition to the button's own action.
+      if (e.target !== card) return;
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
         open();
@@ -1955,6 +2075,7 @@ async function loadConversations() {
   _botsState.cache = list;
   renderBotsPage();
   renderTopbarBotLabel();
+  renderSysPromptAvatar();
   return list;
 }
 
@@ -1976,6 +2097,9 @@ async function openConversation(id) {
   // without this nudge. The bound listener also re-runs saveSettings, which
   // is a no-op for an unchanged localStorage payload.
   if (typeof _updatePromptGenAffordance === "function") _updatePromptGenAffordance();
+  renderSysPromptAvatar(c);   // show this bot's avatar in the sidebar header
+  const _cacheHit = (_botsState.cache || []).find(x => x.id === c.id);
+  if (_cacheHit) _cacheHit.avatar = c.avatar;   // keep card cache fresh
 
   // Match by (model, backend_id) pair. Falls back to model-only if the exact
   // pair can't be found (e.g. the endpoint was deleted). If nothing matches,

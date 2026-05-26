@@ -135,6 +135,15 @@ def init_db() -> None:
                 "ALTER TABLE conversations ADD COLUMN mcp_servers TEXT NOT NULL DEFAULT '[]'"
             )
 
+        # Additive migration: per-bot avatar — a small base64 data URL shown as a
+        # circle next to the bot's name. NULL = no custom avatar (use the
+        # initial-letter fallback). Stored inline (downscaled client-side) to
+        # keep with the no-external-storage design.
+        if not _column_exists(conn, "conversations", "avatar"):
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN avatar TEXT"
+            )
+
         # Seed the built-in Ollama backend at id=1, but ONLY when the backends
         # table is completely empty. The looser `INSERT OR IGNORE` we used to
         # do here would resurrect the built-in on every restart after the

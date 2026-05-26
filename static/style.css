@@ -531,35 +531,79 @@ body[data-page="bots"] .page-bots {
   line-height: 1.6;
 }
 .bot-card {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;            /* lets the transient flash drop to its own line */
+  gap: 12px;
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
   background: var(--panel);
-  /* Extra left padding reserves space for the pending-dot column so cards
-     don't shift sideways when a dot appears/disappears. */
-  padding: 12px 14px 12px 28px;
+  padding: 10px 14px;
   cursor: pointer;
   user-select: none;
   transition: background 0.12s, border-color 0.12s;
   position: relative;
 }
-.bot-card::before {
-  /* Pending / unread dot — invisible by default, painted accent when the card
-     has .has-pending. The accent ring on the nav icon pulses; here we keep
-     a static dot so a long list with many pending entries doesn't strobe. */
+
+/* Circle avatar, left of the name in both list and grid views. A <button> so
+   it's keyboard-focusable; clicking it (handled in JS) uploads/replaces the
+   bot's picture. With no uploaded image it shows the title's initial. */
+.bot-card-avatar {
+  position: relative;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-1);
+  padding: 0;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: box-shadow 0.12s, transform 0.12s;
+}
+.bot-card-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;          /* fill the circle without distortion */
+  border-radius: 50%;
+  display: block;
+}
+.bot-card-avatar svg { width: 22px; height: 22px; }
+.bot-card-avatar.is-fallback {
+  background: hsl(var(--avatar-hue, 210) 42% 46%);
+  border-color: transparent;
+}
+/* The hover `transform` creates a stacking context on the avatar, which traps
+   its tooltip (z-index 9999) *inside* that subtree — so the whole avatar must
+   outrank its siblings (the "System Prompt" heading, the prompt textarea) for
+   the tooltip to paint on top. Use a value clearly above any sidebar content. */
+.bot-card-avatar:hover { box-shadow: 0 0 0 3px var(--accent-ring); transform: scale(1.04); z-index: 200; }
+.bot-card-avatar:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); z-index: 200; }
+
+/* Pending / unread indicator — a small badge on the avatar's corner (replaces
+   the old left-margin dot). Invisible until the card has .has-pending. */
+.bot-card.has-pending .bot-card-avatar::after {
   content: "";
   position: absolute;
-  left: 11px;
-  top: 50%;
-  width: 7px;
-  height: 7px;
+  right: -1px;
+  bottom: -1px;
+  width: 11px;
+  height: 11px;
   border-radius: 50%;
-  background: transparent;
-  transform: translateY(-50%);
-  transition: background 0.2s ease;
-}
-.bot-card.has-pending::before {
   background: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  border: 2px solid var(--panel);
+  box-shadow: 0 0 0 1px var(--accent-ring);
+}
+
+/* Title + meta stack; flex:1 + min-width:0 so long names ellipsize instead of
+   shoving the actions off the card. */
+.bot-card-text {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 /* Row actions — appear on hover/focus only. The gradient mask makes them feel
@@ -630,9 +674,11 @@ body[data-page="bots"] .page-bots {
   border-color: var(--danger);
 }
 
-/* Transient per-card status line (knowledge upload / MCP add feedback). */
+/* Transient per-card status line (knowledge upload / MCP add feedback). The
+   card is a flex row, so claim the full width to sit on its own line below. */
 .bot-card-flash {
-  margin-top: 8px;
+  flex: 0 0 100%;
+  margin-top: 2px;
   font-size: 12px;
   color: var(--accent);
   font-variant-numeric: tabular-nums;
@@ -2076,6 +2122,31 @@ body.sidebar-collapsed #sidebar-toggle {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+/* System Prompt header row: the open bot's avatar + the panel label. Positioned
+   above the prompt textarea so the avatar's hover tooltip paints over it. */
+.sys-prompt-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  position: relative;
+  z-index: 2;
+}
+.sys-prompt-head h3 { margin: 0; }
+.bot-card-avatar.sys-avatar { width: 30px; height: 30px; }
+.bot-card-avatar.sys-avatar svg { width: 18px; height: 18px; }
+/* The sidebar avatar hugs the panel's left edge, so a centered tooltip spills
+   past it on the left and gets clipped by the panel's overflow (showing e.g.
+   "hange avatar"). Left-align it to the avatar so it extends rightward instead. */
+.bot-card-avatar.sys-avatar::after { left: 0; transform: translate(0, -2px); }
+.bot-card-avatar.sys-avatar:hover::after,
+.bot-card-avatar.sys-avatar:focus-visible::after { transform: translate(0, 0); }
+.bot-card-avatar:disabled {
+  cursor: default;
+  opacity: 0.55;
+  box-shadow: none;
+  transform: none;
 }
 .sys-prompt-panel textarea {
   flex: 1 1 auto;
