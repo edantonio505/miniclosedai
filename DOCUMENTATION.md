@@ -360,9 +360,6 @@ The UI is a **list/detail** pattern, not flat tabs. The activity bar has three i
   <img src="docs/images/bots_page_listview.png" alt="Bots page — list view" width="800"><br><em>Bots page — list view</em>
 </p>
 <p align="center">
-  <img src="docs/images/bots_page_gridview.png" alt="Bots page — grid view" width="800"><br><em>Bots page — grid view</em>
-</p>
-<p align="center">
   <img src="docs/images/bots_page_avatars.png" alt="Bots page — grid view with per-bot circle avatars" width="800"><br><em>Bots page — grid view with per-bot circle avatars (bot-glyph fallback on a per-id color; click to upload an image)</em>
 </p>
 

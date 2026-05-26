@@ -387,11 +387,6 @@ Single full-page surface listing every saved conversation, newest first. Each ca
 </p>
 
 <p align="center">
-  <img src="docs/images/bots_page_gridview.png" alt="MiniClosedAI Bots page — grid view: saved bots as responsive auto-fill tiles" width="820">
-  <br><em>Bots page — grid view (toggle on the toolbar).</em>
-</p>
-
-<p align="center">
   <img src="docs/images/bots_page_avatars.png" alt="MiniClosedAI Bots page — grid view with circle avatars: each bot card shows a round avatar (a little bot icon on a per-bot color, or an uploaded image) to the left of its name" width="820">
   <br><em>Bots page — grid view showing per-bot circle avatars. Each bot gets a round avatar to the left of its name: by default a little bot glyph on a color derived from the bot's id, or click the circle to upload your own image (center-cropped + downscaled in-browser, stored inline on the bot).</em>
 </p>
