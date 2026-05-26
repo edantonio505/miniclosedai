@@ -93,6 +93,7 @@ class FakeOllama(_FakeServer):
     dirty = False
     pull_chunks: list[dict] = []
     pull_per_chunk_delay: float = 0.0
+    chat_per_chunk_delay: float = 0.0  # slow /api/chat streaming (cancel test); 0 = off
 
     def _handler_class(self):
         captured = self.captured
@@ -151,9 +152,15 @@ class FakeOllama(_FakeServer):
                         {"message": {"role": "assistant", "content": "world"}, "done": False},
                         {"message": {"role": "assistant", "content": last}, "done": True},
                     ]
-                    for f in frames:
-                        self.wfile.write((json.dumps(f) + "\n").encode())
-                        self.wfile.flush()
+                    try:
+                        for f in frames:
+                            if outer.chat_per_chunk_delay:
+                                time.sleep(outer.chat_per_chunk_delay)
+                            self.wfile.write((json.dumps(f) + "\n").encode())
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        # Client/background task cancelled mid-stream (cancel test).
+                        pass
                     return
                 if self.path == "/api/embed":
                     length = int(self.headers.get("Content-Length", "0"))
@@ -746,6 +753,178 @@ def _():
     finally:
         client.delete(f"/api/conversations/{c['id']}")
         client.delete(f"/api/backends/{bid}")
+
+
+@test("refresh-resilience: background generation persists user + assistant turn")
+def _():
+    # The persisted GUI path runs generation in a background task; the turn must
+    # land in the DB so it survives a refresh. Drain the SSE, then confirm both
+    # messages are persisted and the in-flight flag has cleared.
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "resilience", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        with client.stream("POST", f"/api/conversations/{c['id']}/chat/stream",
+                           json={"message": "hi", "persist": True}) as r:
+            body = b"".join(r.iter_bytes())
+        assert any(e.get("end") for e in sse_events(body))
+        got = client.get(f"/api/conversations/{c['id']}").json()
+        roles = [m["role"] for m in got["messages"]]
+        assert roles == ["user", "assistant"], roles
+        assert got["messages"][-1]["content"] == "Hello world!", got["messages"][-1]
+        assert got["generating"] is False
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("refresh-resilience: GET generation/stream re-attaches and replays the reply")
+def _():
+    # After a refresh the client re-attaches via the resume endpoint. While the
+    # finished generation is still in its eviction grace window, the endpoint
+    # replays the buffered chunks and a terminal end frame.
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "resume", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        with client.stream("POST", f"/api/conversations/{c['id']}/chat/stream",
+                           json={"message": "hi", "persist": True}) as r:
+            b"".join(r.iter_bytes())
+        with client.stream("GET", f"/api/conversations/{c['id']}/generation/stream") as r2:
+            body2 = b"".join(r2.iter_bytes())
+        evts = sse_events(body2)
+        assert any(e.get("end") for e in evts)
+        chunks = "".join(e["chunk"] for e in evts if "chunk" in e)
+        assert "Hello" in chunks, chunks
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("refresh-resilience: resume endpoint with no in-flight generation → just end")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "no-gen", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        with client.stream("GET", f"/api/conversations/{c['id']}/generation/stream") as r:
+            body = b"".join(r.iter_bytes())
+        evts = sse_events(body)
+        assert any(e.get("end") for e in evts)
+        assert not any("chunk" in e for e in evts), evts
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("refresh-resilience: generating flag defaults False; cancel is a no-op when idle")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "idle", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        assert client.get(f"/api/conversations/{c['id']}").json()["generating"] is False
+        res = client.post(f"/api/conversations/{c['id']}/generation/cancel").json()
+        assert res == {"ok": True, "cancelled": False}, res
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("refresh-resilience: failed background generation persists only the user turn")
+def _():
+    # Generation runs in the background; if the backend is unreachable the task
+    # records an error and persists NO assistant message — but the user's turn
+    # (saved up-front) must remain so a refresh still shows what was asked.
+    bid = client.post("/api/backends", json={
+        "name": "DeadOllama", "kind": "ollama",
+        "base_url": "http://127.0.0.1:59999",  # nothing listening → ConnectError
+    }).json()["id"]
+    c = client.post("/api/conversations", json={
+        "title": "deadbackend", "model": "ghost:1b", "backend_id": bid,
+    }).json()
+    try:
+        with client.stream("POST", f"/api/conversations/{c['id']}/chat/stream",
+                           json={"message": "hi", "persist": True}) as r:
+            body = b"".join(r.iter_bytes())
+        evts = sse_events(body)
+        assert any("error" in e for e in evts), evts
+        assert any(e.get("end") for e in evts)
+        got = client.get(f"/api/conversations/{c['id']}").json()
+        assert [m["role"] for m in got["messages"]] == ["user"], got["messages"]
+        assert got["generating"] is False
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("refresh-resilience: cancelling a running generation marks it done + truncates the reply")
+def _():
+    # Stop must truly cancel the server-side task, not just disconnect the view.
+    # TestClient buffers streaming responses (hiding the mid-flight state), so we
+    # drive the background generator directly to control timing: a slow fake
+    # keeps it running, we cancel, then assert it stops before producing the full
+    # reply and is marked finished (so a reloading client's resume won't hang).
+    import asyncio
+    _reseed_builtin_to_fake_ollama()
+    fake_ollama.chat_per_chunk_delay = 0.2  # frames at 0.2/0.4/0.6/0.8s
+    c = client.post("/api/conversations", json={
+        "title": "cancel", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    cid = c["id"]
+    backend = app_mod._load_backend(1)
+    eff = {"model": "ollama-a:3b", "temperature": 0.7, "max_tokens": 512,
+           "top_p": 0.9, "top_k": 40, "think": False, "max_thinking_tokens": None}
+    snap = app_mod._chat_snapshot(eff, backend)
+    messages = [{"role": "system", "content": "x"}, {"role": "user", "content": "hi"}]
+
+    async def scenario():
+        gen = app_mod._new_generation()
+        app_mod._generations[cid] = gen
+        gen["task"] = asyncio.create_task(app_mod._run_generation(
+            cid, "ollama-a:3b", messages, eff, backend, [], gen, snap, [], "/test"))
+        await asyncio.sleep(0.3)             # one frame in — definitely running
+        running = gen["status"]
+        gen["task"].cancel()
+        await asyncio.sleep(0.4)             # let the CancelledError handler finish
+        return running, gen["status"]
+
+    try:
+        running, after = asyncio.run(scenario())
+        assert running == "running", running
+        assert after == "done", after       # cancelled gens are marked finished
+        got = client.get(f"/api/conversations/{cid}").json()
+        # The trailing content frame ("world", at 0.6s) was never reached, so the
+        # full reply must not have been persisted — generation was truncated.
+        assert all("world" not in (m.get("content") or "")
+                   for m in got["messages"]), got["messages"]
+        assert got["generating"] is False
+    finally:
+        fake_ollama.chat_per_chunk_delay = 0.0
+        app_mod._generations.pop(cid, None)
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("refresh-resilience: a non-persist stream starts no background generation")
+def _():
+    # The direct (one-shot API) path must not engage the resilience machinery:
+    # nothing persisted, no in-flight flag, no cancellable generation.
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "direct", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        with client.stream("POST", f"/api/conversations/{c['id']}/chat/stream",
+                           json={"message": "hi"}) as r:  # no persist flag
+            body = b"".join(r.iter_bytes())
+        assert any(e.get("end") for e in sse_events(body))
+        got = client.get(f"/api/conversations/{c['id']}").json()
+        assert got["messages"] == [], got["messages"]
+        assert got["generating"] is False
+        assert client.post(
+            f"/api/conversations/{c['id']}/generation/cancel").json()["cancelled"] is False
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
 
 
 @test("thinking control: Off injects enable_thinking=false + /no_think")

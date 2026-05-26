@@ -139,6 +139,9 @@ let state = {
   activeMode: "stream",    // "stream" | "sync"
   activeStyle: "native",   // "native" | "openai"
   abortController: null,
+  // Conv id of the in-flight stream (POST send or resumed generation). Used by
+  // the Stop button to tell the server to cancel the background generation.
+  streamConvId: null,
   // Pending attachments for the next outgoing user message. Cleared after
   // each successful send. See ATTACH_* constants and _ingestFile() below
   // for the entry shape.
@@ -1956,6 +1959,12 @@ async function loadConversations() {
 }
 
 async function openConversation(id) {
+  // If this same conversation is mid-stream, do NOT re-fetch/re-render. Rebuilding
+  // the message list from the DB snapshot (which lacks the not-yet-persisted
+  // in-flight turn) would wipe the live streaming bubble and leave the Stop
+  // button stuck. The chat is already showing the live stream — just stay on it.
+  // (Navigating away + back during generation is the trigger.)
+  if (id === state.conversationId && state.abortController) return;
   const r = await fetch(`/api/conversations/${id}`);
   if (!r.ok) return;
   const c = await r.json();
@@ -1987,6 +1996,20 @@ async function openConversation(id) {
   _markConvViewed(id);  // opening = "I'm reading this now"
   renderBotsPage();
   renderMessages();
+  if (c.generating && !state.abortController) {
+    // The server is still generating a reply for this conv (we sent a message
+    // then reloaded/navigated). Re-attach to the in-flight generation so the
+    // streaming/waiting state is restored instead of silently lost.
+    resumeGeneration(c);
+  } else if (!state.abortController) {
+    // Self-heal the composer: this conv isn't streaming, so the Send button
+    // must be showing and the input enabled — corrects a Stop button left
+    // stuck by an earlier desync.
+    els.stopBtn.style.display = "none";
+    els.sendBtn.style.display = "";
+    els.sendBtn.disabled = false;
+    els.input.disabled = false;
+  }
   loadKnowledge();
   loadMcp();
   loadEvals();
@@ -2716,13 +2739,9 @@ async function sendMessage(text) {
   const body = assistantEl.querySelector(".msg-body");
   assistantEl.classList.add("cursor");
   scrollToBottom();
-  let assistantText = "";
-  let thinkingText = "";
-  let thinkingEl = null;
-  let contentEl = null;
-  let truncatedNotice = null;
   const ac = new AbortController();
   state.abortController = ac;
+  state.streamConvId = state.conversationId;
   els.stopBtn.style.display = "";
   els.sendBtn.style.display = "none";
 
@@ -2735,8 +2754,10 @@ async function sendMessage(text) {
   // function endpoint with just `{message}` and rely on saved state.
   await flushPendingSave();
 
-  try {
-    const res = await fetch(`/api/conversations/${state.conversationId}/chat/stream`, {
+  const convId = state.conversationId;
+  await _consumeAssistantStream({
+    assistantEl, body, model, params, streamConvId: _streamConvId,
+    fetchFn: () => fetch(`/api/conversations/${convId}/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: ac.signal,
@@ -2751,13 +2772,50 @@ async function sendMessage(text) {
         // turn (text bodies prepended, images become image_url parts).
         attachments: attachmentsForSend.length ? attachmentsForSend : undefined,
       }),
-    });
+    }),
+  });
+}
 
+// Re-attach to a generation that's still running server-side (the user sent a
+// message and then reloaded/closed the tab). The user turn is already persisted
+// and rendered by openConversation; we add the assistant placeholder and stream
+// the in-flight reply from the resume endpoint. The generation runs
+// independently of this connection, so this is a pure viewer.
+async function resumeGeneration(c) {
+  const assistantEl = renderMessage({ role: "assistant", content: "" });
+  const body = assistantEl.querySelector(".msg-body");
+  assistantEl.classList.add("cursor");
+  scrollToBottom();
+  const ac = new AbortController();
+  state.abortController = ac;
+  state.streamConvId = c.id;
+  els.stopBtn.style.display = "";
+  els.sendBtn.style.display = "none";
+  els.sendBtn.disabled = true;
+  els.input.disabled = true;
+  _onStreamStart(c.id);
+  await _consumeAssistantStream({
+    assistantEl, body, model: c.model, params: c.params || {}, streamConvId: c.id,
+    fetchFn: () => fetch(`/api/conversations/${c.id}/generation/stream`, { signal: ac.signal }),
+  });
+}
+
+// Drive the assistant bubble from an SSE response — shared by sendMessage (POST
+// chat/stream) and resumeGeneration (GET generation/stream) so both render
+// identically and reset the composer the same way. `fetchFn` runs inside the
+// try so network/abort errors are handled uniformly.
+async function _consumeAssistantStream({ fetchFn, assistantEl, body, model, params, streamConvId }) {
+  let assistantText = "";
+  let thinkingText = "";
+  let thinkingEl = null;
+  let contentEl = null;
+  let truncatedNotice = null;
+  try {
+    const res = await fetchFn();
     if (!res.ok || !res.body) {
-      const body = await res.text().catch(() => "");
-      throw new Error(body || `HTTP ${res.status}`);
+      const t = await res.text().catch(() => "");
+      throw new Error(t || `HTTP ${res.status}`);
     }
-
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -2829,36 +2887,41 @@ async function sendMessage(text) {
     }
   } finally {
     state.abortController = null;
+    state.streamConvId = null;
     els.stopBtn.style.display = "none";
     els.sendBtn.style.display = "";
     assistantEl.classList.remove("cursor");
-    // Params badge inside the body so the flex layout stays clean.
-    const badge = document.createElement("div");
-    badge.className = "params-badge";
-    badge.textContent = `${model} · T=${params.temperature} · max=${params.max_tokens} · top_p=${params.top_p} · top_k=${params.top_k}`;
-    body.appendChild(badge);
-
-    // Final pass: pretty-print JSON (render() already calls prettifyJSONInMarkdown
-    // on every chunk, but the content only parses once the closing brace arrives)
-    // and run syntax highlighting once, now that streaming is done.
-    if (contentEl) {
-      contentEl.innerHTML = render(assistantText);
-      highlightCodeBlocks(contentEl);
+    const hasContent = assistantText.trim().length > 0 || thinkingText.trim().length > 0;
+    if (!hasContent) {
+      // Empty stream — e.g. a resumed generation that already finished and was
+      // persisted+evicted, or a no-op reply. Drop the ghost bubble instead of
+      // leaving a blank one; the real reply (if any) is already in the DB.
+      assistantEl.remove();
+    } else {
+      // Params badge inside the body so the flex layout stays clean.
+      const badge = document.createElement("div");
+      badge.className = "params-badge";
+      badge.textContent = `${model} · T=${params.temperature} · max=${params.max_tokens} · top_p=${params.top_p} · top_k=${params.top_k}`;
+      body.appendChild(badge);
+      // Final pass: pretty-print JSON (render() already runs per chunk, but the
+      // content only parses once the closing brace arrives) and highlight once.
+      if (contentEl) {
+        contentEl.innerHTML = render(assistantText);
+        highlightCodeBlocks(contentEl);
+      }
+      state.messages.push({ role: "assistant", content: assistantText, params: { model, ...params } });
+      // Now that the message is in state, attach the edit pencil — the
+      // placeholder was rendered without an index.
+      const finalIndex = state.messages.length - 1;
+      assistantEl.dataset.index = String(finalIndex);
+      _appendEditButton(assistantEl, finalIndex);
     }
-
-    state.messages.push({ role: "assistant", content: assistantText, params: { model, ...params } });
-    // Now that streaming is done and the message is in state, attach the edit
-    // pencil — the placeholder was rendered without an index since we didn't
-    // know the final message count yet.
-    const finalIndex = state.messages.length - 1;
-    assistantEl.dataset.index = String(finalIndex);
-    _appendEditButton(assistantEl, finalIndex);
     els.sendBtn.disabled = false;
     els.input.disabled = false;
     els.input.focus();
     scrollToBottom();   // settle the viewport on the fully-rendered final message
     loadConversations();
-    _onStreamEnd(_streamConvId);
+    _onStreamEnd(streamConvId);
   }
 }
 
@@ -3234,6 +3297,12 @@ function bindChat() {
   els.deleteChatBtn.addEventListener("click", deleteCurrentConversation);
   els.stopBtn.addEventListener("click", () => {
     if (state.abortController) state.abortController.abort();
+    // Generation now runs server-side independent of this SSE connection, so
+    // aborting the fetch only stops *watching*. Tell the server to truly cancel
+    // the background task (it persists whatever partial reply it produced).
+    if (state.streamConvId != null) {
+      fetch(`/api/conversations/${state.streamConvId}/generation/cancel`, { method: "POST" }).catch(() => {});
+    }
   });
 }
 
