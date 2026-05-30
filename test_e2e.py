@@ -3468,6 +3468,111 @@ def _():
 
 
 # ==================================================================
+# Applications (groups of bots) + per-app TypeScript SDK
+# ==================================================================
+
+@test("apps: migration adds apps table + conversations.app_id")
+def _():
+    import sqlite3
+    conn = sqlite3.connect(_TMP_DB)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "apps" in tables, tables
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)")}
+        assert "app_id" in cols, cols
+    finally:
+        conn.close()
+
+
+@test("apps: CRUD + bot_count; delete unlinks bots (keeps them)")
+def _():
+    bid = _add_openai_backend()
+    b1 = client.post("/api/conversations", json={"title": "App Bot 1", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    b2 = client.post("/api/conversations", json={"title": "App Bot 2", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    r = client.post("/api/apps", json={"name": "Test App", "link": "https://x.example", "description": "d"})
+    assert r.status_code == 201, r.text
+    aid = r.json()["id"]
+    assert r.json()["name"] == "Test App"
+    assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b1}).status_code == 201
+    assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b2}).status_code == 201
+    row = next(a for a in client.get("/api/apps").json() if a["id"] == aid)
+    assert row["bot_count"] == 2, row
+    detail = client.get(f"/api/apps/{aid}").json()
+    assert {x["title"] for x in detail["bots"]} == {"App Bot 1", "App Bot 2"}
+    assert client.patch(f"/api/apps/{aid}", json={"name": "Renamed"}).status_code == 200
+    assert client.get(f"/api/apps/{aid}").json()["name"] == "Renamed"
+    # conversation list exposes app_id
+    convs = {c["id"]: c["app_id"] for c in client.get("/api/conversations").json()}
+    assert convs[b1] == aid, convs
+    # delete app -> bots survive, ungrouped
+    assert client.delete(f"/api/apps/{aid}").status_code == 200
+    convs = {c["id"]: c["app_id"] for c in client.get("/api/conversations").json()}
+    assert convs[b1] is None and convs[b2] is None, convs
+    assert client.get(f"/api/conversations/{b1}").status_code == 200
+    client.delete(f"/api/conversations/{b1}")
+    client.delete(f"/api/conversations/{b2}")
+
+
+@test("apps: one app per bot — adding to a second app moves it")
+def _():
+    bid = _add_openai_backend()
+    b = client.post("/api/conversations", json={"title": "Mover", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    a1 = client.post("/api/apps", json={"name": "A1"}).json()["id"]
+    a2 = client.post("/api/apps", json={"name": "A2"}).json()["id"]
+    client.post(f"/api/apps/{a1}/bots", json={"conversation_id": b})
+    assert len(client.get(f"/api/apps/{a1}").json()["bots"]) == 1
+    client.post(f"/api/apps/{a2}/bots", json={"conversation_id": b})  # moves out of a1
+    assert len(client.get(f"/api/apps/{a1}").json()["bots"]) == 0
+    assert len(client.get(f"/api/apps/{a2}").json()["bots"]) == 1
+    assert client.delete(f"/api/apps/{a2}/bots/{b}").status_code == 200
+    assert len(client.get(f"/api/apps/{a2}").json()["bots"]) == 0
+    # removing a bot not in the app -> 404
+    assert client.delete(f"/api/apps/{a1}/bots/{b}").status_code == 404
+    client.delete(f"/api/apps/{a1}")
+    client.delete(f"/api/apps/{a2}")
+    client.delete(f"/api/conversations/{b}")
+
+
+@test("apps: SDK preview + zip expose bots as deduped functions")
+def _():
+    bid = _add_openai_backend()
+    b1 = client.post("/api/conversations", json={"title": "Intake Reviewer", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    b2 = client.post("/api/conversations", json={"title": "Intake Reviewer", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    aid = client.post("/api/apps", json={"name": "SDK App"}).json()["id"]
+    client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b1})
+    client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b2})
+    sdk = client.get(f"/api/apps/{aid}/sdk").json()
+    paths = [f["path"] for f in sdk["files"]]
+    assert any(p.endswith("client.ts") for p in paths), paths
+    assert any(p.endswith("index.ts") for p in paths), paths
+    bot_files = sorted(p for p in paths if "/bots/" in p)
+    assert len(bot_files) == 2 and bot_files[0] != bot_files[1], bot_files  # dup titles deduped
+    blob = "\n".join(f["content"] for f in sdk["files"])
+    assert "intakeReviewer" in blob
+    assert f"new Bot({b1})" in blob and f"new Bot({b2})" in blob, blob
+    z = client.get(f"/api/apps/{aid}/sdk.zip")
+    assert z.status_code == 200 and z.headers["content-type"].startswith("application/zip")
+    assert "sdk-app-sdk.zip" in z.headers.get("content-disposition", "")
+    import zipfile as _zip, io as _io
+    names = _zip.ZipFile(_io.BytesIO(z.content)).namelist()
+    assert any(n.endswith("index.ts") for n in names), names
+    client.delete(f"/api/apps/{aid}")
+    client.delete(f"/api/conversations/{b1}")
+    client.delete(f"/api/conversations/{b2}")
+
+
+@test("apps: 404s for missing app / bot")
+def _():
+    assert client.get("/api/apps/999999").status_code == 404
+    assert client.patch("/api/apps/999999", json={"name": "x"}).status_code == 404
+    assert client.delete("/api/apps/999999").status_code == 404
+    assert client.get("/api/apps/999999/sdk").status_code == 404
+    aid = client.post("/api/apps", json={"name": "E"}).json()["id"]
+    assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": 999999}).status_code == 404
+    client.delete(f"/api/apps/{aid}")
+
+
+# ==================================================================
 # Main
 # ==================================================================
 

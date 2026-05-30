@@ -101,6 +101,22 @@ CREATE TABLE IF NOT EXISTS eval_cases (
 );
 
 CREATE INDEX IF NOT EXISTS idx_eval_cases_conv ON eval_cases(conversation_id);
+
+-- "Applications": a named group of bots that represents one app. A bot belongs
+-- to at most one application (logical FK `conversations.app_id → apps.id`, added
+-- via migration below). Deleting an application unlinks its bots (sets app_id
+-- NULL) rather than deleting them — see app.py's delete handler. `avatar` is a
+-- small base64 data URL (same convention as conversations.avatar); `link` is an
+-- optional URL pointing at the real application.
+CREATE TABLE IF NOT EXISTS apps (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    description TEXT    NOT NULL DEFAULT '',
+    link        TEXT    NOT NULL DEFAULT '',
+    avatar      TEXT,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -143,6 +159,18 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE conversations ADD COLUMN avatar TEXT"
             )
+
+        # Additive migration: a bot can belong to one "application" (a named
+        # group of bots). NULL = ungrouped (still shown in the flat Bots list).
+        # Logical FK → apps.id; cleanup on app delete unlinks (sets NULL) in
+        # app.py rather than cascading a delete of the bot.
+        if not _column_exists(conn, "conversations", "app_id"):
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN app_id INTEGER"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversations_app ON conversations(app_id)"
+        )
 
         # Seed the built-in Ollama backend at id=1, but ONLY when the backends
         # table is completely empty. The looser `INSERT OR IGNORE` we used to

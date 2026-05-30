@@ -4358,8 +4358,10 @@ const ACTIVE_PAGE_KEY = "miniclosedai:activePage";
 // no longer has its own button in the activity bar. The Bots nav icon stays
 // highlighted whether you're on the list (page=bots) or inside a chat
 // (page=dashboard), reinforcing the parent/child relationship.
-const VALID_PAGES = new Set(["dashboard", "bots", "settings", "logs"]);
+const VALID_PAGES = new Set(["dashboard", "bots", "settings", "logs", "apps", "app-detail"]);
 const _BOTS_AREA = new Set(["bots", "dashboard"]);
+// The Apps nav-item owns both the applications list and a single app's detail.
+const _APPS_AREA = new Set(["apps", "app-detail"]);
 function applyActivePage(page) {
   const from = document.body.dataset.page;
   const p = VALID_PAGES.has(page) ? page : "bots";
@@ -4380,8 +4382,12 @@ function applyActivePage(page) {
 
   document.body.dataset.page = p;
   document.querySelectorAll(".activity-bar .nav-item[data-page]").forEach(btn => {
-    // The Bots nav-item owns BOTH the bots list and the chat (dashboard).
-    const owns = btn.dataset.page === "bots" ? _BOTS_AREA.has(p) : btn.dataset.page === p;
+    // The Bots nav-item owns BOTH the bots list and the chat (dashboard); the
+    // Apps nav-item owns both the apps list and a single app's detail page.
+    let owns;
+    if (btn.dataset.page === "bots") owns = _BOTS_AREA.has(p);
+    else if (btn.dataset.page === "apps") owns = _APPS_AREA.has(p);
+    else owns = btn.dataset.page === p;
     btn.classList.toggle("active", owns);
   });
   try { localStorage.setItem(ACTIVE_PAGE_KEY, p); } catch (_) {}
@@ -4396,6 +4402,9 @@ function applyActivePage(page) {
   }
   if (p === "bots" && typeof onBotsPageEntered === "function") {
     onBotsPageEntered();
+  }
+  if (p === "apps" && typeof onAppsPageEntered === "function") {
+    onAppsPageEntered();
   }
   if (p === "logs" && typeof onLogsPageEntered === "function") {
     onLogsPageEntered();
@@ -5192,6 +5201,7 @@ async function init() {
   if (typeof initBackendsUI === "function") initBackendsUI();
   initLogsUI();
   initBotsUI();
+  initAppsUI();
   initKnowledgeUI();
   initKnowledgeModalUI();
   initMcpUI();
@@ -5591,6 +5601,498 @@ function initPromptGenUI() {
   // as the backend's reachability flips. Same cadence as upgrade-status poll.
   _refreshPromptGenAvailability();
   setInterval(_refreshPromptGenAvailability, 60 * 1000);
+}
+
+// ─── Applications (groups of bots) ───────────────────────────
+// An "application" is a named group of bots that maps to a real app. Mirrors
+// the Bots page: an overview of cards, a detail view to chat with each bot
+// individually, plus a generated TypeScript SDK per application.
+const _appsState = { cache: [], filter: "", current: null };
+const _sdkState = { files: [], active: 0, appId: null };
+
+const _X_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+// Feather: layers — the application (group) avatar fallback.
+const _APP_AVATAR_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>';
+
+function _renderAppAvatarInto(el, a) {
+  el.innerHTML = "";
+  el.style.removeProperty("--avatar-hue");
+  if (a.avatar) {
+    const img = document.createElement("img");
+    img.src = a.avatar; img.alt = "";
+    el.appendChild(img);
+    el.classList.remove("is-fallback");
+  } else {
+    el.innerHTML = _APP_AVATAR_SVG;
+    el.classList.add("is-fallback");
+    // Offset hue from the bot formula so app fallbacks read distinct from bots.
+    el.style.setProperty("--avatar-hue", String((a.id * 67 + 23) % 360));
+  }
+}
+
+function _linkHost(link) {
+  if (!link) return "";
+  try { return new URL(link).host; } catch { return link; }
+}
+
+// JS mirror of sdkgen.function_names — the SDK reference name for each bot.
+const _APP_FN_RESERVED = new Set(["break","case","catch","class","const","continue","debugger","default","delete","do","else","enum","export","extends","false","finally","for","function","if","import","in","instanceof","new","null","return","super","switch","this","throw","true","try","typeof","var","void","while","with","yield","let","static","await","async","Bot","DEFAULT_BASE_URL","MiniClosedAIError"]);
+function _appCamel(name) {
+  const parts = (name || "").split(/[^a-zA-Z0-9]+/).filter(Boolean);
+  if (!parts.length) return "";
+  let head = parts[0];
+  head = head === head.toUpperCase() ? head.toLowerCase() : head[0].toLowerCase() + head.slice(1);
+  let ident = head + parts.slice(1).map(p => p[0].toUpperCase() + p.slice(1)).join("");
+  if (/^[0-9]/.test(ident)) ident = "bot" + ident[0].toUpperCase() + ident.slice(1);
+  return ident;
+}
+function _appFnNames(bots) {
+  const seen = new Set(), out = {};
+  for (const b of bots) {
+    let base = _appCamel(b.title || "");
+    if (!base || _APP_FN_RESERVED.has(base)) base = "bot" + b.id;
+    let name = base;
+    if (seen.has(name)) name = base + "_" + b.id;
+    seen.add(name);
+    out[b.id] = name;
+  }
+  return out;
+}
+
+async function loadApps() {
+  try {
+    const r = await fetch("/api/apps");
+    _appsState.cache = r.ok ? await r.json() : [];
+  } catch { _appsState.cache = []; }
+  renderAppsPage();
+  return _appsState.cache;
+}
+
+function onAppsPageEntered() { loadApps(); }
+
+function _appMatchesFilter(a, q) {
+  if (!q) return true;
+  return `${a.name || ""} ${a.description || ""} ${a.link || ""}`.toLowerCase().includes(q);
+}
+
+function renderAppsPage() {
+  const listEl = document.getElementById("apps-list");
+  if (!listEl) return;
+  const q = _appsState.filter.trim().toLowerCase();
+  const all = _appsState.cache || [];
+  const filtered = all.filter(a => _appMatchesFilter(a, q));
+
+  listEl.innerHTML = "";
+  for (const a of filtered) {
+    const card = document.createElement("div");
+    card.className = "bot-card";
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+
+    const avatar = document.createElement("button");
+    avatar.type = "button";
+    avatar.className = "bot-card-avatar";
+    avatar.dataset.tooltip = a.avatar ? "Change logo" : "Add logo";
+    avatar.setAttribute("aria-label", `${a.avatar ? "Change" : "Add"} logo for ${a.name}`);
+    _renderAppAvatarInto(avatar, a);
+    avatar.addEventListener("click", e => { e.stopPropagation(); _pickAppAvatar(a); });
+
+    const title = document.createElement("div");
+    title.className = "bot-card-title";
+    title.textContent = a.name || "(unnamed application)";
+
+    const meta = document.createElement("div");
+    meta.className = "bot-card-meta";
+    const parts = [`${a.bot_count} bot${a.bot_count === 1 ? "" : "s"}`];
+    if (a.link) parts.push(_linkHost(a.link));
+    parts.push(_formatRelative(a.updated_at));
+    parts.forEach((p, i) => {
+      if (i > 0) { const sep = document.createElement("span"); sep.className = "sep"; sep.textContent = "·"; meta.appendChild(sep); }
+      const span = document.createElement("span"); span.textContent = p; meta.appendChild(span);
+    });
+
+    const textWrap = document.createElement("div");
+    textWrap.className = "bot-card-text";
+    textWrap.appendChild(title); textWrap.appendChild(meta);
+    card.appendChild(avatar); card.appendChild(textWrap);
+
+    const actions = document.createElement("div");
+    actions.className = "bot-card-actions";
+    const sdkBtn = document.createElement("button");
+    sdkBtn.type = "button"; sdkBtn.className = "bot-card-action"; sdkBtn.dataset.tooltip = "Generate SDK";
+    sdkBtn.setAttribute("aria-label", `Generate SDK for ${a.name}`);
+    sdkBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>';
+    sdkBtn.addEventListener("click", e => { e.stopPropagation(); openSdkModal(a.id, a.name); });
+    const editBtn = document.createElement("button");
+    editBtn.type = "button"; editBtn.className = "bot-card-action"; editBtn.dataset.tooltip = "Edit application";
+    editBtn.setAttribute("aria-label", `Edit ${a.name}`);
+    editBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></svg>';
+    editBtn.addEventListener("click", e => { e.stopPropagation(); _openAppFormModal({ app: a }); });
+    const delBtn = document.createElement("button");
+    delBtn.type = "button"; delBtn.className = "bot-card-action danger"; delBtn.dataset.tooltip = "Delete application";
+    delBtn.setAttribute("aria-label", `Delete ${a.name}`);
+    delBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>';
+    delBtn.addEventListener("click", e => { e.stopPropagation(); _deleteApp(a); });
+    actions.append(sdkBtn, editBtn, delBtn);
+    card.appendChild(actions);
+
+    const open = () => openApp(a.id);
+    card.addEventListener("click", open);
+    card.addEventListener("keydown", e => {
+      if (e.target !== card) return;
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+    });
+    listEl.appendChild(card);
+  }
+
+  const countEl = document.getElementById("apps-count");
+  if (countEl) {
+    const total = all.length, shown = filtered.length;
+    countEl.textContent = q ? `${shown} of ${total} application${total === 1 ? "" : "s"}` : `${total} application${total === 1 ? "" : "s"}`;
+  }
+  const emptyEl = document.getElementById("apps-empty");
+  if (emptyEl) {
+    if (!all.length) { emptyEl.textContent = "No applications yet. Click + New application to group your bots."; emptyEl.hidden = false; }
+    else if (!filtered.length) { emptyEl.textContent = "No applications match your filter."; emptyEl.hidden = false; }
+    else emptyEl.hidden = true;
+  }
+}
+
+async function openApp(appId) {
+  let app;
+  try {
+    const r = await fetch(`/api/apps/${appId}`);
+    if (!r.ok) { alert("Application not found."); return; }
+    app = await r.json();
+  } catch (e) { alert(`Could not load application: ${e.message}`); return; }
+  _appsState.current = app;
+  applyActivePage("app-detail");
+  renderAppDetail(app);
+}
+
+function renderAppDetail(app) {
+  const c = document.getElementById("app-detail-container");
+  if (!c) return;
+  c.innerHTML = "";
+  const bots = app.bots || [];
+  const fnNames = _appFnNames(bots);
+
+  const back = document.createElement("button");
+  back.className = "btn btn-small";
+  back.textContent = "← Applications";
+  back.style.marginBottom = "10px";
+  back.addEventListener("click", () => applyActivePage("apps"));
+  c.appendChild(back);
+
+  const head = document.createElement("div");
+  head.className = "app-detail-head";
+  const avatar = document.createElement("button");
+  avatar.type = "button";
+  avatar.className = "bot-card-avatar";
+  avatar.dataset.tooltip = app.avatar ? "Change logo" : "Add logo";
+  _renderAppAvatarInto(avatar, app);
+  avatar.addEventListener("click", () => _pickAppAvatar(app));
+  const htext = document.createElement("div");
+  htext.className = "app-detail-head-text";
+  const h1 = document.createElement("h1"); h1.textContent = app.name; htext.appendChild(h1);
+  if (app.link) {
+    const link = document.createElement("a");
+    link.className = "app-detail-link"; link.href = app.link;
+    link.target = "_blank"; link.rel = "noopener";
+    link.textContent = app.link; htext.appendChild(link);
+  }
+  if (app.description) {
+    const d = document.createElement("p"); d.className = "app-detail-desc"; d.textContent = app.description; htext.appendChild(d);
+  }
+  head.append(avatar, htext);
+  c.appendChild(head);
+
+  const actions = document.createElement("div");
+  actions.className = "app-detail-actions";
+  const count = document.createElement("span");
+  count.className = "bots-count";
+  count.textContent = `${bots.length} bot${bots.length === 1 ? "" : "s"}`;
+  const spacer = document.createElement("span"); spacer.className = "spacer";
+  const addBtn = document.createElement("button"); addBtn.className = "btn btn-small"; addBtn.textContent = "+ Add bot";
+  addBtn.addEventListener("click", () => _openAddBotModal(app));
+  const editBtn = document.createElement("button"); editBtn.className = "btn btn-small"; editBtn.textContent = "Edit";
+  editBtn.addEventListener("click", () => _openAppFormModal({ app }));
+  const sdkBtn = document.createElement("button"); sdkBtn.className = "btn btn-primary btn-small"; sdkBtn.textContent = "Generate SDK";
+  sdkBtn.addEventListener("click", () => openSdkModal(app.id, app.name));
+  actions.append(count, spacer, addBtn, editBtn, sdkBtn);
+  c.appendChild(actions);
+
+  const list = document.createElement("div");
+  list.className = "bots-list";
+  for (const b of bots) {
+    const card = document.createElement("div");
+    card.className = "bot-card"; card.tabIndex = 0; card.setAttribute("role", "button");
+    const av = document.createElement("button");
+    av.type = "button"; av.className = "bot-card-avatar"; av.dataset.tooltip = "Change avatar";
+    _renderAvatarInto(av, b);
+    av.addEventListener("click", e => { e.stopPropagation(); _pickAvatarFor(b); });
+    const title = document.createElement("div"); title.className = "bot-card-title"; title.textContent = b.title || "(untitled)";
+    const meta = document.createElement("div"); meta.className = "bot-card-meta";
+    const m1 = document.createElement("span"); m1.textContent = b.model || "(no model)"; meta.appendChild(m1);
+    const sep = document.createElement("span"); sep.className = "sep"; sep.textContent = "·"; meta.appendChild(sep);
+    const fn = document.createElement("span"); fn.className = "bot-card-fn"; fn.textContent = `${fnNames[b.id]}()`;
+    fn.title = `SDK reference — bot #${b.id}`; meta.appendChild(fn);
+    const textWrap = document.createElement("div"); textWrap.className = "bot-card-text"; textWrap.append(title, meta);
+    card.append(av, textWrap);
+
+    const cardActions = document.createElement("div"); cardActions.className = "bot-card-actions";
+    const rm = document.createElement("button");
+    rm.type = "button"; rm.className = "bot-card-action danger"; rm.dataset.tooltip = "Remove from application";
+    rm.setAttribute("aria-label", `Remove ${b.title} from ${app.name}`);
+    rm.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>';
+    rm.addEventListener("click", async e => {
+      e.stopPropagation();
+      try {
+        const r = await fetch(`/api/apps/${app.id}/bots/${b.id}`, { method: "DELETE" });
+        if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+        await loadConversations();
+        await openApp(app.id);
+      } catch (err) { alert(`Could not remove bot: ${err.message}`); }
+    });
+    cardActions.appendChild(rm);
+    card.appendChild(cardActions);
+
+    const open = () => { applyActivePage("dashboard"); openConversation(b.id); };
+    card.addEventListener("click", open);
+    card.addEventListener("keydown", e => { if (e.target === card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); open(); } });
+    list.appendChild(card);
+  }
+  c.appendChild(list);
+  if (!bots.length) {
+    const empty = document.createElement("div"); empty.className = "bots-empty";
+    empty.textContent = "No bots in this application yet. Click + Add bot to put some in.";
+    c.appendChild(empty);
+  }
+}
+
+// Upload a logo for an application (reuses the bot-avatar downscale pipeline).
+let _appAvatarInput = null;
+function _pickAppAvatar(app) {
+  if (!_appAvatarInput) {
+    _appAvatarInput = document.createElement("input");
+    _appAvatarInput.type = "file"; _appAvatarInput.accept = "image/*"; _appAvatarInput.style.display = "none";
+    document.body.appendChild(_appAvatarInput);
+  }
+  _appAvatarInput.value = "";
+  _appAvatarInput.onchange = async () => {
+    const file = _appAvatarInput.files && _appAvatarInput.files[0];
+    if (!file) return;
+    try {
+      const dataUrl = await _makeAvatarDataUrl(file);
+      const r = await fetch(`/api/apps/${app.id}/avatar`, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ avatar: dataUrl }),
+      });
+      if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+      await loadApps();
+      if (document.body.dataset.page === "app-detail" && _appsState.current && _appsState.current.id === app.id) {
+        await openApp(app.id);
+      }
+    } catch (e) { alert(`Logo upload failed: ${e.message}`); }
+  };
+  _appAvatarInput.click();
+}
+
+// Minimal dynamically-built modal that reuses the existing .modal styling.
+function _spawnModal(buildBody) {
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  backdrop.appendChild(modal);
+  const close = () => backdrop.remove();
+  backdrop.addEventListener("click", e => { if (e.target === backdrop) close(); });
+  buildBody(modal, close);
+  document.body.appendChild(backdrop);
+  return { backdrop, modal, close };
+}
+
+function _modalHeader(modal, titleText, close) {
+  const header = document.createElement("div");
+  header.className = "modal-header";
+  const h = document.createElement("h3"); h.textContent = titleText;
+  const x = document.createElement("button"); x.className = "icon-btn"; x.setAttribute("aria-label", "Close"); x.innerHTML = _X_SVG; x.onclick = close;
+  header.append(h, x); modal.appendChild(header);
+}
+
+function _formField(labelText, { value = "", placeholder = "", multiline = false } = {}) {
+  const label = document.createElement("label"); label.className = "form-field";
+  const span = document.createElement("span"); span.textContent = labelText;
+  const input = multiline ? document.createElement("textarea") : document.createElement("input");
+  if (!multiline) input.type = "text";
+  input.value = value; input.placeholder = placeholder;
+  if (multiline) input.rows = 3;
+  label.append(span, input);
+  return { label, input };
+}
+
+function _openAppFormModal({ app = null } = {}) {
+  _spawnModal((modal, close) => {
+    _modalHeader(modal, app ? "Edit application" : "New application", close);
+    const form = document.createElement("div"); form.className = "backend-form";
+    const name = _formField("Name", { value: app ? app.name : "", placeholder: "My probate app" });
+    const link = _formField("Link (optional)", { value: app ? app.link : "", placeholder: "https://myapp.example" });
+    const desc = _formField("Description (optional)", { value: app ? app.description : "", placeholder: "What this application is and which bots belong to it.", multiline: true });
+    form.append(name.label, link.label, desc.label);
+    const actions = document.createElement("div"); actions.className = "modal-actions";
+    const spacer = document.createElement("div"); spacer.style.flex = "1";
+    const cancel = document.createElement("button"); cancel.className = "btn btn-small"; cancel.textContent = "Cancel"; cancel.onclick = close;
+    const save = document.createElement("button"); save.className = "btn btn-primary btn-small"; save.textContent = "Save";
+    save.addEventListener("click", async () => {
+      const payload = { name: name.input.value.trim(), link: link.input.value.trim(), description: desc.input.value.trim() };
+      if (!payload.name) { name.input.focus(); return; }
+      try {
+        const r = app
+          ? await fetch(`/api/apps/${app.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
+          : await fetch("/api/apps", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+        const created = app ? null : await r.json();
+        close();
+        await loadApps();
+        if (app && document.body.dataset.page === "app-detail" && _appsState.current && _appsState.current.id === app.id) {
+          await openApp(app.id);
+        } else if (!app && created) {
+          await openApp(created.id);
+        }
+      } catch (e) { alert(`Save failed: ${e.message}`); }
+    });
+    actions.append(spacer, cancel, save);
+    modal.append(form, actions);
+    setTimeout(() => name.input.focus(), 0);
+  });
+}
+
+async function _deleteApp(app) {
+  if (!confirm(`Delete the application "${app.name}"? Its bots are kept — they just become ungrouped.`)) return;
+  try {
+    const r = await fetch(`/api/apps/${app.id}`, { method: "DELETE" });
+    if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+    await loadConversations();
+    if (document.body.dataset.page === "app-detail") applyActivePage("apps");
+    await loadApps();
+  } catch (e) { alert(`Delete failed: ${e.message}`); }
+}
+
+function _openAddBotModal(app) {
+  _spawnModal((modal, close) => {
+    _modalHeader(modal, "Add a bot", close);
+    const hint = document.createElement("p"); hint.className = "kb-modal-hint";
+    hint.textContent = "Pick a bot to add to this application. A bot belongs to one application — adding it here moves it from any previous one.";
+    modal.appendChild(hint);
+    const list = document.createElement("div"); list.className = "kb-modal-list";
+    const appNameById = new Map((_appsState.cache || []).map(a => [a.id, a.name]));
+    const bots = _botsState.cache || [];
+    if (!bots.length) {
+      const e = document.createElement("div"); e.className = "kb-modal-empty"; e.textContent = "No bots yet — create one on the Bots page first.";
+      modal.appendChild(e);
+    }
+    for (const b of bots) {
+      const row = document.createElement("div"); row.className = "bot-card";
+      const av = document.createElement("span"); av.className = "bot-card-avatar"; _renderAvatarInto(av, b);
+      const tw = document.createElement("div"); tw.className = "bot-card-text";
+      const t = document.createElement("div"); t.className = "bot-card-title"; t.textContent = b.title || "(untitled)";
+      const m = document.createElement("div"); m.className = "bot-card-meta";
+      const here = b.app_id === app.id;
+      const status = here ? "in this application" : (b.app_id != null ? `in ${appNameById.get(b.app_id) || "another application"}` : "ungrouped");
+      const ms = document.createElement("span"); ms.textContent = status; m.appendChild(ms);
+      tw.append(t, m); row.append(av, tw);
+      const add = document.createElement("button");
+      add.className = "btn btn-small"; add.style.marginLeft = "auto";
+      add.textContent = here ? "Added" : "Add"; add.disabled = here;
+      add.addEventListener("click", async () => {
+        add.disabled = true;
+        try {
+          const r = await fetch(`/api/apps/${app.id}/bots`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversation_id: b.id }) });
+          if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+          await loadConversations();
+          close();
+          await openApp(app.id);
+        } catch (e) { alert(`Could not add bot: ${e.message}`); add.disabled = false; }
+      });
+      row.appendChild(add);
+      list.appendChild(row);
+    }
+    modal.appendChild(list);
+    const actions = document.createElement("div"); actions.className = "modal-actions";
+    const spacer = document.createElement("div"); spacer.style.flex = "1";
+    const done = document.createElement("button"); done.className = "btn btn-primary btn-small"; done.textContent = "Done"; done.onclick = close;
+    actions.append(spacer, done); modal.appendChild(actions);
+  });
+}
+
+// ── SDK preview modal (static markup in index.html) ──
+async function openSdkModal(appId, appName) {
+  let data;
+  try {
+    const r = await fetch(`/api/apps/${appId}/sdk`);
+    if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+    data = await r.json();
+  } catch (e) { alert(`Could not generate SDK: ${e.message}`); return; }
+  _sdkState.files = data.files || [];
+  _sdkState.active = 0;
+  _sdkState.appId = appId;
+  const nameEl = document.getElementById("sdk-modal-app");
+  if (nameEl) nameEl.textContent = data.app ? `· ${data.app.name}` : (appName ? `· ${appName}` : "");
+  _renderSdkModal();
+  const bd = document.getElementById("sdk-modal-backdrop");
+  if (bd) bd.classList.remove("hidden");
+}
+
+function _renderSdkModal() {
+  const listEl = document.getElementById("sdk-file-list");
+  const codeEl = document.getElementById("sdk-code");
+  if (!listEl || !codeEl) return;
+  listEl.innerHTML = "";
+  _sdkState.files.forEach((f, i) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "sdk-file-item" + (i === _sdkState.active ? " active" : "");
+    // Drop the root "<slug>-sdk/" prefix for a cleaner tree.
+    b.textContent = f.path.split("/").slice(1).join("/") || f.path;
+    b.title = f.path;
+    b.addEventListener("click", () => { _sdkState.active = i; _renderSdkModal(); });
+    listEl.appendChild(b);
+  });
+  const f = _sdkState.files[_sdkState.active];
+  codeEl.className = "";
+  codeEl.removeAttribute("data-highlighted");
+  codeEl.textContent = f ? f.content : "";
+  if (window.hljs) { try { window.hljs.highlightElement(codeEl); } catch (_) {} }
+}
+
+function _closeSdkModal() {
+  const bd = document.getElementById("sdk-modal-backdrop");
+  if (bd) bd.classList.add("hidden");
+}
+
+function initAppsUI() {
+  const newBtn = document.getElementById("apps-new-btn");
+  if (newBtn) newBtn.addEventListener("click", () => _openAppFormModal({}));
+  const filter = document.getElementById("apps-filter");
+  if (filter) filter.addEventListener("input", () => { _appsState.filter = filter.value; renderAppsPage(); });
+
+  const close = document.getElementById("sdk-modal-close");
+  if (close) close.addEventListener("click", _closeSdkModal);
+  const bd = document.getElementById("sdk-modal-backdrop");
+  if (bd) bd.addEventListener("click", e => { if (e.target === bd) _closeSdkModal(); });
+  const copy = document.getElementById("sdk-copy");
+  if (copy) copy.addEventListener("click", async () => {
+    const f = _sdkState.files[_sdkState.active];
+    if (!f) return;
+    try { await navigator.clipboard.writeText(f.content); copy.textContent = "Copied!"; setTimeout(() => { copy.textContent = "Copy file"; }, 1200); }
+    catch { alert("Copy failed — select the text manually."); }
+  });
+  const dl = document.getElementById("sdk-download");
+  if (dl) dl.addEventListener("click", () => {
+    if (_sdkState.appId == null) return;
+    const a = document.createElement("a");
+    a.href = `/api/apps/${_sdkState.appId}/sdk.zip`; a.rel = "noopener";
+    document.body.appendChild(a); a.click(); a.remove();
+  });
 }
 
 init();

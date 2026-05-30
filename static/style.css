@@ -240,6 +240,105 @@ body[data-page="bots"] .page-bots {
   flex: 1 1 auto;
   overflow: auto;
 }
+body[data-page="apps"] .page-apps,
+body[data-page="app-detail"] .page-app-detail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+}
+
+/* =====================================================================
+   Applications — groups of bots (reuses .bots-container / .bot-card)
+   ===================================================================== */
+.app-detail-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 8px;
+}
+.app-detail-head .bot-card-avatar {
+  width: 52px;
+  height: 52px;
+  flex: 0 0 auto;
+}
+.app-detail-head-text { flex: 1 1 auto; min-width: 0; }
+.app-detail-head-text h1 { margin: 0 0 4px; }
+.app-detail-desc {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin: 4px 0 0;
+}
+.app-detail-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.82rem;
+  color: var(--accent);
+  text-decoration: none;
+  margin-top: 4px;
+}
+.app-detail-link:hover { text-decoration: underline; }
+.app-detail-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 4px 0 10px;
+}
+.app-detail-actions .spacer { flex: 1 1 auto; }
+/* The SDK reference name shown on each bot card inside an application. */
+.bot-card-fn {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  color: var(--accent);
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 1px 6px;
+}
+/* SDK preview modal — file list on the left, highlighted source on the right. */
+.sdk-modal { max-width: 920px; width: 92vw; }
+.sdk-modal-body {
+  display: flex;
+  gap: 12px;
+  min-height: 0;
+  max-height: 60vh;
+}
+.sdk-file-list {
+  flex: 0 0 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 6px;
+}
+.sdk-file-item {
+  text-align: left;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  border-radius: var(--r-sm);
+  padding: 6px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sdk-file-item:hover { background: var(--bg-elev-1); }
+.sdk-file-item.active { background: var(--accent); color: #fff; }
+.sdk-modal .sdk-code {
+  flex: 1 1 auto;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
 
 /* =====================================================================
    Bots page — searchable library of saved conversations

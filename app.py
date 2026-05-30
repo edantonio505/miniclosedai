@@ -36,6 +36,7 @@ import knowledge
 import llm
 import logs as chat_logs
 import mcp_host
+import sdkgen
 
 # Embedding model used for the per-bot knowledge base. Defaults to a small,
 # widely-available Ollama embedding model; override via env. Embeddings are
@@ -181,6 +182,22 @@ class ConversationUpdate(BaseModel):
 
 class AvatarUpdate(BaseModel):
     avatar: str   # a `data:image/*;base64,...` URL (downscaled client-side)
+
+
+class AppCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str = ""
+    link: str = ""
+
+
+class AppUpdate(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=120)
+    description: str | None = None
+    link: str | None = None
+
+
+class AppBotAdd(BaseModel):
+    conversation_id: int
 
 
 class ConversationChatRequest(BaseModel):
@@ -847,7 +864,7 @@ async def api_models():
 def api_list_conversations():
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, title, model, backend_id, avatar, updated_at FROM conversations ORDER BY updated_at DESC"
+            "SELECT id, title, model, backend_id, avatar, app_id, updated_at FROM conversations ORDER BY updated_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -1002,6 +1019,194 @@ def api_clear_conversation(conv_id: int):
         if cur.rowcount == 0:
             raise HTTPException(404, "Conversation not found")
     return {"ok": True}
+
+
+# ---------- Applications (groups of bots) ----------
+
+def _app_row(conn, app_id: int):
+    row = conn.execute("SELECT * FROM apps WHERE id = ?", (app_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Application not found")
+    return row
+
+
+@app.get("/api/apps")
+def api_list_apps():
+    """Every application with its bot count, newest-first."""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT a.id, a.name, a.description, a.link, a.avatar,
+                      a.created_at, a.updated_at, COUNT(c.id) AS bot_count
+               FROM apps a
+               LEFT JOIN conversations c ON c.app_id = a.id
+               GROUP BY a.id
+               ORDER BY a.updated_at DESC"""
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/apps", status_code=201)
+def api_create_app(data: AppCreate):
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO apps (name, description, link) VALUES (?, ?, ?)",
+            (data.name.strip(), data.description or "", data.link or ""),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM apps WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+@app.get("/api/apps/{app_id}")
+def api_get_app(app_id: int):
+    """An application plus the bots in it."""
+    with db.get_conn() as conn:
+        row = _app_row(conn, app_id)
+        bots = conn.execute(
+            """SELECT id, title, model, backend_id, avatar, updated_at
+               FROM conversations WHERE app_id = ? ORDER BY updated_at DESC""",
+            (app_id,),
+        ).fetchall()
+    out = dict(row)
+    out["bots"] = [dict(b) for b in bots]
+    return out
+
+
+@app.patch("/api/apps/{app_id}")
+def api_update_app(app_id: int, data: AppUpdate):
+    supplied = data.model_dump(exclude_unset=True)
+    fields, values = [], []
+    for col in ("name", "description", "link"):
+        if col in supplied and supplied[col] is not None:
+            val = supplied[col]
+            if col == "name":
+                val = val.strip()
+                if not val:
+                    raise HTTPException(400, "name cannot be empty")
+            fields.append(f"{col} = ?")
+            values.append(val)
+    if not fields:
+        return {"ok": True}
+    values.append(app_id)
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            f"UPDATE apps SET {', '.join(fields)}, updated_at = datetime('now') WHERE id = ?",
+            values,
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Application not found")
+    return {"ok": True}
+
+
+@app.delete("/api/apps/{app_id}")
+def api_delete_app(app_id: int):
+    """Delete an application. Its bots are UNLINKED (app_id → NULL), never deleted."""
+    with db.get_conn() as conn:
+        conn.execute("UPDATE conversations SET app_id = NULL WHERE app_id = ?", (app_id,))
+        cur = conn.execute("DELETE FROM apps WHERE id = ?", (app_id,))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Application not found")
+    return {"ok": True}
+
+
+@app.put("/api/apps/{app_id}/avatar")
+def api_set_app_avatar(app_id: int, data: AvatarUpdate):
+    """Set the application's logo (a base64 image data URL)."""
+    url = (data.avatar or "").strip()
+    if not url.startswith("data:image/"):
+        raise HTTPException(400, "avatar must be a data:image/* URL")
+    if len(url) > AVATAR_MAX_CHARS:
+        raise HTTPException(413, "avatar image too large")
+    with db.get_conn() as conn:
+        cur = conn.execute("UPDATE apps SET avatar = ? WHERE id = ?", (url, app_id))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Application not found")
+    return {"ok": True}
+
+
+@app.delete("/api/apps/{app_id}/avatar")
+def api_clear_app_avatar(app_id: int):
+    with db.get_conn() as conn:
+        cur = conn.execute("UPDATE apps SET avatar = NULL WHERE id = ?", (app_id,))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Application not found")
+    return {"ok": True}
+
+
+@app.post("/api/apps/{app_id}/bots", status_code=201)
+def api_add_bot_to_app(app_id: int, data: AppBotAdd):
+    """Move a bot into this application. One app per bot, so this reassigns it
+    from any previous application."""
+    with db.get_conn() as conn:
+        _app_row(conn, app_id)
+        cur = conn.execute(
+            "UPDATE conversations SET app_id = ? WHERE id = ?",
+            (app_id, data.conversation_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Conversation not found")
+    return {"ok": True}
+
+
+@app.delete("/api/apps/{app_id}/bots/{conv_id}")
+def api_remove_bot_from_app(app_id: int, conv_id: int):
+    """Remove a bot from this application (back to the ungrouped Bots list)."""
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE conversations SET app_id = NULL WHERE id = ? AND app_id = ?",
+            (conv_id, app_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Bot not in this application")
+    return {"ok": True}
+
+
+def _sdk_base_url(request: Request, override: str | None) -> str:
+    """Base URL baked into a generated SDK: an explicit override, else the
+    origin this request came in on (so the SDK points back at this server)."""
+    if override:
+        return override.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+def _app_sdk_files(app_id: int, base_url: str):
+    with db.get_conn() as conn:
+        row = _app_row(conn, app_id)
+        bots = conn.execute(
+            "SELECT id, title, model FROM conversations WHERE app_id = ? ORDER BY id",
+            (app_id,),
+        ).fetchall()
+    app_dict = dict(row)
+    return app_dict, sdkgen.generate_ts_sdk(app_dict, [dict(b) for b in bots], base_url)
+
+
+@app.get("/api/apps/{app_id}/sdk")
+def api_app_sdk(app_id: int, request: Request, base_url: str | None = None):
+    """The generated TypeScript SDK files for this application (for preview)."""
+    app_dict, files = _app_sdk_files(app_id, _sdk_base_url(request, base_url))
+    return {"app": {"id": app_dict["id"], "name": app_dict["name"]}, "files": files}
+
+
+@app.get("/api/apps/{app_id}/sdk.zip")
+def api_app_sdk_zip(app_id: int, request: Request, base_url: str | None = None):
+    """Download the generated TypeScript SDK for this application as a .zip."""
+    app_dict, files = _app_sdk_files(app_id, _sdk_base_url(request, base_url))
+    slug = sdkgen.slugify(app_dict["name"])
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.writestr(f["path"], f["content"])
+    return Response(
+        content=zip_buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{slug}-sdk.zip"'},
+    )
 
 
 # ---------- Per-bot knowledge base (RAG) ----------
