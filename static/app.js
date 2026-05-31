@@ -135,6 +135,10 @@ const SMALL_MODEL_PREFIXES = [
 
 let state = {
   conversationId: null,
+  // Where to send the user when they leave the chat (back button / Esc). Set
+  // by enterChat() at the moment of entry, so opening a bot from inside an App
+  // returns to that App's detail view, not the global Bots page.
+  chatReturnTo: { page: "bots" },
   messages: [], // [{role, content, params?}]
   activeTab: "curl",       // "curl" | "python" | "js"
   activeMode: "stream",    // "stream" | "sync"
@@ -940,10 +944,7 @@ function renderBotsPage() {
     actions.appendChild(delBtn);
     card.appendChild(actions);
 
-    const open = () => {
-      applyActivePage("dashboard");
-      openConversation(c.id);
-    };
+    const open = () => enterChat(c.id);
     card.addEventListener("click", open);
     card.addEventListener("keydown", e => {
       // Only the card itself navigates on Enter/Space. Without this guard a
@@ -1121,7 +1122,7 @@ function initBotsUI() {
     });
   }
   if (els.breadcrumbBack) {
-    els.breadcrumbBack.addEventListener("click", () => applyActivePage("bots"));
+    els.breadcrumbBack.addEventListener("click", () => exitChatToReturn());
   }
   if (els.breadcrumbCurrent) {
     els.breadcrumbCurrent.addEventListener("click", () => {
@@ -2040,7 +2041,7 @@ function _botsHotkeyHandler(e) {
     if (modalOpen) return;
     if (document.body.dataset.page === "dashboard") {
       e.preventDefault();
-      applyActivePage("bots");
+      exitChatToReturn();
     }
     return;
   }
@@ -5770,6 +5771,37 @@ async function openApp(appId) {
   renderAppDetail(app);
 }
 
+
+// ---------- Chat-entry / chat-exit helpers ----------
+//
+// Centralize the two-step "switch to chat + open conversation" pattern so every
+// entry point captures where the user came from. The back button (and Esc on
+// dashboard) restores that return target — so a bot opened from inside an App
+// returns to that App's detail view, not the global Bots page.
+
+function enterChat(convId) {
+  const here = document.body.dataset.page;
+  if (here === "app-detail" && _appsState.current?.id != null) {
+    state.chatReturnTo = { page: "app-detail", appId: _appsState.current.id };
+  } else {
+    state.chatReturnTo = { page: "bots" };
+  }
+  applyActivePage("dashboard");
+  openConversation(convId);
+}
+
+async function exitChatToReturn() {
+  const r = state.chatReturnTo || { page: "bots" };
+  if (r.page === "app-detail" && r.appId != null) {
+    // openApp() alerts + returns silently on failure without setting current;
+    // if loading didn't end up on the app we wanted, fall back to the Apps list.
+    await openApp(r.appId);
+    if (_appsState.current?.id !== r.appId) applyActivePage("apps");
+    return;
+  }
+  applyActivePage(r.page || "bots");
+}
+
 function renderAppDetail(app) {
   const c = document.getElementById("app-detail-container");
   if (!c) return;
@@ -5857,7 +5889,7 @@ function renderAppDetail(app) {
     cardActions.appendChild(rm);
     card.appendChild(cardActions);
 
-    const open = () => { applyActivePage("dashboard"); openConversation(b.id); };
+    const open = () => enterChat(b.id);
     card.addEventListener("click", open);
     card.addEventListener("keydown", e => { if (e.target === card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); open(); } });
     list.appendChild(card);
