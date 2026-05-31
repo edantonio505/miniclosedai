@@ -26,7 +26,8 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 3. [Running](#running)
 4. [Docker deployment](#docker-deployment)
 5. [UI features](#ui-features)
-6. [Knowledge base (RAG)](#knowledge-base-rag)
+6. [Apps + per-app SDK generation (TypeScript / JavaScript / Python)](#apps-groups-of-bots-and-per-app-sdk-generation)
+7. [Knowledge base (RAG)](#knowledge-base-rag)
 7. [Extensibility — MCP plugins](#extensibility--mcp-plugins)
 8. [Evaluation & auto-improve](#evaluation--auto-improve-scoring)
 9. [Worked example — connecting Bonsai (1-bit 8B)](#worked-example--connecting-bonsai-1-bit-8b)
@@ -426,6 +427,55 @@ Vertical-nav button (terminal icon, between Bots and Settings in the activity ba
 <p align="center">
   <img src="docs/images/logs_page.png" alt="Logs page — per-call request/response viewer" width="800"><br><em>Logs page</em>
 </p>
+
+---
+
+## Apps (groups of bots) and per-app SDK generation
+
+A second top-level surface beside Bots: an **application** is a named group of bots (e.g. *"GA Probate"*) that can also emit a ready-to-use client SDK in TypeScript, JavaScript, or Python with each member bot wired in as a named function.
+
+### Data model
+
+A single **`apps`** table (`db.py:111-119`): `id`, `name`, `description`, `link`, `avatar` (data URL), `created_at`, `updated_at`. Bots belong to an app via a `conversations.app_id` column (additive migration in `init_db`), with `idx_conversations_app` for the per-app lookup. Assignment is one-to-many — a bot is in zero or one apps. Removing a bot from an app sets `app_id = NULL`; deleting the app does the same to its bots (the bots are not deleted).
+
+### Endpoints (`app.py:1033-1209`)
+
+CRUD on apps:
+- `GET  /api/apps` — list apps with `bot_count`.
+- `POST /api/apps` — create (`AppCreate`: name, description, link).
+- `GET  /api/apps/{id}` — single app + its bots.
+- `PATCH /api/apps/{id}` — update name / description / link.
+- `DELETE /api/apps/{id}` — delete app; bots' `app_id` is set to NULL.
+- `PUT/DELETE /api/apps/{id}/avatar` — same shape as the per-bot avatar endpoints.
+
+Bot assignment:
+- `POST /api/apps/{id}/bots` body `{conversation_id}` — assign a bot (reassigns from any previous app).
+- `DELETE /api/apps/{id}/bots/{conv_id}` — clear `app_id` (404 if the bot wasn't in this app).
+
+SDK generation:
+- `GET /api/apps/{id}/sdk?lang=ts|js|py` — JSON preview: `{app, lang, files: [{path, content}]}`. `lang` defaults to `ts` (backwards-compat); unknown lang → 400.
+- `GET /api/apps/{id}/sdk.zip?lang=…` — download as a zip. Filename keeps `<slug>-sdk.zip` for `ts` (no breakage); `js` / `py` use `<slug>-<lang>-sdk.zip` so all three can coexist in a downloads folder.
+
+### `sdkgen.py` — the generator
+
+Stdlib-only, with three parallel emitters dispatched by `generate_sdk(lang, app, bots, base_url)` (`SDK_LANGS = ("ts", "js", "py")`):
+
+- **`generate_ts_sdk`** — typed TypeScript; per-bot `bots/<fn>.ts`, `client.ts`, `index.ts` barrel, `package.json`, `README.md`. Imports use the explicit `.js` extension (NodeNext/bundler-style).
+- **`generate_js_sdk`** — same shape with types stripped; ESM `.js`. Runs in Node 18+ (native `fetch`) and modern browsers.
+- **`generate_python_sdk`** — a stdlib-only Python package. Folder is `<py_slug>_sdk/` (underscores, so it's directly importable). Lays out `client.py`, `__init__.py` (re-exports + a `<bag>` dict of all bots), and `bots/<fn>.py` per bot. Snake-case function names via `function_names_python` (camelCase `function_names` is reused for TS/JS).
+
+Identifiers are deduplicated on collision by appending the bot id, and reserved words are rejected (per-language `_RESERVED` / `_PY_RESERVED` sets). The server URL is baked into `client.{ts,js,py}` via a `__BASE_URL__` placeholder substituted at generation time.
+
+### UI (`static/index.html`, `static/app.js`, `static/style.css`)
+
+- **Apps page** (`body[data-page="apps"]`, `renderAppsPage`): grid of app cards (`_appsState.cache`) with filter, "New application" button, and a per-card **Generate SDK** action.
+- **App detail** (`body[data-page="app-detail"]`, `renderAppDetail`): back-to-Apps button, the app's bot grid, plus a top-level Generate-SDK button. `_appsState.current` holds the open app.
+- **SDK modal** (`#sdk-modal-backdrop`, `openSdkModal`): three-language tab strip (`.sdk-lang-tab[data-lang="ts|js|py"]`); each tab refetches `/sdk?lang=…` via `_loadSdkFiles()` and re-renders the file tree + preview. Download button targets `/sdk.zip?lang=…`. State carries `{ files, active, appId, appName, lang }`.
+- **Context-aware back** (`enterChat()` / `exitChatToReturn()` in `app.js`): the chat view remembers which surface launched it (`state.chatReturnTo`), so back from a bot opened *inside* an app returns to that app's detail view — not the global Bots page. On Esc the same restore runs.
+
+### Drop-in usage caveats
+
+The generated SDKs are thin HTTP clients: they need a **reachable MiniClosedAI server**. The base URL is baked at generation time but overridable via `MINICLOSEDAI_BASE_URL` (Node `process.env` for JS/TS, `os.environ` for Python) or per-call `baseUrl` / `base_url`. Bot ids are pinned in the generated files — recreate a bot and you'll need to regenerate. The API ships with `allow_origins=["*"]` (in `app.py`) and no auth, so put a reverse proxy + auth in front before exposing port `8095` to the public internet.
 
 ---
 

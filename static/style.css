@@ -300,6 +300,30 @@ body[data-page="app-detail"] .page-app-detail {
 }
 /* SDK preview modal — file list on the left, highlighted source on the right. */
 .sdk-modal { max-width: 920px; width: 92vw; }
+/* Language tabs at the top of the SDK modal (TypeScript / JavaScript / Python). */
+.sdk-lang-tabs {
+  display: flex;
+  gap: 6px;
+  margin: 4px 0 10px;
+}
+.sdk-lang-tab {
+  border: 1px solid var(--border);
+  background: var(--bg-elev-1);
+  color: var(--text-muted);
+  border-radius: var(--r-sm);
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.sdk-lang-tab:hover { background: var(--panel); color: var(--text); }
+.sdk-lang-tab.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.sdk-lang-tab:disabled { opacity: 0.6; cursor: progress; }
 .sdk-modal-body {
   display: flex;
   gap: 12px;

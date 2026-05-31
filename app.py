@@ -1175,7 +1175,10 @@ def _sdk_base_url(request: Request, override: str | None) -> str:
     return str(request.base_url).rstrip("/")
 
 
-def _app_sdk_files(app_id: int, base_url: str):
+def _app_sdk_files(app_id: int, base_url: str, lang: str = "ts"):
+    if lang not in sdkgen.SDK_LANGS:
+        raise HTTPException(
+            400, f"unknown SDK language: {lang!r}. Valid: {', '.join(sdkgen.SDK_LANGS)}.")
     with db.get_conn() as conn:
         row = _app_row(conn, app_id)
         bots = conn.execute(
@@ -1183,21 +1186,28 @@ def _app_sdk_files(app_id: int, base_url: str):
             (app_id,),
         ).fetchall()
     app_dict = dict(row)
-    return app_dict, sdkgen.generate_ts_sdk(app_dict, [dict(b) for b in bots], base_url)
+    return app_dict, sdkgen.generate_sdk(lang, app_dict, [dict(b) for b in bots], base_url)
 
 
 @app.get("/api/apps/{app_id}/sdk")
-def api_app_sdk(app_id: int, request: Request, base_url: str | None = None):
-    """The generated TypeScript SDK files for this application (for preview)."""
-    app_dict, files = _app_sdk_files(app_id, _sdk_base_url(request, base_url))
-    return {"app": {"id": app_dict["id"], "name": app_dict["name"]}, "files": files}
+def api_app_sdk(app_id: int, request: Request, base_url: str | None = None, lang: str = "ts"):
+    """Generated SDK files for this application (for preview).
+
+    `lang` selects the language: `ts` (default, TypeScript), `js` (JavaScript),
+    or `py` (Python). Defaults to `ts` so older clients keep working unchanged.
+    """
+    app_dict, files = _app_sdk_files(app_id, _sdk_base_url(request, base_url), lang)
+    return {"app": {"id": app_dict["id"], "name": app_dict["name"]}, "lang": lang, "files": files}
 
 
 @app.get("/api/apps/{app_id}/sdk.zip")
-def api_app_sdk_zip(app_id: int, request: Request, base_url: str | None = None):
-    """Download the generated TypeScript SDK for this application as a .zip."""
-    app_dict, files = _app_sdk_files(app_id, _sdk_base_url(request, base_url))
+def api_app_sdk_zip(app_id: int, request: Request, base_url: str | None = None, lang: str = "ts"):
+    """Download the generated SDK for this application as a .zip. See /sdk for `lang`."""
+    app_dict, files = _app_sdk_files(app_id, _sdk_base_url(request, base_url), lang)
     slug = sdkgen.slugify(app_dict["name"])
+    # Encode language in the filename so users can keep all three side-by-side
+    # in a downloads folder without overwriting each other.
+    filename = f"{slug}-sdk.zip" if lang == "ts" else f"{slug}-{lang}-sdk.zip"
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for f in files:
@@ -1205,7 +1215,7 @@ def api_app_sdk_zip(app_id: int, request: Request, base_url: str | None = None):
     return Response(
         content=zip_buf.getvalue(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{slug}-sdk.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

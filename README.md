@@ -26,7 +26,7 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 3. [Install](#install) · [One-line install](#quickest--one-line-install-macos-linux-wsl) · [Docker quick start (with baked models)](#docker-quick-start-with-baked-models)
 4. [Run](#run)
 5. [Your first bot — 60 seconds](#your-first-bot--60-seconds)
-6. [UI guide](#ui-guide) · [Sidebar panels — Knowledge / Extensions / Evals](#sidebar)
+6. [UI guide](#ui-guide) · [Sidebar panels — Knowledge / Extensions / Evals](#sidebar) · [Apps + per-app SDK (TypeScript / JavaScript / Python)](#apps-page-grouping-bots--generate-a-per-app-sdk)
 7. [Connecting LM Studio and other OpenAI-compatible endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)
 8. [Generating system prompts](#generating-system-prompts)
 9. [The microservice pattern](#the-microservice-pattern)
@@ -396,6 +396,39 @@ Single full-page surface listing every saved conversation, newest first. Each ca
 - **Card with a pulse dot** → that bot has a streaming reply in progress OR a completed reply you haven't viewed yet. Clicking the card clears the dot.
 - **Hover a card → row actions appear** on the right (work the same in list and grid view): **`</>` API code** (snippet modal scoped to that bot), **📚 Manage knowledge** (opens a modal listing that bot's documents — filename · chunks · size · date — with per-doc delete and an **+ Add document** button), **🧩 Manage extensions** (opens a modal listing that bot's MCP plugins with a per-server enable toggle, remove, and an add-by-URL row), **📊 Evals** (opens the score/auto-improve modal for that bot), and **🗑 Delete** (confirms with the bot's title, clears stale unread/streaming dots, falls back to the empty state if it was the last bot). All buttons stop event propagation so clicking them doesn't also open the chat; a gradient mask fades the title/meta underneath so the buttons read as an intentional overlay. Editing a bot that's currently open keeps its sidebar panels in sync.
 - **Quick-switch shortcut**: `⌘K` / `Ctrl+K` from anywhere, or `/` when you're not in a text field, jumps to the Bots page and focuses the filter.
+
+### Apps page (grouping bots) — generate a per-app SDK
+
+The **Apps** activity-bar icon opens a second top-level surface that groups bots into named **applications** (e.g. *"GA Probate"*, *"Sales Pipeline"*). Each app has a name, an optional description + link, an avatar, and a list of bots assigned to it. Clicking an app drills into its detail view — a card grid of just that app's bots — and clicking a bot from there opens the chat. The back button returns to the **same app's detail view** (not the global Bots list), so app-scoped workflows feel like their own little surface.
+
+The headline feature is **per-app SDK generation**. Each application has a **Generate SDK** button: it opens a modal with a language tab strip — **TypeScript**, **JavaScript**, or **Python** — and downloads a ready-to-use client package wired specifically for *this app's* bots, with each bot exposed as a named function and its bot id baked in:
+
+```python
+# Python — drop ga_probate_sdk/ anywhere on sys.path, then:
+from ga_probate_sdk import triage, drafter
+
+intent = triage("Client is asking about asset valuation", history=False)
+reply  = drafter(f"Draft a response covering: {intent}")
+```
+
+```ts
+// TypeScript / JavaScript — same shape, ESM, native fetch
+import { triage, drafter } from "./ga-probate-sdk";
+
+const intent = await triage("Client is asking about asset valuation");
+const reply  = await drafter(`Draft a response covering: ${intent}`);
+```
+
+What each language gives you:
+- **TypeScript** — typed, per-bot files + `index.ts` barrel + `package.json` + `README.md`. Works in modern TS projects (`moduleResolution: "NodeNext"` or `"bundler"`).
+- **JavaScript** — plain ESM `.js` (types stripped, same shape). Drop into any Node 18+ project or load directly in a modern browser; no bundler required.
+- **Python** — stdlib-only package (urllib + json, no `pip install`). Folder uses underscores so it's directly importable as `<app_slug>_sdk`.
+
+**Drop-in usage notes** (the same caveats apply to all three languages):
+- The MiniClosedAI server must be **running and reachable** from wherever the SDK runs — these are thin HTTP clients; the model + bot logic stay on the server.
+- The server URL is **baked at generation time**. Override it via the `MINICLOSEDAI_BASE_URL` env var, or per call with `baseUrl` (TS/JS) / `base_url=` (Python), if your consuming app runs somewhere that can't reach the original host.
+- Bot ids are **pinned in the generated files** — recreate a bot and its id changes; regenerate the SDK after structural changes.
+- There's **no auth on the API** and CORS is wide open (`allow_origins=["*"]`). Fine for LAN / your own infra; put a reverse proxy + auth in front before exposing port `8095` to the public internet.
 
 ### Chat view — topbar
 

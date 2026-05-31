@@ -3561,6 +3561,77 @@ def _():
     client.delete(f"/api/conversations/{b2}")
 
 
+@test("apps: SDK lang=js produces a JavaScript package + zip filename suffix")
+def _():
+    bid = _add_openai_backend()
+    b = client.post("/api/conversations", json={
+        "title": "Intake Reviewer", "model": "openai-a-4b", "backend_id": bid,
+    }).json()["id"]
+    aid = client.post("/api/apps", json={"name": "JS App"}).json()["id"]
+    client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b})
+    sdk = client.get(f"/api/apps/{aid}/sdk?lang=js").json()
+    assert sdk["lang"] == "js"
+    paths = [f["path"] for f in sdk["files"]]
+    assert any(p.endswith("client.js") for p in paths), paths
+    assert any(p.endswith("index.js") for p in paths), paths
+    assert not any(p.endswith(".ts") for p in paths), paths  # no TS leakage
+    blob = "\n".join(f["content"] for f in sdk["files"])
+    assert "intakeReviewer" in blob          # camelCase function (same as TS)
+    assert ": string" not in blob            # type annotations stripped
+    z = client.get(f"/api/apps/{aid}/sdk.zip?lang=js")
+    assert z.status_code == 200
+    assert "js-app-js-sdk.zip" in z.headers.get("content-disposition", "")
+    client.delete(f"/api/apps/{aid}")
+    client.delete(f"/api/conversations/{b}")
+
+
+@test("apps: SDK lang=py produces an importable Python package")
+def _():
+    bid = _add_openai_backend()
+    b = client.post("/api/conversations", json={
+        "title": "Intake Reviewer", "model": "openai-a-4b", "backend_id": bid,
+    }).json()["id"]
+    aid = client.post("/api/apps", json={"name": "Py App"}).json()["id"]
+    client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b})
+    sdk = client.get(f"/api/apps/{aid}/sdk?lang=py").json()
+    assert sdk["lang"] == "py"
+    paths = [f["path"] for f in sdk["files"]]
+    # Python package uses underscores in the folder so it's directly importable.
+    assert all(p.startswith("py_app_sdk/") for p in paths), paths
+    assert "py_app_sdk/__init__.py" in paths
+    assert "py_app_sdk/client.py" in paths
+    bot_files = [p for p in paths if p.startswith("py_app_sdk/bots/") and p.endswith(".py")
+                 and not p.endswith("__init__.py")]
+    assert len(bot_files) == 1, bot_files
+    # Snake-case Python function name derived from the title.
+    blob = "\n".join(f["content"] for f in sdk["files"])
+    assert "def intake_reviewer(" in blob, blob
+    assert f"Bot({b})" in blob, blob
+    # All generated files must parse as Python.
+    import ast as _ast
+    for f in sdk["files"]:
+        if f["path"].endswith(".py"):
+            _ast.parse(f["content"], filename=f["path"])
+    z = client.get(f"/api/apps/{aid}/sdk.zip?lang=py")
+    assert z.status_code == 200
+    assert "py-app-py-sdk.zip" in z.headers.get("content-disposition", "")
+    client.delete(f"/api/apps/{aid}")
+    client.delete(f"/api/conversations/{b}")
+
+
+@test("apps: SDK lang validation — unknown value rejected, default stays ts")
+def _():
+    aid = client.post("/api/apps", json={"name": "Lang App"}).json()["id"]
+    # No lang → default TypeScript (backwards-compat for existing clients).
+    assert client.get(f"/api/apps/{aid}/sdk").json()["lang"] == "ts"
+    # Unknown lang → 400.
+    assert client.get(f"/api/apps/{aid}/sdk?lang=ruby").status_code == 400
+    # Default zip keeps the old filename (no language suffix) for ts.
+    z = client.get(f"/api/apps/{aid}/sdk.zip")
+    assert "lang-app-sdk.zip" in z.headers.get("content-disposition", "")
+    client.delete(f"/api/apps/{aid}")
+
+
 @test("apps: 404s for missing app / bot")
 def _():
     assert client.get("/api/apps/999999").status_code == 404

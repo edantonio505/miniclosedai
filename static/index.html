@@ -646,12 +646,17 @@
   <div id="sdk-modal-backdrop" class="modal-backdrop hidden">
     <div class="modal sdk-modal">
       <div class="modal-header">
-        <h3>TypeScript SDK <span id="sdk-modal-app" class="kb-modal-bot"></span></h3>
+        <h3><span id="sdk-modal-lang-label">TypeScript</span> SDK <span id="sdk-modal-app" class="kb-modal-bot"></span></h3>
         <button id="sdk-modal-close" class="icon-btn" data-tooltip="Close" aria-label="Close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
-      <p class="kb-modal-hint">Drop this folder into a TypeScript project to call this application's bots over the MiniClosedAI HTTP API. The server must be running and reachable. Each bot is exposed as a function named after it.</p>
+      <div class="sdk-lang-tabs" id="sdk-lang-tabs" role="tablist" aria-label="SDK language">
+        <button type="button" class="sdk-lang-tab active" data-lang="ts" role="tab" aria-selected="true">TypeScript</button>
+        <button type="button" class="sdk-lang-tab" data-lang="js" role="tab" aria-selected="false">JavaScript</button>
+        <button type="button" class="sdk-lang-tab" data-lang="py" role="tab" aria-selected="false">Python</button>
+      </div>
+      <p class="kb-modal-hint" id="sdk-modal-hint">Drop this folder into a TypeScript project to call this application's bots over the MiniClosedAI HTTP API. The server must be running and reachable. Each bot is exposed as a function named after it.</p>
       <div class="sdk-modal-body">
         <div id="sdk-file-list" class="sdk-file-list"></div>
         <pre class="sdk-code"><code id="sdk-code"></code></pre>

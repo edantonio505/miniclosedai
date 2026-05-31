@@ -5609,7 +5609,13 @@ function initPromptGenUI() {
 // the Bots page: an overview of cards, a detail view to chat with each bot
 // individually, plus a generated TypeScript SDK per application.
 const _appsState = { cache: [], filter: "", current: null };
-const _sdkState = { files: [], active: 0, appId: null };
+const _sdkState = { files: [], active: 0, appId: null, appName: "", lang: "ts" };
+const _SDK_LANG_LABELS = { ts: "TypeScript", js: "JavaScript", py: "Python" };
+const _SDK_LANG_HINTS = {
+  ts: "Drop this folder into a TypeScript project to call this application's bots over the MiniClosedAI HTTP API. The server must be running and reachable. Each bot is exposed as a function named after it.",
+  js: "Drop this folder into any Node 18+ project (or load it in a browser) to call this application's bots over the MiniClosedAI HTTP API. The server must be running and reachable. Each bot is exposed as a function named after it.",
+  py: "Drop this package into your Python project (anywhere on sys.path — stdlib only, no pip install) to call this application's bots over the MiniClosedAI HTTP API. The server must be running and reachable. Each bot is exposed as a function named after it.",
+};
 
 const _X_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
 // Feather: layers — the application (group) avatar fallback.
@@ -6057,21 +6063,42 @@ function _openAddBotModal(app) {
 }
 
 // ── SDK preview modal (static markup in index.html) ──
-async function openSdkModal(appId, appName) {
-  let data;
-  try {
-    const r = await fetch(`/api/apps/${appId}/sdk`);
-    if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
-    data = await r.json();
-  } catch (e) { alert(`Could not generate SDK: ${e.message}`); return; }
-  _sdkState.files = data.files || [];
-  _sdkState.active = 0;
+async function openSdkModal(appId, appName, lang) {
   _sdkState.appId = appId;
-  const nameEl = document.getElementById("sdk-modal-app");
-  if (nameEl) nameEl.textContent = data.app ? `· ${data.app.name}` : (appName ? `· ${appName}` : "");
-  _renderSdkModal();
+  _sdkState.appName = appName || "";
+  _sdkState.lang = lang || _sdkState.lang || "ts";
+  const ok = await _loadSdkFiles();
+  if (!ok) return;
   const bd = document.getElementById("sdk-modal-backdrop");
   if (bd) bd.classList.remove("hidden");
+}
+
+// Fetch the SDK files for the current (_sdkState.appId, _sdkState.lang) and
+// re-render the modal. Returns false on error so callers can bail without
+// opening/keeping the modal in a broken state.
+async function _loadSdkFiles() {
+  if (_sdkState.appId == null) return false;
+  let data;
+  try {
+    const r = await fetch(`/api/apps/${_sdkState.appId}/sdk?lang=${_sdkState.lang}`);
+    if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+    data = await r.json();
+  } catch (e) { alert(`Could not generate SDK: ${e.message}`); return false; }
+  _sdkState.files = data.files || [];
+  _sdkState.active = 0;
+  const nameEl = document.getElementById("sdk-modal-app");
+  if (nameEl) nameEl.textContent = data.app ? `· ${data.app.name}` : (_sdkState.appName ? `· ${_sdkState.appName}` : "");
+  const langLbl = document.getElementById("sdk-modal-lang-label");
+  if (langLbl) langLbl.textContent = _SDK_LANG_LABELS[_sdkState.lang] || _sdkState.lang;
+  const hint = document.getElementById("sdk-modal-hint");
+  if (hint) hint.textContent = _SDK_LANG_HINTS[_sdkState.lang] || hint.textContent;
+  document.querySelectorAll(".sdk-lang-tab").forEach(b => {
+    const active = b.dataset.lang === _sdkState.lang;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  _renderSdkModal();
+  return true;
 }
 
 function _renderSdkModal() {
@@ -6122,8 +6149,20 @@ function initAppsUI() {
   if (dl) dl.addEventListener("click", () => {
     if (_sdkState.appId == null) return;
     const a = document.createElement("a");
-    a.href = `/api/apps/${_sdkState.appId}/sdk.zip`; a.rel = "noopener";
+    a.href = `/api/apps/${_sdkState.appId}/sdk.zip?lang=${_sdkState.lang}`; a.rel = "noopener";
     document.body.appendChild(a); a.click(); a.remove();
+  });
+  // Language tabs — switch lang, re-fetch, re-render. Disabled while loading
+  // so a quick double-click doesn't leave the modal showing stale files.
+  document.querySelectorAll(".sdk-lang-tab").forEach(b => {
+    b.addEventListener("click", async () => {
+      const next = b.dataset.lang;
+      if (!next || next === _sdkState.lang) return;
+      _sdkState.lang = next;
+      document.querySelectorAll(".sdk-lang-tab").forEach(x => x.disabled = true);
+      try { await _loadSdkFiles(); }
+      finally { document.querySelectorAll(".sdk-lang-tab").forEach(x => x.disabled = false); }
+    });
   });
 }
 
