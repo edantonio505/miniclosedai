@@ -1782,6 +1782,16 @@ textarea {
   border-color: var(--accent-hover);
 }
 
+.btn-danger {
+  background: #d64545;
+  border-color: #d64545;
+  color: #fff;
+}
+.btn-danger:hover {
+  background: #c23b3b;
+  border-color: #c23b3b;
+}
+
 .btn-ghost {
   background: transparent;
   border-color: transparent;

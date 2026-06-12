@@ -505,9 +505,21 @@ function setStatus(kind, text) {
 // (via _selectModelOption) + dispatches `change` so all existing logic fires.
 
 function _syncModelPickerLabel() {
-  if (!els.modelPickerLabel) return;
   const sel = els.modelSelect.selectedOptions[0];
-  els.modelPickerLabel.textContent = sel && sel.value ? sel.value : "Select model";
+  if (els.modelPickerLabel) {
+    els.modelPickerLabel.textContent = sel && sel.value ? sel.value : "Select model";
+  }
+  // Re-highlight the active row to match the CURRENT selection. The picker
+  // list DOM is only built in _rebuildModelPicker(), so without this the row
+  // marked .active stays frozen at whatever was selected when the list was
+  // built — reopening it would show the previous model highlighted and the
+  // newly-picked one unmarked.
+  if (els.modelPickerList) {
+    const curKey = sel ? `${sel.value}::${sel.dataset.backendId || ""}` : null;
+    for (const item of els.modelPickerList.querySelectorAll(".model-picker-item")) {
+      item.classList.toggle("active", curKey != null && item.dataset.key === curKey);
+    }
+  }
 }
 
 function _rebuildModelPicker() {
@@ -533,6 +545,7 @@ function _rebuildModelPicker() {
       item.dataset.group = group.label.toLowerCase();
       if (!opt.disabled) {
         const key = `${opt.value}::${opt.dataset.backendId || ""}`;
+        item.dataset.key = key;  // lets _syncModelPickerLabel re-highlight on change
         if (key === curKey) item.classList.add("active");
         item.addEventListener("click", () => {
           _selectModelOption(opt.value, opt.dataset.backendId);
@@ -1109,6 +1122,83 @@ function onBotsPageEntered() {
   }
 }
 
+// ─── In-app prompt / confirm dialogs ────────────────────────────────────
+// Promise-based replacements for native prompt()/confirm(). Browsers let the
+// user permanently suppress native dialogs ("prevent additional dialogs"),
+// after which prompt() returns null and confirm() returns false — silently
+// breaking flows like New bot and Delete. These modals can't be suppressed.
+//   uiPrompt({...})  → resolves to the entered string on OK, or null on cancel
+//   uiConfirm({...}) → resolves to true on OK, or false on cancel
+let _uiDialogResolve = null;
+
+function _uiDialogIsPrompt() {
+  const f = document.getElementById("ui-dialog-input-field");
+  return f && f.style.display !== "none";
+}
+
+function _uiDialogClose(result) {
+  const backdrop = document.getElementById("ui-dialog-backdrop");
+  if (backdrop) backdrop.classList.add("hidden");
+  const resolve = _uiDialogResolve;
+  _uiDialogResolve = null;
+  if (resolve) resolve(result);
+}
+
+function _openUiDialog(opts) {
+  const withInput = !!opts.withInput;
+  return new Promise(resolve => {
+    // Only one dialog at a time — cancel any in-flight one first.
+    if (_uiDialogResolve) _uiDialogClose(withInput ? null : false);
+    _uiDialogResolve = resolve;
+
+    const $ = id => document.getElementById(id);
+    $("ui-dialog-title").textContent = opts.title || "";
+    const msg = $("ui-dialog-message");
+    msg.textContent = opts.message || "";
+    msg.style.display = opts.message ? "" : "none";
+
+    $("ui-dialog-input-field").style.display = withInput ? "" : "none";
+    const input = $("ui-dialog-input");
+    if (withInput) {
+      $("ui-dialog-input-label").textContent = opts.inputLabel || "Name";
+      input.value = opts.value || "";
+      input.placeholder = opts.placeholder || "";
+    }
+
+    const okBtn = $("ui-dialog-ok");
+    okBtn.textContent = opts.okText || "OK";
+    okBtn.classList.toggle("btn-danger", !!opts.danger);
+    okBtn.classList.toggle("btn-primary", !opts.danger);
+    $("ui-dialog-cancel").textContent = opts.cancelText || "Cancel";
+
+    $("ui-dialog-backdrop").classList.remove("hidden");
+    if (withInput) { input.focus(); input.select(); } else okBtn.focus();
+  });
+}
+
+function uiPrompt(opts = {})  { return _openUiDialog({ ...opts, withInput: true }); }
+function uiConfirm(opts = {}) { return _openUiDialog({ ...opts, withInput: false }); }
+
+function initUiDialog() {
+  const $ = id => document.getElementById(id);
+  const backdrop = $("ui-dialog-backdrop");
+  if (!backdrop) return;
+  const input = $("ui-dialog-input");
+  const onOk     = () => _uiDialogClose(_uiDialogIsPrompt() ? input.value.trim() : true);
+  const onCancel = () => _uiDialogClose(_uiDialogIsPrompt() ? null : false);
+
+  $("ui-dialog-ok").addEventListener("click", onOk);
+  $("ui-dialog-cancel").addEventListener("click", onCancel);
+  $("ui-dialog-close").addEventListener("click", onCancel);
+  backdrop.addEventListener("click", e => { if (e.target === backdrop) onCancel(); });
+  // Keydown on the backdrop covers both the input (prompt) and button focus
+  // (confirm). stopPropagation keeps global Esc-to-bots / ⌘K from also firing.
+  backdrop.addEventListener("keydown", e => {
+    if (e.key === "Enter")  { e.preventDefault(); e.stopPropagation(); onOk(); }
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); onCancel(); }
+  });
+}
+
 function initBotsUI() {
   if (els.botsFilter) {
     els.botsFilter.addEventListener("input", () => {
@@ -1118,8 +1208,18 @@ function initBotsUI() {
   }
   if (els.botsNewBtn) {
     els.botsNewBtn.addEventListener("click", async () => {
-      await newConversation();
-      applyActivePage("dashboard");
+      // Ask for the name FIRST via an in-app dialog (not native prompt(),
+      // which browsers can suppress). Cancel → create nothing and stay on the
+      // Bots page. Only navigate to the chat once a bot was actually created.
+      const name = await uiPrompt({
+        title: "New bot",
+        inputLabel: "Bot name",
+        placeholder: "e.g. Support Assistant",
+        okText: "Create",
+      });
+      if (name === null) return;  // cancelled → no bot created
+      const created = await newConversation({ skipPrompt: true, title: name });
+      if (created) applyActivePage("dashboard");
     });
   }
   if (els.breadcrumbBack) {
@@ -2141,19 +2241,28 @@ async function openConversation(id) {
   loadEvals();
 }
 
-async function newConversation() {
+async function newConversation(opts = {}) {
   const opt = els.modelSelect.selectedOptions[0];
   const model = opt && opt.value;
   if (!model) {
     alert("Pick a model first.");
-    return;
+    return false;
   }
   const backendId = opt.dataset.backendId
     ? parseInt(opt.dataset.backendId, 10)
     : 1;
-  const input = prompt("Name this chat:", "");
-  if (input === null) return;                 // user cancelled
-  const title = input.trim() || "New Chat";
+  // `skipPrompt` callers (e.g. the Bots-page "+ New bot" button) name the bot
+  // with the non-suppressible inline rename input AFTER creation, instead of a
+  // native prompt() — browsers silently no-op prompt()/alert() once the user
+  // ticks "prevent additional dialogs", which made New bot appear dead.
+  let title;
+  if (opts.skipPrompt) {
+    title = (opts.title && opts.title.trim()) || "New Chat";
+  } else {
+    const input = prompt("Name this chat:", "");
+    if (input === null) return false;         // user cancelled
+    title = input.trim() || "New Chat";
+  }
 
   // Every new bot starts from a clean slate — default system prompt and params.
   // Model + backend are carried over from the current selection.
@@ -2187,6 +2296,7 @@ async function newConversation() {
 
   // Focus the system prompt so they can start authoring the bot immediately.
   els.systemPrompt.focus();
+  return true;
 }
 
 function resetSidebarToDefaults() {
@@ -3760,7 +3870,12 @@ function bindDownloadMenu() {
 async function deleteConvById(id, opts = {}) {
   if (id == null) return false;
   const title = opts.title || "this bot";
-  const ok = opts.skipConfirm || confirm(`Delete "${title}"? This cannot be undone.`);
+  const ok = opts.skipConfirm || await uiConfirm({
+    title: "Delete bot",
+    message: `Delete "${title}"? This cannot be undone.`,
+    okText: "Delete",
+    danger: true,
+  });
   if (!ok) return false;
   const r = await fetch(`/api/conversations/${id}`, { method: "DELETE" });
   if (!r.ok) { alert("Failed to delete bot."); return false; }
@@ -5448,6 +5563,7 @@ async function init() {
   initSuggestionChips();
   initMicButton();
   if (typeof initBackendsUI === "function") initBackendsUI();
+  initUiDialog();
   initLogsUI();
   initBotsUI();
   initAppsUI();
