@@ -2850,6 +2850,21 @@ body.sidebar-collapsed #sidebar-toggle {
   height: 16px;
 }
 
+/* Push-to-talk mic button — recording = pulsing accent ring; busy = dimmed. */
+#mic-btn.recording {
+  color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-ring);
+  animation: mic-pulse 1.1s ease-in-out infinite;
+}
+#mic-btn.busy {
+  opacity: 0.5;
+  cursor: progress;
+}
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px var(--accent-ring); }
+  50%      { box-shadow: 0 0 0 5px var(--accent-ring); }
+}
+
 /* ----- Attachment chip strip above the textarea ----- */
 .attachment-list {
   display: flex;

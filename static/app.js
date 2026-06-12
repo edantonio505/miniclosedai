@@ -83,6 +83,7 @@ const els = {
   input: document.getElementById("input"),
   sendBtn: document.getElementById("send-btn"),
   attachBtn: document.getElementById("attach-btn"),
+  micBtn: document.getElementById("mic-btn"),
   attachInput: document.getElementById("attach-input"),
   attachmentList: document.getElementById("attachment-list"),
   attachmentWarning: document.getElementById("attachment-warning"),
@@ -3050,6 +3051,242 @@ async function _consumeAssistantStream({ fetchFn, assistantEl, body, model, para
   }
 }
 
+// =====================================================================
+// Push-to-talk (voice mode)
+// =====================================================================
+//
+// Hold the mic button, release to send. Audio is recorded via MediaRecorder
+// (browser default codec — usually webm/opus; the voice service auto-decodes
+// via PyAV), POSTed as multipart to /voice/turn, and the merged SSE stream
+// drives the same chat bubble + a Web-Audio playback queue.
+
+const _voice = {
+  rec: null,             // active MediaRecorder
+  chunks: [],            // collected blob parts for the current take
+  pressed: false,        // is the button currently held / toggled on?
+  abort: null,           // AbortController for the in-flight /voice/turn
+  audioCtx: null,        // shared AudioContext, created on first use
+  audioCursor: 0,        // currentTime to schedule the next chunk at
+};
+
+
+function _getAudioContext() {
+  // Lazy: browsers gate AudioContext creation behind a user gesture, which
+  // pressing the mic button counts as.
+  if (!_voice.audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    _voice.audioCtx = new Ctx();
+  }
+  return _voice.audioCtx;
+}
+
+
+// Decode + schedule one base64 PCM-16 chunk for seamless playback.
+function _enqueueAudioChunk(b64, sampleRate) {
+  const ctx = _getAudioContext();
+  const binary = atob(b64);
+  // PCM 16-bit little-endian → Float32 in [-1, 1]
+  const len = binary.length / 2;
+  const pcm = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    const lo = binary.charCodeAt(i * 2);
+    const hi = binary.charCodeAt(i * 2 + 1);
+    let s = (hi << 8) | lo;
+    if (s >= 0x8000) s -= 0x10000;
+    pcm[i] = s / 0x8000;
+  }
+  const buffer = ctx.createBuffer(1, len, sampleRate);
+  buffer.getChannelData(0).set(pcm);
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
+  // Schedule on a sliding cursor so back-to-back chunks have no gap.
+  const startAt = Math.max(ctx.currentTime, _voice.audioCursor);
+  source.start(startAt);
+  _voice.audioCursor = startAt + buffer.duration;
+}
+
+
+async function _startRecording() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    // The microphone API is gated behind a "secure context": browsers expose
+    // it only on https:// or http://localhost / 127.0.0.1, never on a plain-
+    // HTTP LAN IP. Spell that out so the user knows what to fix.
+    const isSecure = window.isSecureContext;
+    const origin = location.origin;
+    const msg = isSecure
+      ? `Your browser does not expose a microphone API. Origin: ${origin}.`
+      : `Microphone access requires a secure context (https:// or localhost). ` +
+        `You're on ${origin}, which the browser treats as insecure. Options: ` +
+        `(1) reach MiniClosedAI via http://localhost:8095 from the same machine, ` +
+        `(2) put MiniClosedAI behind HTTPS, or ` +
+        `(3) Chrome flag: chrome://flags/#unsafely-treat-insecure-origin-as-secure → add ${origin} → relaunch.`;
+    alert(msg);
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio: true});
+  } catch (e) {
+    alert(`Could not access the microphone: ${e.message}`); return;
+  }
+  _voice.chunks = [];
+  // Default codec — Chrome gives webm/opus, Firefox ogg/opus, Safari mp4.
+  // The voice service decodes any of them via PyAV.
+  const rec = new MediaRecorder(stream);
+  rec.addEventListener("dataavailable", e => {
+    if (e.data && e.data.size > 0) _voice.chunks.push(e.data);
+  });
+  rec.addEventListener("stop", () => {
+    stream.getTracks().forEach(t => t.stop());
+  });
+  rec.start();
+  _voice.rec = rec;
+  els.micBtn?.classList.add("recording");
+}
+
+
+async function _stopRecordingAndSend() {
+  const rec = _voice.rec;
+  if (!rec || rec.state === "inactive") return;
+  // Wait for the final 'stop' event so all chunks are flushed.
+  await new Promise(res => {
+    rec.addEventListener("stop", res, {once: true});
+    rec.stop();
+  });
+  els.micBtn?.classList.remove("recording");
+  els.micBtn?.classList.add("busy");
+  const blob = new Blob(_voice.chunks, {type: rec.mimeType || "audio/webm"});
+  _voice.rec = null;
+  if (!state.conversationId) {
+    await newConversation();
+    if (!state.conversationId) { els.micBtn?.classList.remove("busy"); return; }
+  }
+  // Filename matters: it tells the server what extension to assume when
+  // logging / decoding. The MIME type carries the real format.
+  const filename = (blob.type || "").includes("webm") ? "voice.webm"
+                  : (blob.type || "").includes("ogg") ? "voice.ogg"
+                  : (blob.type || "").includes("mp4") ? "voice.mp4"
+                  : "voice.wav";
+  await _consumeVoiceTurn(blob, filename);
+  els.micBtn?.classList.remove("busy");
+}
+
+
+// Render the merged SSE from /voice/turn — three event kinds:
+//   {transcript}        → render a user message bubble with that text
+//   {chunk}             → assistant text token (one chat bubble streams in)
+//   {audio_chunk_b64}   → push into the Web Audio playback queue
+async function _consumeVoiceTurn(blob, filename) {
+  const convId = state.conversationId;
+  let assistantEl = null;
+  let body = null;
+  let contentEl = null;
+  let assistantText = "";
+  _voice.audioCursor = 0;
+  const ac = new AbortController();
+  _voice.abort = ac;
+  try {
+    const fd = new FormData();
+    fd.append("audio", blob, filename);
+    const res = await fetch(`/api/conversations/${convId}/voice/turn`, {
+      method: "POST", body: fd, signal: ac.signal,
+    });
+    if (!res.ok || !res.body) {
+      throw new Error(await res.text().catch(() => `HTTP ${res.status}`));
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream: true});
+      const parts = buf.split("\n\n");
+      buf = parts.pop() || "";
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data:")) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (ev.transcript != null) {
+          const userMsg = {role: "user", content: ev.transcript};
+          state.messages.push(userMsg);
+          renderMessage(userMsg);
+          // Assistant bubble — same shape as sendMessage.
+          assistantEl = renderMessage({role: "assistant", content: ""});
+          body = assistantEl.querySelector(".msg-body");
+          assistantEl.classList.add("cursor");
+          scrollToBottom();
+        } else if (ev.error) {
+          assistantText += `\n\n**Error:** ${ev.error}`;
+          if (assistantEl && body) {
+            if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
+            contentEl.innerHTML = render(assistantText);
+          } else {
+            alert(`Voice turn failed: ${ev.error}`);
+          }
+        } else if (ev.chunk != null && body) {
+          assistantText += ev.chunk;
+          if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
+          contentEl.innerHTML = render(assistantText);
+          scrollToBottom();
+        } else if (ev.audio_chunk_b64) {
+          _enqueueAudioChunk(ev.audio_chunk_b64, ev.sample_rate || 22050);
+        } else if (ev.end) {
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      alert(`Voice turn failed: ${e.message}`);
+    }
+  } finally {
+    _voice.abort = null;
+    if (assistantEl) {
+      assistantEl.classList.remove("cursor");
+      if (contentEl) { contentEl.innerHTML = render(assistantText); highlightCodeBlocks(contentEl); }
+      // Stash the assistant message so a re-render keeps it.
+      state.messages.push({role: "assistant", content: assistantText});
+      loadConversations();   // refresh sidebar list + Bots-page card freshness
+    }
+  }
+}
+
+
+function initMicButton() {
+  const btn = els.micBtn;
+  if (!btn) return;
+  // Press-and-hold gestures. Also tolerate click (toggle) for accessibility.
+  const onPress = e => {
+    if (btn.hidden || btn.disabled) return;
+    e.preventDefault();
+    if (_voice.pressed) return;   // already capturing
+    _voice.pressed = true;
+    _startRecording();
+  };
+  const onRelease = e => {
+    if (!_voice.pressed) return;
+    e?.preventDefault?.();
+    _voice.pressed = false;
+    _stopRecordingAndSend();
+  };
+  btn.addEventListener("mousedown", onPress);
+  btn.addEventListener("touchstart", onPress, {passive: false});
+  // Releasing anywhere counts — user may slide off the button.
+  document.addEventListener("mouseup", onRelease);
+  document.addEventListener("touchend", onRelease);
+  document.addEventListener("touchcancel", onRelease);
+  // Keyboard accessibility: Space toggles.
+  btn.addEventListener("keydown", e => {
+    if (e.key === " " || e.key === "Enter") {
+      e.preventDefault();
+      _voice.pressed ? onRelease() : onPress(e);
+    }
+  });
+}
+
 // ---------- API code modal ----------
 // Each conversation is a saved microservice: its model, system prompt, and
 // sampling params are locked server-side. The snippet only needs to supply
@@ -3770,7 +4007,17 @@ async function loadBackends() {
   } catch {
     backendCache = [];
   }
+  _refreshMicAffordance();
   return backendCache;
+}
+
+// Show the push-to-talk mic button only when at least one enabled voice
+// backend is registered. Hidden by default so users without a voice service
+// see no dead UI.
+function _refreshMicAffordance() {
+  if (!els.micBtn) return;
+  const hasVoice = (backendCache || []).some(b => b.kind === "voice" && b.enabled);
+  els.micBtn.hidden = !hasVoice;
 }
 
 function _backendStatusDot(running, enabled, hadErr) {
@@ -5199,6 +5446,7 @@ async function init() {
   initSplitter();
   initHSplitter();
   initSuggestionChips();
+  initMicButton();
   if (typeof initBackendsUI === "function") initBackendsUI();
   initLogsUI();
   initBotsUI();
@@ -5215,6 +5463,11 @@ async function init() {
   initImportBotUI();
   els.input.addEventListener("input", autoGrowInput);
   await loadModels();
+  // Warm the backend cache at boot so the dashboard's push-to-talk affordance
+  // (which checks for a kind='voice' row) shows up without first opening
+  // Settings. loadBackends() also re-runs every time Settings renders, so
+  // adding / removing a voice endpoint there propagates here on the next save.
+  await loadBackends();
   await loadConversations();
   initPromptGenUI();
 
