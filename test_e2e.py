@@ -270,6 +270,93 @@ class FakeOpenAI(_FakeServer):
         return H
 
 
+class FakeVoice(_FakeServer):
+    """Speaks the MiniClosedAI voice-backend contract (see voice.py).
+
+    Just enough of the four endpoints (`/health`, `/voices`, `/transcribe`,
+    `/speak/stream`) to satisfy the backend-status probe, the voices-list
+    reshape, and the per-conversation voice/turn endpoint (task #46). No real
+    ASR or TTS — `/transcribe` returns a canned string, `/speak/stream` yields
+    one short base64'd chunk + `{done:true}`.
+
+    Set `instance.fail = True` to make every route return 503 — used to test
+    the unreachable-backend path without spinning up a separate dead server.
+    """
+    fail: bool = False
+
+    def _handler_class(self):
+        captured = self.captured
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a, **kw): pass
+
+            def do_GET(self):
+                if outer.fail:
+                    self._reply(503, b"down", "text/plain"); return
+                if self.path == "/health":
+                    body = json.dumps({
+                        "ok": True,
+                        "asr_model": "fake-whisper-small",
+                        "tts_model": "fake-melo-multilingual",
+                        "device": "cpu",
+                        "voices_loaded": True,
+                    }).encode()
+                    self._reply(200, body, "application/json"); return
+                if self.path == "/voices":
+                    body = json.dumps({
+                        "en": [
+                            {"id": "en_F_0", "name": "English Female",   "gender": "F"},
+                            {"id": "en_M_0", "name": "English Male",     "gender": "M"},
+                        ],
+                        "es": [
+                            {"id": "es_F_0", "name": "Spanish Female",   "gender": "F"},
+                            {"id": "es_M_0", "name": "Spanish Male",     "gender": "M"},
+                        ],
+                    }).encode()
+                    self._reply(200, body, "application/json"); return
+                self._reply(404, b"not found", "text/plain")
+
+            def do_POST(self):
+                if outer.fail:
+                    self._reply(503, b"down", "text/plain"); return
+                if self.path == "/transcribe":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    self.rfile.read(length)   # drain multipart, don't bother parsing
+                    captured.append({"path": self.path, "len": length})
+                    body = json.dumps({
+                        "text": "hello world",
+                        "language": "en",
+                    }).encode()
+                    self._reply(200, body, "application/json"); return
+                if self.path == "/speak/stream":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length)) if length else {}
+                    captured.append({"path": self.path, "payload": payload})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    # One tiny base64 chunk + the terminal {done:true}.
+                    frames = [
+                        {"chunk_b64": "AAA=", "sample_rate": 22050},
+                        {"done": True, "sample_rate": 22050},
+                    ]
+                    for f in frames:
+                        self.wfile.write(f"data: {json.dumps(f)}\n\n".encode())
+                        self.wfile.flush()
+                    return
+                self._reply(404, b"not found", "text/plain")
+
+            def _reply(self, status, body, ct):
+                self.send_response(status)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        return H
+
+
 # ------------------------------------------------------------------
 # Test runner (tiny, stdlib only)
 # ------------------------------------------------------------------
@@ -331,6 +418,7 @@ def sse_events(raw: bytes | str) -> list[dict]:
 client = TestClient(app_mod.app)    # triggers lifespan → init_db against temp DB
 fake_ollama = FakeOllama()
 fake_openai = FakeOpenAI()
+fake_voice = FakeVoice()
 
 
 def _reseed_builtin_to_fake_ollama() -> None:
@@ -343,6 +431,16 @@ def _add_openai_backend() -> int:
     r = client.post("/api/backends", json={
         "name": "FakeOAI", "kind": "openai",
         "base_url": f"{fake_openai.base_url}/v1",
+    })
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+def _add_voice_backend() -> int:
+    """Register the fake voice service as a new backend; return its id."""
+    r = client.post("/api/backends", json={
+        "name": "FakeVoice", "kind": "voice",
+        "base_url": fake_voice.base_url,
     })
     assert r.status_code == 200, r.text
     return r.json()["id"]
@@ -562,6 +660,192 @@ def _():
     j = r.json()
     assert j["running"] is True
     assert j["models_count"] == 2
+
+
+@test("voice backend: kind=voice round-trips through create + list")
+def _():
+    bid = _add_voice_backend()
+    try:
+        # POST returned the row; list contains it with kind preserved + api_key scrubbed.
+        all_backends = client.get("/api/backends").json()
+        b = next(x for x in all_backends if x["id"] == bid)
+        assert b["kind"] == "voice"
+        assert b["base_url"] == fake_voice.base_url
+        assert b["api_key_set"] is False
+        assert b["enabled"] == 1
+    finally:
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("voice backend: /status reports reachable via /health (and unreachable on failure)")
+def _():
+    bid = _add_voice_backend()
+    try:
+        j = client.get(f"/api/backends/{bid}/status").json()
+        assert j == {"running": True, "base_url": fake_voice.base_url,
+                     "kind": "voice", "enabled": True}, j
+        # Toggle the fake to 503 — /status now reports unreachable, no exception.
+        fake_voice.fail = True
+        try:
+            j2 = client.get(f"/api/backends/{bid}/status").json()
+            assert j2["running"] is False, j2
+        finally:
+            fake_voice.fail = False
+    finally:
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("voice backend: /models reshapes /voices into <lang>/<voice_id> entries")
+def _():
+    bid = _add_voice_backend()
+    try:
+        j = client.get(f"/api/backends/{bid}/models").json()
+        assert j["running"] is True
+        names = {m["name"] for m in j["models"]}
+        # FakeVoice ships 2 English + 2 Spanish voices.
+        assert {"en/en_F_0", "en/en_M_0", "es/es_F_0", "es/es_M_0"}.issubset(names), names
+        # Details carry the language + voice_id so the dropdowns can group cleanly.
+        m = next(m for m in j["models"] if m["name"] == "es/es_F_0")
+        assert m["details"]["language"] == "es"
+        assert m["details"]["voice_id"] == "es_F_0"
+        assert m["details"]["display"] == "Spanish Female"
+        assert m["details"]["family"] == "voice"
+    finally:
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("voice backend: /test draft probe reports reachable + voice count")
+def _():
+    r = client.post("/api/backends/test", json={
+        "name": "voice-draft", "kind": "voice",
+        "base_url": fake_voice.base_url,
+    })
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["running"] is True
+    # /models for voice returns the reshaped voices list; the count is the total
+    # voices across all languages (2 EN + 2 ES = 4).
+    assert j["models_count"] == 4, j
+
+
+@test("voice endpoints: /voice/transcribe proxies through to the backend")
+def _():
+    vbid = _add_voice_backend()
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "voice-transcribe", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        r = client.post(
+            f"/api/conversations/{c['id']}/voice/transcribe",
+            files={"audio": ("hello.wav", b"\x00\x00\x00\x00", "audio/wav")},
+        )
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["text"] == "hello world"
+        assert j["language"] == "en"
+        # Sanity: FakeVoice captured the request.
+        assert any(p.get("path") == "/transcribe" for p in fake_voice.captured)
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{vbid}")
+
+
+@test("voice endpoints: /voice/speak streams SSE chunks + uses defaults from /voices")
+def _():
+    vbid = _add_voice_backend()
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "voice-speak", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        with client.stream("POST", f"/api/conversations/{c['id']}/voice/speak",
+                           json={"text": "Hola"}) as r:
+            body = b"".join(r.iter_bytes())
+        evts = sse_events(body)
+        # FakeVoice emits one chunk + one {done:true}.
+        assert any("chunk_b64" in e for e in evts), evts
+        assert any(e.get("done") for e in evts), evts
+        # Defaulted to the first voice (en/en_F_0) since voice_settings is empty.
+        speak_calls = [p["payload"] for p in fake_voice.captured if p.get("path") == "/speak/stream"]
+        assert speak_calls, fake_voice.captured
+        assert speak_calls[-1]["voice"] == "en_F_0"
+        assert speak_calls[-1]["language"] == "en"
+        assert speak_calls[-1]["text"] == "Hola"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{vbid}")
+
+
+@test("voice endpoints: /voice/turn chains ASR → chat → TTS into one SSE stream")
+def _():
+    vbid = _add_voice_backend()
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "voice-turn", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        fake_voice.captured.clear()
+        with client.stream(
+            "POST", f"/api/conversations/{c['id']}/voice/turn",
+            files={"audio": ("greeting.wav", b"\x00\x00\x00\x00", "audio/wav")},
+        ) as r:
+            body = b"".join(r.iter_bytes())
+        evts = sse_events(body)
+        kinds = [next(iter(e.keys())) for e in evts if e]
+        # Order: transcript first, then LLM chunks, then audio chunks, then end.
+        assert "transcript" in kinds, kinds
+        assert "chunk" in kinds, kinds          # FakeOllama emits the assistant text
+        assert "audio_chunk_b64" in kinds, kinds
+        assert any(e.get("end") for e in evts), evts
+        # The transcript reached FakeOllama as the user message verbatim.
+        ollama_call = next(
+            p["payload"] for p in fake_ollama.captured if p["path"] == "/api/chat"
+        )
+        last_user = next(m for m in reversed(ollama_call["messages"]) if m["role"] == "user")
+        assert last_user["content"] == "hello world"
+        # And the turn was persisted on the conv.
+        got = client.get(f"/api/conversations/{c['id']}").json()
+        roles = [m["role"] for m in got["messages"]]
+        assert roles == ["user", "assistant"], roles
+        assert got["messages"][0]["content"] == "hello world"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{vbid}")
+
+
+@test("voice endpoints: 404 when no voice backend is configured")
+def _():
+    # No voice backend in the DB. Endpoints must surface a clear 404 rather
+    # than blowing up trying to call a phantom backend.
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "no-voice-backend", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        r = client.post(
+            f"/api/conversations/{c['id']}/voice/transcribe",
+            files={"audio": ("x.wav", b"\x00", "audio/wav")},
+        )
+        assert r.status_code == 404
+        assert "Settings" in r.json()["detail"], r.json()
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("voice backend: conversations.voice_settings column round-trips through GET")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "voice-prefs", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        got = client.get(f"/api/conversations/{c['id']}").json()
+        # New conv has empty voice_settings — JSON-decoded by row_to_dict.
+        assert "voice_settings" in got
+        assert got["voice_settings"] == {}, got["voice_settings"]
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
 
 
 @test("/api/models: aggregated shape + legacy back-compat keys")

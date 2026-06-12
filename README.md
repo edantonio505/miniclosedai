@@ -26,7 +26,7 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 3. [Install](#install) · [One-line install](#quickest--one-line-install-macos-linux-wsl) · [Docker quick start (with baked models)](#docker-quick-start-with-baked-models)
 4. [Run](#run)
 5. [Your first bot — 60 seconds](#your-first-bot--60-seconds)
-6. [UI guide](#ui-guide) · [Sidebar panels — Knowledge / Extensions / Evals](#sidebar) · [Apps + per-app SDK (TypeScript / JavaScript / Python)](#apps-page-grouping-bots--generate-a-per-app-sdk)
+6. [UI guide](#ui-guide) · [Sidebar panels — Knowledge / Extensions / Evals](#sidebar) · [Apps + per-app SDK (TypeScript / JavaScript / Python)](#apps-page-grouping-bots--generate-a-per-app-sdk) · [Voice — push-to-talk](#voice--push-to-talk-in-the-chat-composer)
 7. [Connecting LM Studio and other OpenAI-compatible endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)
 8. [Generating system prompts](#generating-system-prompts)
 9. [The microservice pattern](#the-microservice-pattern)
@@ -429,6 +429,47 @@ What each language gives you:
 - The server URL is **baked at generation time**. Override it via the `MINICLOSEDAI_BASE_URL` env var, or per call with `baseUrl` (TS/JS) / `base_url=` (Python), if your consuming app runs somewhere that can't reach the original host.
 - Bot ids are **pinned in the generated files** — recreate a bot and its id changes; regenerate the SDK after structural changes.
 - There's **no auth on the API** and CORS is wide open (`allow_origins=["*"]`). Fine for LAN / your own infra; put a reverse proxy + auth in front before exposing port `8095` to the public internet.
+
+### Voice — push-to-talk in the chat composer
+
+MiniClosedAI's chat composer can show a **🎤 push-to-talk button**, fed by a separate **voice service** (open-source ASR + TTS in a Docker container). The voice service connects to MiniClosedAI exactly like Ollama or LM Studio: you paste its URL into **Settings → LLM Endpoints → + Add endpoint**, pick **Voice (ASR + TTS)** as the kind, and the mic button appears.
+
+The voice service lives in `miniclosedai-voice/` — a single FastAPI app wrapping **faster-whisper** (ASR) and **Piper** (TTS), packaged as one Docker image you run yourself.
+
+**One image, two deployments:**
+
+```bash
+# Local laptop (CPU is fine for the v1 'small' whisper + Piper voices)
+docker run --rm -p 8090:8090 \
+    -v voice_models:/root/.cache/huggingface \
+    -v voice_pipers:/voices \
+    miniclosedai-voice:latest
+
+# RunPod / any NVIDIA GPU host
+docker run --rm --gpus all -p 8090:8090 \
+    -e VOICE_ASR_MODEL=large-v3 -e VOICE_DEVICE=cuda \
+    -v voice_models:/root/.cache/huggingface \
+    -v voice_pipers:/voices \
+    miniclosedai-voice:latest
+```
+
+Then in MiniClosedAI: Settings → LLM Endpoints → **+ Add endpoint** → kind **Voice (ASR + TTS)** → paste the URL (`http://localhost:8090` locally, or your RunPod proxy URL like `https://<pod-id>-8090.proxy.runpod.net`) → Test → Save. The mic button on the chat composer lights up once a voice backend is enabled.
+
+**Voices in v1**: 4 English (Amy/Ryan/Alan/Jenny) and 4 Spanish (Dave/Sharvard/Claude/Ald) — Piper's MIT-licensed voices, sample rates 16–22 kHz. Add more by appending to `tts.py`'s `VOICE_CATALOG`; [the gallery](https://rhasspy.github.io/piper-samples/) lists 40+ EN and 10+ ES voices.
+
+**How a turn flows:**
+
+1. Hold the 🎤 button → `MediaRecorder` captures audio (browser default codec — WebM/Opus on Chrome, OGG/Opus on Firefox, MP4 on Safari).
+2. Release → the blob POSTs to `/api/conversations/{id}/voice/turn`.
+3. MiniClosedAI calls the voice service's `/transcribe` (ASR), runs the bot's normal chat path (RAG + relay-route + persistence intact), then calls `/speak/stream` for the reply.
+4. One merged SSE stream comes back: `{transcript}` (the ASR text appears as a user message), `{chunk}` × N (assistant text streams in), `{audio_chunk_b64}` × M (base64 PCM-16 plays seamlessly via Web Audio).
+
+**Caveats:**
+- No auth on the API by default; set `VOICE_API_KEY=…` on the voice container and use it as the backend's API key field if you expose it to the public internet.
+- Push-to-talk only in v1. Continuous-listen / wake-word voice mode is a follow-up that fits the same SSE backbone.
+- Per-bot voice + language selection isn't in the sidebar yet — the voice service defaults to the first English voice for every bot in v1. The plumbing (`conversations.voice_settings` JSON column + `voice_backend_id`/`voice_id`/`language` schema) is already in place for v2.
+
+See [`miniclosedai-voice/README.md`](./miniclosedai-voice/README.md) for the full API, the env-var matrix, and how to add more Piper voices.
 
 ### Chat view — topbar
 

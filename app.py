@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,6 +33,7 @@ import pypdf
 import db
 import evals
 import knowledge
+import voice
 import llm
 import logs as chat_logs
 import mcp_host
@@ -228,7 +229,10 @@ class ConversationChatRequest(BaseModel):
 
 class BackendCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=80)
-    kind: Literal["ollama", "openai"]
+    # 'voice' is a dockerized ASR + TTS service registered via Settings → Add
+    # endpoint, same flow as Ollama / OpenAI-compat. See voice.py + the new
+    # voice-branch in /status, /test, /models.
+    kind: Literal["ollama", "openai", "voice"]
     base_url: str = Field(..., min_length=1)
     api_key: str | None = None
     headers: dict[str, str] = {}
@@ -556,15 +560,21 @@ async def api_backend_test(data: BackendTestRequest):
     try:
         models = await llm.list_models(probe)
     except Exception as e:
-        return {"running": True, "models_count": 0, "message": f"Reachable but /models failed: {e}"}
+        unit = "voices catalog" if probe["kind"] == "voice" else "/models"
+        return {"running": True, "models_count": 0, "message": f"Reachable but {unit} failed: {e}"}
     count = len(models)
+    # Voice backends serve voices, not LLM models — the reshape into the
+    # Ollama-style list is internal plumbing; the human-facing label should
+    # match the user's mental model.
+    unit = "voice" if probe["kind"] == "voice" else "model"
     if count == 0:
-        return {
-            "running": True,
-            "models_count": 0,
-            "message": f"Reachable, but 0 models available. (If this is LM Studio, is a model loaded? Also confirm the URL ends with '/v1'.)",
-        }
-    return {"running": True, "models_count": count, "message": f"Reachable · {count} model(s)"}
+        if probe["kind"] == "voice":
+            empty = "Reachable, but the voices catalog is empty. (Add voices to tts.py's VOICE_CATALOG.)"
+        else:
+            empty = ("Reachable, but 0 models available. "
+                     "(If this is LM Studio, is a model loaded? Also confirm the URL ends with '/v1'.)")
+        return {"running": True, "models_count": 0, "message": empty}
+    return {"running": True, "models_count": count, "message": f"Reachable · {count} {unit}(s)"}
 
 
 @app.get("/api/backends/{backend_id}/models")
@@ -2818,6 +2828,253 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# =====================================================================
+# Voice (per-conversation) — push-to-talk pipeline
+# =====================================================================
+#
+# Three endpoints, all scoped to a conversation so each bot can have its own
+# voice + language prefs (stored in conversations.voice_settings) and so the
+# turn is persisted exactly like a normal chat turn:
+#
+#   POST /voice/transcribe — multipart audio → JSON {text, language}
+#   POST /voice/speak      — JSON {text} → SSE audio chunks
+#   POST /voice/turn       — multipart audio → SSE merging {transcript},
+#                            {chunk} × N (assistant tokens), {audio_chunk_b64}
+#                            × M, {end}; the user + assistant messages persist
+#                            to the conv just like /chat/stream with persist=True.
+#
+# The voice backend is resolved per-conv via voice_settings.voice_backend_id,
+# falling back to the first enabled kind='voice' row in `backends`. Users
+# register that backend through Settings → Add endpoint (kind=Voice); there's
+# no built-in or env-var seeding — the voice service is an independent box
+# the user manages on their own (locally or on RunPod).
+
+class VoiceSpeakRequest(BaseModel):
+    """Body for POST /voice/speak."""
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(..., min_length=1, max_length=4000)
+    voice: str | None = None
+    language: str | None = None
+    speed: float | None = Field(None, ge=0.5, le=2.0)
+
+
+def _load_conv_for_voice(conv_id: int) -> dict:
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conv_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Conversation not found")
+    return db.row_to_dict(row)
+
+
+def _resolve_voice_backend(conv: dict) -> dict:
+    """Return the voice backend for this conv, or 404 if none is configured."""
+    settings = conv.get("voice_settings") or {}
+    explicit_id = settings.get("voice_backend_id")
+    if explicit_id is not None:
+        b = _load_backend(explicit_id)
+        if b.get("kind") != "voice":
+            raise HTTPException(
+                400, f"Backend #{explicit_id} is not a voice backend (kind={b.get('kind')!r}).",
+            )
+        if not b.get("enabled"):
+            raise HTTPException(400, f"Voice backend #{explicit_id} is disabled.")
+        return b
+    # Fallback: first enabled voice backend.
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM backends WHERE kind = 'voice' AND enabled = 1 ORDER BY id LIMIT 1"
+        ).fetchone()
+    if not row:
+        raise HTTPException(
+            404,
+            "No voice backend configured. In Settings → LLM Endpoints, click "
+            "'+ Add endpoint' and choose 'Voice (ASR + TTS)' with the URL of "
+            "your running voice service (e.g. http://localhost:8090).",
+        )
+    return db.row_to_dict(row)
+
+
+async def _resolve_voice_choice(
+    conv: dict,
+    backend: dict,
+    override_voice: str | None = None,
+    override_lang: str | None = None,
+) -> tuple[str, str]:
+    """(voice_id, language) — explicit override > conv voice_settings > first
+    English voice from the backend > first available voice."""
+    s = conv.get("voice_settings") or {}
+    voice_id = override_voice or s.get("voice_id")
+    language = override_lang or s.get("language")
+    if voice_id and language:
+        return voice_id, language
+    try:
+        cat = await voice.list_voices(backend)
+    except Exception as e:
+        raise HTTPException(502, f"Could not query voices catalog: {e}")
+    if not isinstance(cat, dict):
+        raise HTTPException(502, "Voice backend returned a malformed /voices catalog.")
+    # English first, then any other language with voices.
+    for lang in ("en", *sorted(k for k in cat.keys() if k != "en")):
+        voices_list = cat.get(lang) or []
+        if voices_list and isinstance(voices_list[0], dict):
+            vid = voices_list[0].get("id")
+            if vid:
+                return vid, lang
+    raise HTTPException(503, "Voice backend has no voices available.")
+
+
+@app.post("/api/conversations/{conv_id}/voice/transcribe")
+async def api_conv_voice_transcribe(
+    conv_id: int,
+    audio: UploadFile = File(...),
+    language: str | None = Form(None),
+):
+    """Proxy: audio in → text out. Uses the conv's voice backend."""
+    conv = _load_conv_for_voice(conv_id)
+    backend = _resolve_voice_backend(conv)
+    audio_bytes = await audio.read()
+    try:
+        return await voice.transcribe(
+            backend, audio_bytes,
+            filename=audio.filename or "audio.wav",
+            content_type=audio.content_type or "audio/wav",
+            language=language,
+        )
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Voice backend /transcribe failed: {e}")
+
+
+@app.post("/api/conversations/{conv_id}/voice/speak")
+async def api_conv_voice_speak(conv_id: int, req: VoiceSpeakRequest):
+    """Proxy: text in → SSE audio chunks out. Uses the conv's voice + language
+    (req fields override the saved voice_settings)."""
+    conv = _load_conv_for_voice(conv_id)
+    backend = _resolve_voice_backend(conv)
+    voice_id, language = await _resolve_voice_choice(
+        conv, backend, override_voice=req.voice, override_lang=req.language,
+    )
+
+    async def gen():
+        try:
+            async for ev in voice.speak_stream(
+                backend, req.text, voice_id, language, speed=req.speed,
+            ):
+                yield f"data: {json.dumps(ev)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/conversations/{conv_id}/voice/turn")
+async def api_conv_voice_turn(
+    conv_id: int,
+    audio: UploadFile = File(...),
+    language: str | None = Form(None),
+):
+    """The push-to-talk turn: ASR → bot reply → TTS, merged into one SSE.
+
+    Emits, in order:
+      data: {transcript: "<text>", asr_language: "en"}
+      data: {chunk: "<assistant token>"}           × N
+      data: {audio_chunk_b64: "...", sample_rate: 22050}   × M
+      data: {end: true}
+
+    Persists the (user, assistant) pair to the conv exactly like
+    `/chat/stream` with `persist=true`. Errors at any stage are surfaced as a
+    `{error: "..."}` event before the `{end}`.
+    """
+    conv = _load_conv_for_voice(conv_id)
+    voice_backend = _resolve_voice_backend(conv)
+    audio_bytes = await audio.read()
+    audio_name = audio.filename or "audio.wav"
+    audio_ct = audio.content_type or "audio/wav"
+
+    async def gen():
+        # 1. ASR
+        try:
+            asr = await voice.transcribe(
+                voice_backend, audio_bytes,
+                filename=audio_name, content_type=audio_ct, language=language,
+            )
+        except Exception as e:
+            yield f"data: {json.dumps({'error': f'ASR failed: {e}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+        transcript = (asr.get("text") or "").strip()
+        yield f"data: {json.dumps({'transcript': transcript, 'asr_language': asr.get('language')})}\n\n"
+        if not transcript:
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        # 2. LLM — reuse the same path /chat/stream uses, so RAG + relay-route
+        #    still work, and the messages list is identical.
+        try:
+            chat_req = ConversationChatRequest(
+                message=transcript, include_history=True, persist=False,
+            )
+            _, messages, eff, llm_backend = _resolve_conversation_chat(conv_id, chat_req)
+            await _augment_messages_with_knowledge(conv_id, messages, transcript, llm_backend)
+            llm_backend = await _maybe_override_to_relay(llm_backend, eff["model"])
+        except HTTPException as e:
+            yield f"data: {json.dumps({'error': f'LLM setup: {e.detail}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        collected: list[str] = []
+        try:
+            async for ev in llm.chat_stream(
+                llm_backend, eff["model"], messages,
+                temperature=eff["temperature"], max_tokens=eff["max_tokens"],
+                top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
+            ):
+                if "content" in ev:
+                    collected.append(ev["content"])
+                    yield f"data: {json.dumps({'chunk': ev['content']})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': f'LLM stream: {e}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        reply = "".join(collected).strip()
+        # Persist the turn (best-effort — UI surfaces the audio playback even
+        # if the DB write hits a transient error).
+        try:
+            user_msg = {"role": "user", "content": transcript}
+            _persist_conv_chat_turn(conv_id, [user_msg], reply, eff, llm_backend)
+        except Exception:
+            pass
+        if not reply:
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        # 3. TTS
+        try:
+            voice_id, lang = await _resolve_voice_choice(conv, voice_backend)
+        except HTTPException as e:
+            yield f"data: {json.dumps({'error': f'voice choice: {e.detail}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+        try:
+            async for ev in voice.speak_stream(voice_backend, reply, voice_id, lang):
+                if "chunk_b64" in ev:
+                    yield f"data: {json.dumps({'audio_chunk_b64': ev['chunk_b64'], 'sample_rate': ev.get('sample_rate')})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': f'TTS: {e}'})}\n\n"
+
+        yield f"data: {json.dumps({'end': True})}\n\n"
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 

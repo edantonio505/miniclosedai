@@ -26,8 +26,9 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 3. [Running](#running)
 4. [Docker deployment](#docker-deployment)
 5. [UI features](#ui-features)
-6. [Apps + per-app SDK generation (TypeScript / JavaScript / Python)](#apps-groups-of-bots-and-per-app-sdk-generation)
-7. [Knowledge base (RAG)](#knowledge-base-rag)
+6. [Voice — push-to-talk (Dockerized ASR + TTS service)](#voice-push-to-talk-via-a-separate-dockerized-asr--tts-service)
+7. [Apps + per-app SDK generation (TypeScript / JavaScript / Python)](#apps-groups-of-bots-and-per-app-sdk-generation)
+8. [Knowledge base (RAG)](#knowledge-base-rag)
 7. [Extensibility — MCP plugins](#extensibility--mcp-plugins)
 8. [Evaluation & auto-improve](#evaluation--auto-improve-scoring)
 9. [Worked example — connecting Bonsai (1-bit 8B)](#worked-example--connecting-bonsai-1-bit-8b)
@@ -427,6 +428,92 @@ Vertical-nav button (terminal icon, between Bots and Settings in the activity ba
 <p align="center">
   <img src="docs/images/logs_page.png" alt="Logs page — per-call request/response viewer" width="800"><br><em>Logs page</em>
 </p>
+
+---
+
+## Voice (push-to-talk via a separate Dockerized ASR + TTS service)
+
+A self-hosted voice surface for any bot: hold the 🎤 on the chat composer, talk, release; the transcript appears as the user turn, the assistant reply streams in **and speaks back**, all in one round trip. The audio plumbing is intentionally split between **two containers** so MiniClosedAI doesn't carry GPU-heavy model dependencies and so the voice service is interchangeable between local (CPU) and remote (RunPod GPU) without touching MiniClosedAI's code.
+
+### Architecture
+
+```
+Browser                       MiniClosedAI                 Voice Docker             Ollama / LLM
+─────────                     ─────────────                 ────────────             ────────────
+🎤 hold
+  ↓ MediaRecorder (WebM/Opus)
+  ↓ POST multipart
+  ───────────────────────►   /api/conversations/{id}/voice/turn
+                               │  (1) /transcribe ─────►    faster-whisper → text
+                               │  (2) chat path ──────────────────────────────►   bot reply (streamed)
+                               │  (3) /speak/stream ───►    Piper → SSE PCM chunks
+                               ◄──────────────────────────
+  ◄── SSE: {transcript}, {chunk} × N, {audio_chunk_b64} × M, {end} ──
+  Web Audio playback queue
+```
+
+### Voice service — `miniclosedai-voice/`
+
+A standalone FastAPI app (one folder, one Docker image). MIT-licensed open-source stack:
+
+| Layer | Library | Notes |
+|---|---|---|
+| ASR | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | CTranslate2 Whisper. Multilingual. fp16 on GPU, int8 on CPU. `VOICE_ASR_MODEL` picks `tiny`/`base`/`small`/`medium`/`large-v3`. |
+| TTS | [Piper](https://github.com/rhasspy/piper) | ONNX runtime. v1 ships 4 EN + 4 ES voices; auto-downloads from `rhasspy/piper-voices` on Hugging Face on first use. |
+| HTTP | FastAPI + uvicorn | Single worker (GPU is serialized). CORS open. Optional `VOICE_API_KEY` Bearer auth. |
+
+The five-endpoint contract (`miniclosedai-voice/server.py`):
+
+```
+GET  /health         — {ok, asr_model, tts_model, device, voices_loaded}
+GET  /voices         — {"en": [{id,name,gender}, ...], "es": [...]}
+POST /transcribe     — multipart audio (+optional language) → {text, language, segments}
+POST /speak          — JSON {text, voice, language, speed?} → audio/wav body
+POST /speak/stream   — same body → SSE: {chunk_b64, sample_rate} × N, then {done:true}
+```
+
+### MiniClosedAI side
+
+**Backend integration** (`db.py`, `app.py`, `voice.py`):
+
+- The `backends.kind` CHECK now accepts `'voice'` (idempotent recreate-table migration in `db.py:_migrate_backends_kind_to_include_voice`). All existing backend lifecycle endpoints (`/api/backends`, `/status`, `/test`, `/models`) dispatch to voice via a new branch in `llm._IMPLS["voice"]`; `/models` returns the voices catalog reshaped to the Ollama-style `[{name, size, details}]` list the frontend already parses.
+- `voice.py` (new module) provides the four async httpx wrappers — `health`, `list_voices`, `transcribe`, `speak_stream` — same style as `llm._ollama_*` / `llm._openai_*`.
+- New per-conversation endpoints (`app.py`):
+  - `POST /api/conversations/{id}/voice/transcribe` — multipart audio → JSON transcript.
+  - `POST /api/conversations/{id}/voice/speak` — JSON `{text}` → SSE audio chunks.
+  - `POST /api/conversations/{id}/voice/turn` — multipart audio → one merged SSE: ASR transcript, chat reply (text), TTS audio. Reuses `_resolve_conversation_chat`, `_augment_messages_with_knowledge`, `_maybe_override_to_relay`, and `_persist_conv_chat_turn` so RAG, relay-routing, and conversation persistence all behave identically to a normal `/chat/stream` turn.
+- Per-conversation `voice_settings` JSON column (`{voice_backend_id?, voice_id?, language?, autoplay?}`) — the resolver picks the explicit backend id, else the first enabled voice backend; the voice/language resolve from `voice_settings` else the backend's first English voice.
+
+**Frontend** (`static/app.js`, `index.html`, `style.css`):
+
+- `<option value="voice">Voice (ASR + TTS)</option>` joins the `#backend-kind` dropdown; the URL hint mentions the voice URL.
+- `#mic-btn` on the composer is hidden by default; `_refreshMicAffordance()` unhides it when `backendCache` contains any enabled `kind='voice'` backend.
+- Press-and-hold or click-toggle: `_startRecording()` → `navigator.mediaDevices.getUserMedia({audio:true})` + `MediaRecorder`; on release `_stopRecordingAndSend()` posts the blob to `/voice/turn`.
+- `_consumeVoiceTurn()` reads the merged SSE: `transcript` renders a user bubble + opens an assistant bubble, `chunk` streams text into it, `audio_chunk_b64` decodes (atob → Int16 → Float32) and `_enqueueAudioChunk()` schedules it on a sliding `AudioContext.currentTime` cursor for gapless playback.
+- CSS pulse animation on `#mic-btn.recording`; `.busy` while the turn is in flight.
+
+### Deploying the voice service
+
+The image is identical between local and RunPod; only the URL you paste into Settings differs.
+
+```bash
+# Local CPU (default)
+docker run --rm -p 8090:8090 \
+    -v voice_models:/root/.cache/huggingface -v voice_pipers:/voices \
+    miniclosedai-voice:latest
+
+# GPU
+docker run --rm --gpus all -p 8090:8090 \
+    -e VOICE_ASR_MODEL=large-v3 -e VOICE_DEVICE=cuda \
+    -v voice_models:/root/.cache/huggingface -v voice_pipers:/voices \
+    miniclosedai-voice:latest
+```
+
+Then in MiniClosedAI: **Settings → LLM Endpoints → + Add endpoint** → kind `Voice (ASR + TTS)` → paste URL → **Test** → Save.
+
+### Testing
+
+`test_e2e.py` ships a `FakeVoice` (mirrors `FakeOllama` / `FakeOpenAI`) serving canned `/health`, `/voices`, `/transcribe`, and `/speak/stream`. Nine voice-related tests cover: `kind='voice'` CRUD round-trip; `/status` reachable/unreachable; `/models` reshape into `<lang>/<voice_id>` entries; `/test` draft probe; `voice_settings` column round-trip; `/voice/transcribe` proxy; `/voice/speak` SSE + default-voice resolution; `/voice/turn` full ASR→Ollama→TTS chain with persistence; 404 when no voice backend is configured. Run via `.venv/bin/python test_e2e.py`.
 
 ---
 
