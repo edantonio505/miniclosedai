@@ -51,6 +51,11 @@ services:
     # 127.0.0.1 prefix = loopback only. Remove it to expose on LAN (no auth!).
     ports:
       - "127.0.0.1:8095:8095"
+    # Lets the container reach services on the host (e.g. a host-installed
+    # Ollama) via http://host.docker.internal:<port>. Requires the host
+    # service to listen on more than 127.0.0.1 (for Ollama: OLLAMA_HOST=0.0.0.0).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/', timeout=2)\" || exit 1"]
       interval: 30s

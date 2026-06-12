@@ -25,7 +25,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Application code — explicit COPY instead of `COPY . .` so new files don't
 # accidentally land in the image. .dockerignore is defense-in-depth.
-COPY app.py db.py llm.py ./
+COPY app.py db.py evals.py knowledge.py llm.py logs.py mcp_host.py ./
 COPY static/ ./static/
 
 # Build-time SHA so Docker installs (which don't ship .git inside the image)
