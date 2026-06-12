@@ -527,6 +527,32 @@
     </div>
   </div>
 
+  <!-- Generic in-app prompt / confirm dialog. Replaces native prompt()/confirm(),
+       which browsers silently suppress after the user ticks "prevent additional
+       dialogs" — that made New bot / delete appear to do nothing. -->
+  <div id="ui-dialog-backdrop" class="modal-backdrop hidden">
+    <div class="modal ui-dialog">
+      <div class="modal-header">
+        <h3 id="ui-dialog-title">Dialog</h3>
+        <button id="ui-dialog-close" class="icon-btn" data-tooltip="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="backend-form">
+        <p id="ui-dialog-message" class="form-hint" style="margin:0;"></p>
+        <label class="form-field" id="ui-dialog-input-field">
+          <span id="ui-dialog-input-label">Name</span>
+          <input type="text" id="ui-dialog-input" maxlength="200" />
+        </label>
+        <div class="modal-actions">
+          <div style="flex:1"></div>
+          <button type="button" id="ui-dialog-cancel" class="btn btn-small">Cancel</button>
+          <button type="button" id="ui-dialog-ok" class="btn btn-primary btn-small">OK</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Manage Knowledge Modal — opened by a bot card's 📚 action -->
   <div id="kb-modal-backdrop" class="modal-backdrop hidden">
     <div class="modal">
