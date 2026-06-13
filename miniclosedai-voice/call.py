@@ -181,7 +181,12 @@ class BotCallHandler:
             ) as client:
                 async with client.stream(
                     "POST", url,
-                    json={"message": text, "persist": True, "include_history": True, "voice_mode": True},
+                    # persist=False is the big call-mode latency win — the persist=True
+                    # path in MiniClosedAI launches a background task and the SSE polls
+                    # its buffer, which adds ~1.7s to TTFT. A call is ephemeral; we don't
+                    # need the resilient-to-refresh behavior. include_history=True still
+                    # loads prior persisted turns so the bot has cross-session memory.
+                    json={"message": text, "persist": False, "include_history": True, "voice_mode": True},
                     headers={"Accept": "text/event-stream"},
                 ) as resp:
                     if resp.status_code >= 400:
