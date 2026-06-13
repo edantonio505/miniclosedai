@@ -105,6 +105,76 @@ async def transcribe(
         return r.json()
 
 
+# ---------- Call mode signaling proxy ---------------------------------------
+#
+# Browser ↔ MiniClosedAI is HTTPS (so the mic API is available); but the voice
+# container runs on plain HTTP. Browsers block cross-origin HTTPS→HTTP fetches
+# (mixed content), so MiniClosedAI proxies the three signaling endpoints so
+# the browser only talks to one origin.
+#
+# The actual WebRTC audio (RTP/UDP) does NOT go through this proxy — once the
+# SDP exchange + ICE happens, the browser and the voice container have each
+# other's ICE candidates and the media flows direct peer-to-peer. So only the
+# small JSON/SSE traffic is proxied.
+
+
+async def call_configure(backend: dict, payload: dict) -> dict:
+    """POST /call/configure on the voice backend; return the JSON response."""
+    url = f"{_base_url(backend)}/call/configure"
+    async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
+        r = await client.post(url, json=payload, headers=_headers(backend))
+        r.raise_for_status()
+        return r.json()
+
+
+async def call_offer(backend: dict, payload: dict) -> dict:
+    """POST /webrtc/offer (FastRTC's signaling endpoint) and return the SDP
+    answer JSON. The actual media stream is negotiated via ICE candidates
+    inside this SDP — once exchanged, audio flows direct browser↔voice, NOT
+    through MiniClosedAI."""
+    url = f"{_base_url(backend)}/webrtc/offer"
+    async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
+        r = await client.post(url, json=payload, headers=_headers(backend))
+        if r.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"voice /webrtc/offer -> HTTP {r.status_code}: "
+                f"{r.text[:200]}",
+                request=r.request, response=r,
+            )
+        return r.json()
+
+
+async def call_events(backend: dict, webrtc_id: str) -> AsyncIterator[dict]:
+    """Stream the voice service's /call/events/{webrtc_id} SSE. Yields each
+    parsed event dict (the per-stage status / transcript / chunk / end / error
+    messages the call handler emits via AdditionalOutputs)."""
+    url = f"{_base_url(backend)}/call/events/{webrtc_id}"
+    async with httpx.AsyncClient(timeout=_TURN_TIMEOUT) as client:
+        async with client.stream(
+            "GET", url,
+            headers={**_headers(backend), "Accept": "text/event-stream"},
+        ) as resp:
+            if resp.status_code >= 400:
+                detail = (await resp.aread()).decode(errors="replace")[:300]
+                raise httpx.HTTPStatusError(
+                    f"voice /call/events -> HTTP {resp.status_code}: {detail}",
+                    request=resp.request, response=resp,
+                )
+            buf = ""
+            async for chunk in resp.aiter_text():
+                buf += chunk
+                parts = buf.split("\n\n")
+                buf = parts.pop()
+                for part in parts:
+                    line = part.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        yield json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        continue
+
+
 async def speak_stream(
     backend: dict,
     text: str,

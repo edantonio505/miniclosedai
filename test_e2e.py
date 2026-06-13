@@ -371,6 +371,10 @@ def test(name: str):
             t0 = time.perf_counter()
             try:
                 fn()
+            except _SkipTest as e:
+                _RESULTS.append((name, "skip", str(e) or "skipped"))
+                print(f"  ⊘ {name}  (skipped: {e or 'no reason'})  ({time.perf_counter()-t0:.2f}s)")
+                return
             except AssertionError as e:
                 _RESULTS.append((name, False, f"AssertionError: {e}"))
                 print(f"  ✗ {name}  ({time.perf_counter()-t0:.2f}s)")
@@ -387,6 +391,16 @@ def test(name: str):
         _TESTS.append((name, runner))
         return runner
     return deco
+
+
+class _SkipTest(Exception):
+    """Raised by a test to mark itself skipped (e.g. when a live service is
+    unavailable). The test runner catches this separately from real failures."""
+
+
+def skip(reason: str = "") -> None:
+    """Inside a test body, abort and mark the test skipped with `reason`."""
+    raise _SkipTest(reason)
 
 
 # ------------------------------------------------------------------
@@ -444,6 +458,42 @@ def _add_voice_backend() -> int:
     })
     assert r.status_code == 200, r.text
     return r.json()["id"]
+
+
+# Probe for a real, running miniclosedai-voice Docker service. When present,
+# the "voice integration:" tests below run end-to-end against it; when absent,
+# they skip cleanly so CI / a fresh clone without the voice service still goes
+# 100% green. Override with `MINICLOSEDAI_VOICE_URL=…` to point at a remote.
+_VOICE_URL_PROBED: tuple[str, ...] | None = None  # cached after first call
+
+
+def _probe_real_voice_service() -> str | None:
+    """Return the URL of a reachable voice service (with kind='voice' contract),
+    or None if no service responds. Caches the result for the suite lifetime."""
+    global _VOICE_URL_PROBED
+    if _VOICE_URL_PROBED is not None:
+        return _VOICE_URL_PROBED[0] if _VOICE_URL_PROBED else None
+    candidates = [
+        os.environ.get("MINICLOSEDAI_VOICE_URL"),
+        "http://127.0.0.1:8090",
+        "http://localhost:8090",
+    ]
+    import urllib.request, urllib.error
+    for url in candidates:
+        if not url:
+            continue
+        url = url.rstrip("/")
+        try:
+            with urllib.request.urlopen(f"{url}/health", timeout=2) as r:
+                if r.status == 200:
+                    body = json.loads(r.read().decode())
+                    if body.get("ok") is True and body.get("tts_model"):
+                        _VOICE_URL_PROBED = (url,)
+                        return url
+        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            continue
+    _VOICE_URL_PROBED = ()
+    return None
 
 
 # ==================================================================
@@ -814,6 +864,21 @@ def _():
         client.delete(f"/api/backends/{vbid}")
 
 
+@test("call mode: composer ships a #call-btn + app.js carries the WebRTC module")
+def _():
+    # The 📞 button is HTML markup; the JS module wires getUserMedia + RTCPeerConnection
+    # + DataChannel handling. Both must be present in the served assets.
+    html = client.get("/static/index.html").text
+    assert 'id="call-btn"' in html, "call-btn missing from index.html"
+    assert "Call the bot" in html, "call-btn aria-label / tooltip missing"
+    js = client.get("/static/app.js").text
+    assert "_refreshCallAffordance" in js, "call affordance gate missing"
+    assert "_startCall" in js and "_endCall" in js, "call lifecycle helpers missing"
+    assert "RTCPeerConnection" in js, "WebRTC peer connection setup missing"
+    assert "EventSource" in js, "SSE consumer for transcript/chunk events missing"
+    assert "initCallButton" in js, "initCallButton hook missing"
+
+
 @test("voice endpoints: 404 when no voice backend is configured")
 def _():
     # No voice backend in the DB. Endpoints must surface a clear 404 rather
@@ -831,6 +896,86 @@ def _():
         assert "Settings" in r.json()["detail"], r.json()
     finally:
         client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("voice integration: /voice/speak streams real audio from the live voice service")
+def _():
+    # Live integration — runs only when miniclosedai-voice is reachable.
+    # Validates that MiniClosedAI's /voice/speak proxy actually drives Piper
+    # end-to-end (the FakeVoice tests only check the proxy contract).
+    voice_url = _probe_real_voice_service()
+    if not voice_url:
+        skip("no voice service reachable (start miniclosedai-voice container)")
+    bid = client.post("/api/backends", json={
+        "name": "live-voice", "kind": "voice", "base_url": voice_url,
+    }).json()["id"]
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "speak-live", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        with client.stream("POST", f"/api/conversations/{c['id']}/voice/speak",
+                           json={"text": "Hello from the integration suite.",
+                                 "voice": "en_US-amy-medium", "language": "en"}) as r:
+            body = b"".join(r.iter_bytes())
+        evts = sse_events(body)
+        chunks = [e for e in evts if "chunk_b64" in e]
+        assert chunks, f"no audio chunks: {evts[:3]}"
+        assert any(e.get("done") for e in evts), f"no terminal done event: {evts}"
+        # Each chunk is base64-encoded int16 PCM at the sample_rate advertised.
+        first = chunks[0]
+        assert first.get("sample_rate", 0) > 0
+        raw = base64.b64decode(first["chunk_b64"])
+        assert len(raw) >= 320, f"first chunk too small ({len(raw)} bytes)"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("voice integration: /voice/transcribe round-trips real TTS through real ASR")
+def _():
+    # Synthesize speech via /speak, hand the WAV back to /voice/transcribe,
+    # and verify the round-trip recovers recognizable text. Skips when the
+    # voice service isn't running.
+    voice_url = _probe_real_voice_service()
+    if not voice_url:
+        skip("no voice service reachable (start miniclosedai-voice container)")
+    import urllib.request
+    # 1. Synthesize "this is a test" directly on the voice server.
+    req = urllib.request.Request(
+        f"{voice_url}/speak",
+        data=json.dumps({"text": "This is a test of the voice integration.",
+                         "voice": "en_US-amy-medium", "language": "en"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        wav = r.read()
+    assert wav.startswith(b"RIFF"), f"expected WAV header, got {wav[:8]!r}"
+
+    # 2. Register the live backend + a conv, then transcribe via MiniClosedAI's proxy.
+    bid = client.post("/api/backends", json={
+        "name": "live-voice", "kind": "voice", "base_url": voice_url,
+    }).json()["id"]
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "transcribe-live", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        r = client.post(
+            f"/api/conversations/{c['id']}/voice/transcribe",
+            files={"audio": ("test.wav", wav, "audio/wav")},
+        )
+        assert r.status_code == 200, r.text
+        out = r.json()
+        text = (out.get("text") or "").lower()
+        # Whisper-small isn't perfect — accept partial match of distinctive words.
+        assert "test" in text or "voice" in text or "integration" in text, \
+            f"no recognizable word in transcript: {text!r}"
+        assert out.get("language"), out
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{bid}")
 
 
 @test("voice backend: conversations.voice_settings column round-trips through GET")
@@ -3943,16 +4088,23 @@ def main() -> int:
             fn()
 
     total = time.perf_counter() - t0
-    passed = sum(1 for _, ok, _ in _RESULTS if ok)
-    failed = len(_RESULTS) - passed
+    passed  = sum(1 for _, ok, _ in _RESULTS if ok is True)
+    skipped = sum(1 for _, ok, _ in _RESULTS if ok == "skip")
+    failed  = len(_RESULTS) - passed - skipped
     print(f"\n{'='*48}")
-    print(f"{passed}/{len(_RESULTS)} passed · {failed} failed · {total:.2f}s")
+    skip_str = f" · {skipped} skipped" if skipped else ""
+    print(f"{passed}/{len(_RESULTS)} passed · {failed} failed{skip_str} · {total:.2f}s")
     print('='*48)
     if failed:
         print("\nFailures:")
         for name, ok, msg in _RESULTS:
-            if not ok:
+            if ok is False:
                 print(f"  ✗ {name}  → {msg}")
+    if skipped:
+        print("\nSkipped:")
+        for name, ok, msg in _RESULTS:
+            if ok == "skip":
+                print(f"  ⊘ {name}  → {msg}")
 
     # Cleanup
     fake_ollama.stop()

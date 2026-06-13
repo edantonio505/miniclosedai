@@ -225,6 +225,11 @@ class ConversationChatRequest(BaseModel):
     # single-`message` form; the `messages=[…]` form must include any
     # multimodal content arrays in-line itself.
     attachments: list[AttachmentSpec] | None = None
+    # Hint that this turn is part of a live spoken conversation (📞 call mode).
+    # The server appends a short addendum to the system prompt asking the model
+    # to keep replies to 1-2 sentences so TTS starts speaking sooner and the
+    # user doesn't sit through a wall of audio.
+    voice_mode: bool = False
 
 
 class BackendCreate(BaseModel):
@@ -2402,7 +2407,14 @@ def _resolve_conversation_chat(
     # form, prepend the conversation's saved turns so conversational bots have
     # memory. Not applied when the caller already supplies `messages=[...]`,
     # since they're already in control of the history.
-    ollama_messages = [{"role": "system", "content": effective["system_prompt"]}]
+    system_prompt = effective["system_prompt"]
+    if req.voice_mode:
+        system_prompt = (
+            (system_prompt or "").rstrip()
+            + "\n\nYou are speaking aloud over a phone call. Reply in 1-2 short "
+            "sentences, no markdown, no lists, no code blocks."
+        )
+    ollama_messages = [{"role": "system", "content": system_prompt}]
     if req.include_history and req.message is not None:
         for m in (conv.get("messages") or []):
             role = m.get("role")
@@ -2862,6 +2874,17 @@ class VoiceSpeakRequest(BaseModel):
     speed: float | None = Field(None, ge=0.5, le=2.0)
 
 
+class VoiceSayRequest(BaseModel):
+    """Body for POST /voice/say. Caller already has the transcript (e.g. from
+    the browser's SpeechRecognition API while the user was holding the mic) so
+    we skip server-side Whisper entirely and go straight to LLM + TTS."""
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(..., min_length=1, max_length=8000)
+    # Optional override of the bot's saved voice/language for this one turn.
+    voice: str | None = None
+    language: str | None = None
+
+
 def _load_conv_for_voice(conv_id: int) -> dict:
     with db.get_conn() as conn:
         row = conn.execute(
@@ -3017,14 +3040,32 @@ async def api_conv_voice_turn(
             return
 
         # 2. LLM — reuse the same path /chat/stream uses, so RAG + relay-route
-        #    still work, and the messages list is identical.
+        #    still work, and the messages list is identical. The client renders
+        #    each {status} event as a "thinking" pill in the assistant bubble
+        #    so the user knows what's happening between transcript and reply.
         try:
             chat_req = ConversationChatRequest(
                 message=transcript, include_history=True, persist=False,
             )
             _, messages, eff, llm_backend = _resolve_conversation_chat(conv_id, chat_req)
+            # Tell the UI we're hitting the knowledge base BEFORE we start —
+            # the search itself can take 200ms-2s depending on chunk count +
+            # embed-backend latency. Skip the event when there's no KB so the
+            # status stays accurate.
+            has_kb = False
+            with db.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM kb_chunks WHERE conversation_id = ? LIMIT 1",
+                    (conv_id,),
+                ).fetchone()
+                has_kb = row is not None
+            if has_kb:
+                yield f"data: {json.dumps({'status': 'searching_knowledge'})}\n\n"
             await _augment_messages_with_knowledge(conv_id, messages, transcript, llm_backend)
             llm_backend = await _maybe_override_to_relay(llm_backend, eff["model"])
+            # Setup done — LLM call about to start. First-token latency depends
+            # on the model and whether it's warm; this status covers that gap.
+            yield f"data: {json.dumps({'status': 'thinking'})}\n\n"
         except HTTPException as e:
             yield f"data: {json.dumps({'error': f'LLM setup: {e.detail}'})}\n\n"
             yield f"data: {json.dumps({'end': True})}\n\n"
@@ -3072,6 +3113,230 @@ async def api_conv_voice_turn(
             yield f"data: {json.dumps({'error': f'TTS: {e}'})}\n\n"
 
         yield f"data: {json.dumps({'end': True})}\n\n"
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/conversations/{conv_id}/voice/say")
+async def api_conv_voice_say(conv_id: int, req: VoiceSayRequest):
+    """Push-to-talk fast path: caller already has the transcript (from the
+    browser's SpeechRecognition API). Skip server-side Whisper entirely; run
+    LLM + TTS and return the merged SSE just like /voice/turn.
+
+    Emits, in order:
+      data: {transcript: "<echo>"}                    # client already has it,
+                                                      # but echoing keeps the
+                                                      # event shape identical
+                                                      # to /voice/turn
+      data: {status: "searching_knowledge" | "thinking"}
+      data: {chunk: "<assistant token>"}              × N
+      data: {audio_chunk_b64: "...", sample_rate: …}  × M
+      data: {end: true}
+    """
+    conv = _load_conv_for_voice(conv_id)
+    voice_backend = _resolve_voice_backend(conv)
+    transcript = req.text.strip()
+    if not transcript:
+        raise HTTPException(400, "Empty text.")
+
+    async def gen():
+        # 1. Echo the transcript so the client SSE consumer can keep one
+        #    code path for both /voice/turn (server ASR) and /voice/say
+        #    (browser ASR).
+        yield f"data: {json.dumps({'transcript': transcript, 'asr_source': 'browser'})}\n\n"
+
+        # 2. LLM setup — same code path the normal chat /chat/stream uses, so
+        #    RAG + relay-route + history all work identically.
+        try:
+            chat_req = ConversationChatRequest(
+                message=transcript, include_history=True, persist=False,
+            )
+            _, messages, eff, llm_backend = _resolve_conversation_chat(conv_id, chat_req)
+            has_kb = False
+            with db.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM kb_chunks WHERE conversation_id = ? LIMIT 1",
+                    (conv_id,),
+                ).fetchone()
+                has_kb = row is not None
+            if has_kb:
+                yield f"data: {json.dumps({'status': 'searching_knowledge'})}\n\n"
+            await _augment_messages_with_knowledge(conv_id, messages, transcript, llm_backend)
+            llm_backend = await _maybe_override_to_relay(llm_backend, eff["model"])
+            yield f"data: {json.dumps({'status': 'thinking'})}\n\n"
+        except HTTPException as e:
+            yield f"data: {json.dumps({'error': f'LLM setup: {e.detail}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        # 3. Stream LLM reply.
+        collected: list[str] = []
+        try:
+            async for ev in llm.chat_stream(
+                llm_backend, eff["model"], messages,
+                temperature=eff["temperature"], max_tokens=eff["max_tokens"],
+                top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
+            ):
+                if "content" in ev:
+                    collected.append(ev["content"])
+                    yield f"data: {json.dumps({'chunk': ev['content']})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': f'LLM stream: {e}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        reply = "".join(collected).strip()
+        # Persist the (user, assistant) pair so refresh + history still work.
+        try:
+            user_msg = {"role": "user", "content": transcript}
+            _persist_conv_chat_turn(conv_id, [user_msg], reply, eff, llm_backend)
+        except Exception:
+            pass
+        if not reply:
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        # 4. TTS — same voice resolution as /voice/turn. The req can override
+        #    the bot's saved prefs for this one turn.
+        try:
+            voice_id, lang = await _resolve_voice_choice(
+                conv, voice_backend,
+                override_voice=req.voice, override_lang=req.language,
+            )
+        except HTTPException as e:
+            yield f"data: {json.dumps({'error': f'voice choice: {e.detail}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+        try:
+            async for ev in voice.speak_stream(voice_backend, reply, voice_id, lang):
+                if "chunk_b64" in ev:
+                    yield f"data: {json.dumps({'audio_chunk_b64': ev['chunk_b64'], 'sample_rate': ev.get('sample_rate')})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': f'TTS: {e}'})}\n\n"
+
+        yield f"data: {json.dumps({'end': True})}\n\n"
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Call signaling proxy (HTTPS browser ↔ HTTP voice container)
+# ---------------------------------------------------------------------------
+# Browsers refuse cross-origin HTTP fetches from an HTTPS page (mixed content).
+# These three endpoints proxy the small JSON / SSE signaling traffic through
+# MiniClosedAI's own origin so the browser stays on HTTPS the whole way. The
+# actual WebRTC audio (RTP/UDP) flows direct browser ↔ voice container after
+# the SDP exchange — it never goes through this proxy and doesn't pay the
+# bandwidth cost.
+
+class CallConfigureRequest(BaseModel):
+    """Body for /call/configure proxy. The browser only supplies voice prefs;
+    conv_id and miniclosedai_url are filled in server-side so a tampered
+    client can't make the voice container call an arbitrary URL."""
+    model_config = ConfigDict(extra="forbid")
+    voice: str | None = None
+    language: str | None = None
+
+
+class CallOfferRequest(BaseModel):
+    """Body for /call/offer proxy — passes the SDP through unchanged."""
+    model_config = ConfigDict(extra="allow")
+    sdp: str | None = None
+    type: str
+    webrtc_id: str
+
+
+def _self_url_for_voice(request: Request) -> str:
+    """The base URL the voice container should use to call back into
+    MiniClosedAI for /chat/stream. We trust the incoming `Host` header: from
+    inside a Docker network the LAN IP works, and from a same-machine setup
+    the localhost form does. Strip a trailing slash so concatenation is clean."""
+    return str(request.base_url).rstrip("/")
+
+
+@app.post("/api/conversations/{conv_id}/call/configure")
+async def api_conv_call_configure(
+    conv_id: int, req: CallConfigureRequest, request: Request,
+):
+    """Proxy POST /call/configure — same-origin so the browser can stay on HTTPS."""
+    conv = _load_conv_for_voice(conv_id)
+    backend = _resolve_voice_backend(conv)
+    voice_id, language = await _resolve_voice_choice(
+        conv, backend, override_voice=req.voice, override_lang=req.language,
+    )
+    payload = {
+        "conv_id": conv_id,
+        "miniclosedai_url": _self_url_for_voice(request),
+        "voice": voice_id,
+        "language": language,
+    }
+    # Pre-warm the bot's LLM in the background — first-turn latency in call
+    # mode is dominated by the model load (Ollama's default keep_alive expires
+    # in 5 min). Fire-and-forget, never blocks the call setup.
+    asyncio.create_task(_warmup_conv_model(conv_id))
+    try:
+        return await voice.call_configure(backend, payload)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Voice backend /call/configure failed: {e}")
+
+
+async def _warmup_conv_model(conv_id: int) -> None:
+    """Force the bot's LLM into memory so the first call-mode turn isn't slow.
+
+    Sends a 1-token prompt through the same chat path real turns use, so
+    whichever backend the bot points at (Ollama, OpenAI-compat, relay) gets
+    warmed correctly. Errors are swallowed — warmup is best-effort.
+    """
+    try:
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT model, backend_id, params FROM conversations WHERE id = ?",
+                (conv_id,),
+            ).fetchone()
+        if not row:
+            return
+        backend = _load_backend(row["backend_id"] or 1)
+        backend = await _maybe_override_to_relay(backend, row["model"])
+        messages = [{"role": "user", "content": "."}]
+        async for ev in llm.chat_stream(
+            backend, row["model"], messages,
+            temperature=0.0, max_tokens=1, top_p=1.0, top_k=1, think=False,
+        ):
+            # Bail after first event — the model is loaded once anything streams.
+            break
+    except Exception:
+        pass
+
+
+@app.post("/api/conversations/{conv_id}/call/offer")
+async def api_conv_call_offer(conv_id: int, req: CallOfferRequest):
+    """Proxy POST /webrtc/offer — returns the SDP answer JSON from FastRTC."""
+    conv = _load_conv_for_voice(conv_id)
+    backend = _resolve_voice_backend(conv)
+    try:
+        return await voice.call_offer(backend, req.model_dump(exclude_none=True))
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Voice backend /webrtc/offer failed: {e}")
+
+
+@app.get("/api/conversations/{conv_id}/call/events/{webrtc_id}")
+async def api_conv_call_events(conv_id: int, webrtc_id: str):
+    """Proxy GET /call/events/{id} — forwards the SSE stream to the browser."""
+    conv = _load_conv_for_voice(conv_id)
+    backend = _resolve_voice_backend(conv)
+
+    async def gen():
+        try:
+            async for ev in voice.call_events(backend, webrtc_id):
+                yield f"data: {json.dumps(ev)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(
         gen(), media_type="text/event-stream",
