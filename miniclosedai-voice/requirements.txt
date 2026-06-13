@@ -1,0 +1,18 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+numpy<2
+soundfile==0.13.1
+# av (PyAV) gives faster-whisper a universal audio decoder so the browser can
+# send MediaRecorder's WebM/Opus / OGG / MP4 blobs without re-encoding. Range
+# is bounded so aiortc (which pins av<13) and faster-whisper (av>=11) coexist.
+av>=11,<13
+faster-whisper==1.2.1
+piper-tts==1.2.0
+huggingface-hub==0.27.0
+requests==2.32.3
+# fastrtc powers the /call route: continuous duplex WebRTC audio with VAD-based
+# turn detection and built-in barge-in. It pulls aiortc + libsrtp transitively;
+# we don't pin aiortc here to avoid the resolver fighting fastrtc's range.
+fastrtc==0.0.34
+httpx==0.28.1

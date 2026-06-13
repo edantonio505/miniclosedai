@@ -84,6 +84,10 @@ const els = {
   sendBtn: document.getElementById("send-btn"),
   attachBtn: document.getElementById("attach-btn"),
   micBtn: document.getElementById("mic-btn"),
+  voiceStopBtn: document.getElementById("voice-stop-btn"),
+  voicePreview: document.getElementById("voice-preview"),
+  callBtn: document.getElementById("call-btn"),
+  callStatus: document.getElementById("call-status"),
   attachInput: document.getElementById("attach-input"),
   attachmentList: document.getElementById("attachment-list"),
   attachmentWarning: document.getElementById("attachment-warning"),
@@ -3177,6 +3181,31 @@ const _voice = {
   abort: null,           // AbortController for the in-flight /voice/turn
   audioCtx: null,        // shared AudioContext, created on first use
   audioCursor: 0,        // currentTime to schedule the next chunk at
+  // Live-preview transcript (browser's SpeechRecognition while the user holds
+  // the mic). Cleared the moment the server returns the authoritative Whisper
+  // transcript, or on release if the API isn't available.
+  speechRec: null,       // active SpeechRecognition instance, or null
+  previewFinal: "",      // text the recognizer has marked `isFinal: true`
+  previewLatest: "",     // most recent text actually rendered in the chip
+                         // (final + current interim) — what the user SEES.
+                         // Critical for short utterances where Chrome never
+                         // finalizes anything before release.
+  // Active AudioBufferSourceNodes for the in-flight TTS. The stop button
+  // walks this list to .stop() each one, then aborts the SSE so the server
+  // doesn't keep sending audio chunks we don't want to play.
+  audioSources: [],
+  // True once the SSE response has finished. The stop button stays visible
+  // as long as either the stream is still active OR audio is still playing,
+  // so the user can interrupt at *any* point during the bot's reply.
+  streamEnded: false,
+  // Pre-created bubbles so the conversation feels instant on release. The
+  // user bubble uses the SpeechRecognition preview as a placeholder until the
+  // server's authoritative Whisper transcript replaces it.
+  pendingUserEl: null,
+  pendingUserMsg: null,
+  pendingAssistantEl: null,
+  pendingAssistantBody: null,
+  thinkingPill: null,
 };
 
 
@@ -3191,7 +3220,25 @@ function _getAudioContext() {
 }
 
 
-// Decode + schedule one base64 PCM-16 chunk for seamless playback.
+// Hide the stop button only when (a) the SSE has finished AND (b) the audio
+// playback cursor has actually caught up to the AudioContext's current time
+// AND (c) no queued AudioBufferSourceNodes remain. If any of those are still
+// pending, we keep the button visible so the user can interrupt at any
+// moment, even after the SSE response has officially "ended."
+function _maybeHideVoiceStop() {
+  if (!els.voiceStopBtn) return;
+  if (!_voice.streamEnded) return;
+  if (_voice.audioSources.length > 0) return;
+  const ctx = _voice.audioCtx;
+  if (ctx && _voice.audioCursor > ctx.currentTime + 0.02) return;
+  els.voiceStopBtn.hidden = true;
+}
+
+
+// Decode + schedule one base64 PCM-16 chunk for seamless playback. The
+// voice-stop button was already made visible at the start of the turn (in
+// _consumeVoiceTurn) so we don't need to flip it here — audio playback is
+// just one of the things the same Stop button cancels.
 function _enqueueAudioChunk(b64, sampleRate) {
   const ctx = _getAudioContext();
   const binary = atob(b64);
@@ -3214,6 +3261,121 @@ function _enqueueAudioChunk(b64, sampleRate) {
   const startAt = Math.max(ctx.currentTime, _voice.audioCursor);
   source.start(startAt);
   _voice.audioCursor = startAt + buffer.duration;
+  // Track the source so a Stop click can interrupt it. Remove it on natural
+  // end so the list stays small.
+  _voice.audioSources.push(source);
+  source.onended = () => {
+    const i = _voice.audioSources.indexOf(source);
+    if (i >= 0) _voice.audioSources.splice(i, 1);
+    // If this was the last queued chunk AND the SSE has already finished,
+    // it's safe to take the stop button away now.
+    _maybeHideVoiceStop();
+  };
+}
+
+
+// Stop everything playing right now AND cancel the in-flight SSE so the
+// server doesn't keep producing audio we no longer want. The assistant's
+// text bubble (already rendered up to this point) stays in the chat —
+// only the spoken half is interrupted.
+function _stopVoicePlayback() {
+  // 1. Silence the queued buffers. Each call is idempotent so duplicate
+  //    stops on a source we already paused are harmless.
+  for (const s of _voice.audioSources.splice(0)) {
+    try { s.stop(); } catch (_) { /* already stopped */ }
+    try { s.disconnect(); } catch (_) {}
+  }
+  // 2. Cursor reset — next chunk (in a future turn) plays immediately.
+  if (_voice.audioCtx) _voice.audioCursor = _voice.audioCtx.currentTime;
+  // 3. Abort the SSE so the server's TTS pipeline stops emitting chunks.
+  if (_voice.abort) {
+    try { _voice.abort.abort(); } catch (_) {}
+  }
+  if (els.voiceStopBtn) els.voiceStopBtn.hidden = true;
+}
+
+
+// --- Live transcription preview ---------------------------------------
+//
+// While the user is holding the mic, the browser's built-in SpeechRecognition
+// API gives instant partial transcripts (sub-100ms) so they see their words
+// appear as they speak. The final word is whatever server-side Whisper says —
+// the preview gets cleared the moment the real transcript arrives.
+//
+// Chrome / Edge / Safari support this. Firefox doesn't — fail silently and
+// fall back to "release first, then see the transcript" behavior.
+
+function _hasSpeechRecognition() {
+  return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
+
+function _setVoicePreview(text) {
+  if (!els.voicePreview) return;
+  const t = (text || "").trim();
+  if (!t) {
+    els.voicePreview.hidden = true;
+    els.voicePreview.textContent = "";
+    return;
+  }
+  els.voicePreview.hidden = false;
+  els.voicePreview.textContent = t;
+}
+
+
+function _startSpeechPreview() {
+  if (!_hasSpeechRecognition()) return;
+  const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const rec = new Ctor();
+  rec.continuous = true;
+  rec.interimResults = true;
+  // No `lang` set ⇒ user's browser locale. Most natural default.
+  _voice.previewFinal = "";
+  _voice.previewLatest = "";
+  rec.addEventListener("result", e => {
+    // Late-firing safeguard: Chrome may fire one more `result` event after
+    // we already called .stop() while it flushes trailing audio. By that
+    // point _stopSpeechPreview has nulled the active reference, so we drop
+    // anything for a recognizer we no longer own — otherwise it would
+    // re-paint the chip after we already cleared it on release.
+    if (_voice.speechRec !== rec) return;
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) {
+        _voice.previewFinal += r[0].transcript;
+      } else {
+        interim += r[0].transcript;
+      }
+    }
+    const combined = _voice.previewFinal + interim;
+    _voice.previewLatest = combined;
+    _setVoicePreview(combined);
+  });
+  rec.addEventListener("error", () => { /* swallow — preview is best-effort */ });
+  rec.addEventListener("end", () => {
+    // If we're still recording, the recognizer auto-stopped (it does that
+    // after a few seconds of silence). Restart it.
+    if (_voice.pressed) {
+      try { rec.start(); } catch (_) {}
+    }
+  });
+  try { rec.start(); } catch (_) { return; }
+  _voice.speechRec = rec;
+}
+
+
+function _stopSpeechPreview({clearChip = false} = {}) {
+  if (_voice.speechRec) {
+    try {
+      // Detach the end handler so it doesn't auto-restart after we asked
+      // it to stop.
+      _voice.speechRec.onend = null;
+      _voice.speechRec.stop();
+    } catch (_) {}
+    _voice.speechRec = null;
+  }
+  if (clearChip) _setVoicePreview("");
 }
 
 
@@ -3253,13 +3415,51 @@ async function _startRecording() {
   rec.start();
   _voice.rec = rec;
   els.micBtn?.classList.add("recording");
+  // Live preview is best-effort — if the browser doesn't have
+  // SpeechRecognition (Firefox), we just skip it and the user sees the
+  // transcript when the server returns.
+  _startSpeechPreview();
 }
 
 
 async function _stopRecordingAndSend() {
   const rec = _voice.rec;
   if (!rec || rec.state === "inactive") return;
-  // Wait for the final 'stop' event so all chunks are flushed.
+  // Stop the preview recognizer so it releases the mic.
+  _stopSpeechPreview();
+  // The instant the user releases, render the conversation bubbles. The user
+  // bubble uses the SpeechRecognition transcript (which is the same text
+  // they've been watching appear in the preview chip). The assistant bubble
+  // gets a "thinking" pill that flips to "Searching knowledge" / "Thinking"
+  // as the server emits {status} events before the first {chunk}.
+  //
+  // Prefer `previewLatest` (final + interim — what was on screen) over
+  // `previewFinal` (only the finalized parts). Otherwise short utterances
+  // that the recognizer never had time to mark final would silently fall
+  // back to the slow server-Whisper path.
+  const previewText = (_voice.previewLatest || _voice.previewFinal || "").trim();
+  _setVoicePreview("");
+  els.voicePreview?.classList.remove("sending");
+  const userMsg = {role: "user", content: previewText || "…"};
+  _voice.pendingUserMsg = userMsg;
+  state.messages.push(userMsg);
+  _voice.pendingUserEl = renderMessage(userMsg);
+  if (!previewText) _voice.pendingUserEl?.classList.add("voice-pending");
+  const assistantEl = renderMessage({role: "assistant", content: ""});
+  assistantEl.classList.add("cursor");
+  _voice.pendingAssistantEl = assistantEl;
+  _voice.pendingAssistantBody = assistantEl.querySelector(".msg-body");
+  const pill = document.createElement("div");
+  pill.className = "voice-thinking-pill";
+  // If we already have the transcript (browser recognition), the next step is
+  // straight to the LLM — no transcription happening on the server.
+  pill.textContent = previewText ? "💭 Thinking…" : "🎙 Transcribing…";
+  _voice.pendingAssistantBody.innerHTML = "";
+  _voice.pendingAssistantBody.appendChild(pill);
+  _voice.thinkingPill = pill;
+  scrollToBottom();
+  // Wait for MediaRecorder's stop event so the audio buffer is finalized.
+  // (We don't always upload it — see below — but stopping releases the mic.)
   await new Promise(res => {
     rec.addEventListener("stop", res, {once: true});
     rec.stop();
@@ -3272,14 +3472,133 @@ async function _stopRecordingAndSend() {
     await newConversation();
     if (!state.conversationId) { els.micBtn?.classList.remove("busy"); return; }
   }
-  // Filename matters: it tells the server what extension to assume when
-  // logging / decoding. The MIME type carries the real format.
-  const filename = (blob.type || "").includes("webm") ? "voice.webm"
-                  : (blob.type || "").includes("ogg") ? "voice.ogg"
-                  : (blob.type || "").includes("mp4") ? "voice.mp4"
-                  : "voice.wav";
-  await _consumeVoiceTurn(blob, filename);
+
+  // Decision: fast-path or fallback?
+  //   • Browser already has the transcript → POST text to /voice/say
+  //     (no Whisper, no audio upload — saves ~500ms–2s per turn).
+  //   • Browser had nothing (Firefox, mic permission issue, very quiet) →
+  //     POST the audio blob to /voice/turn so server Whisper can recover it.
+  if (previewText) {
+    await _consumeVoiceSay(previewText);
+  } else {
+    const filename = (blob.type || "").includes("webm") ? "voice.webm"
+                    : (blob.type || "").includes("ogg") ? "voice.ogg"
+                    : (blob.type || "").includes("mp4") ? "voice.mp4"
+                    : "voice.wav";
+    await _consumeVoiceTurn(blob, filename);
+  }
   els.micBtn?.classList.remove("busy");
+}
+
+
+// Fast push-to-talk path: hand the LLM the browser's transcript verbatim, get
+// the merged SSE back (LLM chunks + TTS audio). Same event shape as
+// _consumeVoiceTurn so the UI handlers are identical — just a different URL
+// and a JSON body instead of multipart audio.
+async function _consumeVoiceSay(text) {
+  const convId = state.conversationId;
+  let assistantEl = _voice.pendingAssistantEl;
+  let body = _voice.pendingAssistantBody;
+  let contentEl = null;
+  let assistantText = "";
+  _voice.audioCursor = 0;
+  _voice.streamEnded = false;
+  const ac = new AbortController();
+  _voice.abort = ac;
+  if (els.voiceStopBtn) els.voiceStopBtn.hidden = false;
+  try {
+    const res = await fetch(`/api/conversations/${convId}/voice/say`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      signal: ac.signal,
+      body: JSON.stringify({text}),
+    });
+    if (!res.ok || !res.body) {
+      throw new Error(await res.text().catch(() => `HTTP ${res.status}`));
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream: true});
+      const parts = buf.split("\n\n");
+      buf = parts.pop() || "";
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data:")) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (ev.transcript != null) {
+          // The server echoed our transcript back — undim the user bubble
+          // (it was already rendered with the right text on release).
+          if (_voice.pendingUserEl) {
+            _voice.pendingUserEl.classList.remove("voice-pending");
+          }
+          _voice.pendingUserMsg = null;
+          _voice.pendingUserEl = null;
+        } else if (ev.status) {
+          if (_voice.thinkingPill) {
+            const labels = {
+              "transcribing":        "🎙 Transcribing…",
+              "searching_knowledge": "📚 Searching knowledge…",
+              "thinking":            "💭 Thinking…",
+            };
+            _voice.thinkingPill.textContent = labels[ev.status] || `· ${ev.status}…`;
+          }
+        } else if (ev.error) {
+          assistantText += `\n\n**Error:** ${ev.error}`;
+          if (assistantEl && body) {
+            if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
+            contentEl.innerHTML = render(assistantText);
+          } else {
+            alert(`Voice turn failed: ${ev.error}`);
+          }
+        } else if (ev.chunk != null && body) {
+          if (_voice.thinkingPill) {
+            _voice.thinkingPill.remove();
+            _voice.thinkingPill = null;
+          }
+          assistantText += ev.chunk;
+          if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
+          contentEl.innerHTML = render(assistantText);
+          scrollToBottom();
+        } else if (ev.audio_chunk_b64) {
+          _enqueueAudioChunk(ev.audio_chunk_b64, ev.sample_rate || 22050);
+        } else if (ev.end) {
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      alert(`Voice turn failed: ${e.message}`);
+    }
+  } finally {
+    _voice.abort = null;
+    // Mark the SSE done — the stop button stays visible until the audio
+    // queue actually drains. _enqueueAudioChunk's onended handler calls
+    // _maybeHideVoiceStop() each time a buffer source finishes.
+    _voice.streamEnded = true;
+    _maybeHideVoiceStop();
+    els.voicePreview?.classList.remove("sending");
+    _setVoicePreview("");
+    _voice.pendingUserEl = null;
+    _voice.pendingUserMsg = null;
+    _voice.pendingAssistantEl = null;
+    _voice.pendingAssistantBody = null;
+    if (_voice.thinkingPill) {
+      _voice.thinkingPill.remove();
+      _voice.thinkingPill = null;
+    }
+    if (assistantEl) {
+      assistantEl.classList.remove("cursor");
+      if (contentEl) { contentEl.innerHTML = render(assistantText); highlightCodeBlocks(contentEl); }
+      state.messages.push({role: "assistant", content: assistantText});
+      loadConversations();
+    }
+  }
 }
 
 
@@ -3289,13 +3608,21 @@ async function _stopRecordingAndSend() {
 //   {audio_chunk_b64}   → push into the Web Audio playback queue
 async function _consumeVoiceTurn(blob, filename) {
   const convId = state.conversationId;
-  let assistantEl = null;
-  let body = null;
+  // Reuse the bubbles _stopRecordingAndSend already rendered so the
+  // conversation feels instant. Fall back to creating them lazily for
+  // legacy callers (none right now).
+  let assistantEl = _voice.pendingAssistantEl;
+  let body = _voice.pendingAssistantBody;
   let contentEl = null;
   let assistantText = "";
   _voice.audioCursor = 0;
+  _voice.streamEnded = false;
   const ac = new AbortController();
   _voice.abort = ac;
+  // Show the stop button up front — the user might want to cancel during
+  // ASR or LLM streaming, not just TTS playback. _stopVoicePlayback() calls
+  // ac.abort() which propagates through the fetch below.
+  if (els.voiceStopBtn) els.voiceStopBtn.hidden = false;
   try {
     const fd = new FormData();
     fd.append("audio", blob, filename);
@@ -3320,14 +3647,41 @@ async function _consumeVoiceTurn(blob, filename) {
         let ev;
         try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
         if (ev.transcript != null) {
-          const userMsg = {role: "user", content: ev.transcript};
-          state.messages.push(userMsg);
-          renderMessage(userMsg);
-          // Assistant bubble — same shape as sendMessage.
-          assistantEl = renderMessage({role: "assistant", content: ""});
-          body = assistantEl.querySelector(".msg-body");
-          assistantEl.classList.add("cursor");
+          // Authoritative Whisper transcript arrived — replace whatever the
+          // browser's SpeechRecognition put in the user bubble.
+          const text = ev.transcript || "";
+          if (_voice.pendingUserMsg) {
+            _voice.pendingUserMsg.content = text;
+            if (_voice.pendingUserEl) {
+              _voice.pendingUserEl.classList.remove("voice-pending");
+              const ub = _voice.pendingUserEl.querySelector(".msg-body");
+              if (ub) ub.textContent = text;
+            }
+            _voice.pendingUserMsg = null;
+            _voice.pendingUserEl = null;
+          } else {
+            const userMsg = {role: "user", content: text};
+            state.messages.push(userMsg);
+            renderMessage(userMsg);
+          }
+          // Assistant bubble was pre-created with a "Transcribing…" pill.
+          // The transcript arriving means transcription is *done* — so move
+          // the pill to "Thinking" right now rather than waiting for the
+          // server's next {status} event. If the server later upgrades to
+          // {status: "searching_knowledge"}, that overrides this.
+          if (_voice.thinkingPill) {
+            _voice.thinkingPill.textContent = "💭 Thinking…";
+          }
           scrollToBottom();
+        } else if (ev.status) {
+          if (_voice.thinkingPill) {
+            const labels = {
+              "transcribing":        "🎙 Transcribing…",
+              "searching_knowledge": "📚 Searching knowledge…",
+              "thinking":            "💭 Thinking…",
+            };
+            _voice.thinkingPill.textContent = labels[ev.status] || `· ${ev.status}…`;
+          }
         } else if (ev.error) {
           assistantText += `\n\n**Error:** ${ev.error}`;
           if (assistantEl && body) {
@@ -3337,6 +3691,11 @@ async function _consumeVoiceTurn(blob, filename) {
             alert(`Voice turn failed: ${ev.error}`);
           }
         } else if (ev.chunk != null && body) {
+          // First text chunk replaces the thinking pill with real content.
+          if (_voice.thinkingPill) {
+            _voice.thinkingPill.remove();
+            _voice.thinkingPill = null;
+          }
           assistantText += ev.chunk;
           if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
           contentEl.innerHTML = render(assistantText);
@@ -3354,6 +3713,22 @@ async function _consumeVoiceTurn(blob, filename) {
     }
   } finally {
     _voice.abort = null;
+    // SSE done — but audio playback may still be in flight. The stop button
+    // stays visible until the audio queue drains (see _maybeHideVoiceStop).
+    _voice.streamEnded = true;
+    _maybeHideVoiceStop();
+    els.voicePreview?.classList.remove("sending");
+    _setVoicePreview("");
+    // Clean up the pre-created refs — release ended, the bubbles are now
+    // either populated (assistantText present) or empty (turn cancelled).
+    _voice.pendingUserEl = null;
+    _voice.pendingUserMsg = null;
+    _voice.pendingAssistantEl = null;
+    _voice.pendingAssistantBody = null;
+    if (_voice.thinkingPill) {
+      _voice.thinkingPill.remove();
+      _voice.thinkingPill = null;
+    }
     if (assistantEl) {
       assistantEl.classList.remove("cursor");
       if (contentEl) { contentEl.innerHTML = render(assistantText); highlightCodeBlocks(contentEl); }
@@ -3366,6 +3741,14 @@ async function _consumeVoiceTurn(blob, filename) {
 
 
 function initMicButton() {
+  // Wire the stop-audio button regardless of whether mic-btn is in the DOM —
+  // it stops playback for both push-to-talk and (future) call-mode audio.
+  if (els.voiceStopBtn) {
+    els.voiceStopBtn.addEventListener("click", e => {
+      e.preventDefault();
+      _stopVoicePlayback();
+    });
+  }
   const btn = els.micBtn;
   if (!btn) return;
   // Press-and-hold gestures. Also tolerate click (toggle) for accessibility.
@@ -3396,6 +3779,316 @@ function initMicButton() {
     }
   });
 }
+
+
+// =====================================================================
+// Call mode (continuous duplex audio over WebRTC)
+// =====================================================================
+//
+// Click 📞 → handshake with the voice service's FastRTC stream; the browser
+// pipes mic audio to it, plays its reply audio inline, and renders transcript
+// + assistant tokens as they arrive on the WebRTC DataChannel. Click again to
+// hang up. Interrupt-able mid-reply (FastRTC's ReplyOnPause handles barge-in
+// server-side; on our side, a fresh `{transcript}` event finalizes the
+// previous assistant bubble and opens a new one).
+
+const _call = {
+  pc: null,                // RTCPeerConnection
+  audioEl: null,           // <audio> playing the remote stream
+  events: null,            // EventSource — SSE stream of {transcript}/{chunk}/{end}
+  webrtcId: null,          // server-side session id we issued for this call
+  micStream: null,         // MediaStream from getUserMedia
+  state: "idle",           // idle | dialing | talking | hanging-up
+  // Current in-progress assistant bubble being streamed:
+  assistantEl: null,
+  assistantBody: null,
+  assistantContentEl: null,
+  assistantText: "",
+};
+
+
+function _finalizeCallAssistantBubble() {
+  if (!_call.assistantEl) return;
+  _call.assistantEl.classList.remove("cursor");
+  if (_call.assistantContentEl) {
+    _call.assistantContentEl.innerHTML = render(_call.assistantText);
+    highlightCodeBlocks(_call.assistantContentEl);
+  }
+  if (_call.assistantText.trim()) {
+    state.messages.push({role: "assistant", content: _call.assistantText});
+    const finalIndex = state.messages.length - 1;
+    _call.assistantEl.dataset.index = String(finalIndex);
+    _appendEditButton(_call.assistantEl, finalIndex);
+  } else {
+    // Empty bubble — never got any chunks. Remove it.
+    _call.assistantEl.remove();
+  }
+  _call.assistantEl = null;
+  _call.assistantBody = null;
+  _call.assistantContentEl = null;
+  _call.assistantText = "";
+}
+
+
+// Per-stage status labels with emoji prefixes — server emits the raw stage,
+// browser maps to the user-facing string. `null` hides the pill.
+const _CALL_STATUS_LABELS = {
+  listening:    "🎙 Listening…",
+  transcribing: "✍ Transcribing…",
+  thinking:     "💭 Thinking…",
+  speaking:     "🔊 Speaking…",
+};
+
+
+function _setCallStatus(stage) {
+  if (!els.callStatus) return;
+  const label = stage ? (_CALL_STATUS_LABELS[stage] || stage) : "";
+  if (!label) {
+    els.callStatus.hidden = true;
+    els.callStatus.textContent = "";
+    return;
+  }
+  els.callStatus.hidden = false;
+  els.callStatus.textContent = label;
+}
+
+
+function _onCallDataEvent(ev) {
+  if (ev.error) {
+    // Don't tear down the whole call on a single-sentence TTS hiccup — just
+    // surface the error. The server keeps streaming the next sentence.
+    console.warn("voice service event error:", ev.error);
+  }
+  if (ev.status) {
+    _setCallStatus(ev.status);
+  }
+  if (ev.transcript != null) {
+    // Finalize any previous (possibly interrupted) assistant bubble before
+    // starting the new turn.
+    _finalizeCallAssistantBubble();
+    const userMsg = {role: "user", content: ev.transcript};
+    state.messages.push(userMsg);
+    renderMessage(userMsg);
+    _call.assistantEl = renderMessage({role: "assistant", content: ""});
+    _call.assistantBody = _call.assistantEl.querySelector(".msg-body");
+    _call.assistantEl.classList.add("cursor");
+    _call.assistantText = "";
+    scrollToBottom();
+    return;
+  }
+  if (ev.chunk != null && _call.assistantEl) {
+    _call.assistantText += ev.chunk;
+    if (!_call.assistantContentEl) {
+      _call.assistantBody.innerHTML = "";
+      _call.assistantContentEl = document.createElement("div");
+      _call.assistantBody.appendChild(_call.assistantContentEl);
+    }
+    _call.assistantContentEl.innerHTML = render(_call.assistantText);
+    scrollToBottom();
+    return;
+  }
+  if (ev.end) {
+    _finalizeCallAssistantBubble();
+    loadConversations();   // keep the sidebar list fresh
+    return;
+  }
+}
+
+
+async function _startCall() {
+  if (_call.state !== "idle") return;
+  _call.state = "dialing";
+  els.callBtn.classList.add("calling");
+  // Show a placeholder status while the connection comes up; the server
+  // will start emitting real {status: ...} events the moment audio flows.
+  _setCallStatus("listening");
+
+  const voiceBackend = (backendCache || []).find(b => b.kind === "voice" && b.enabled);
+  if (!voiceBackend) {
+    _endCall();
+    alert("No voice backend configured. Add one in Settings → + Add endpoint (kind=Voice).");
+    return;
+  }
+
+  if (!state.conversationId) {
+    await newConversation();
+    if (!state.conversationId) { _endCall(); return; }
+  }
+
+  // Read the bot's voice prefs (if any) from the persisted conv. The server
+  // proxy will fill in defaults from /voices if these are empty.
+  let convVoice = "", convLang = "en";
+  try {
+    const conv = await fetch(`/api/conversations/${state.conversationId}`).then(r => r.json());
+    const vs = (conv && conv.voice_settings) || {};
+    convVoice = vs.voice_id || "";
+    convLang = vs.language || "en";
+  } catch (_) {}
+
+  // All three signaling calls go through MiniClosedAI (same origin = HTTPS).
+  // This avoids the "Mixed Content" block browsers slap on HTTP fetches from
+  // an HTTPS page. The audio stream itself flows direct browser ↔ voice
+  // container via WebRTC's UDP transport (not subject to mixed-content
+  // policy) once the SDP exchange is done.
+  const callBase = `/api/conversations/${state.conversationId}/call`;
+
+  // 1. Tell the voice service which bot is being called. The server proxy
+  //    fills in conv_id and the miniclosedai_url itself — the browser only
+  //    sends voice/language preferences.
+  try {
+    const r = await fetch(`${callBase}/configure`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        voice: convVoice || null,
+        language: convLang,
+      }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text().catch(() => "")}`);
+  } catch (e) {
+    _endCall();
+    alert(`Could not configure the call: ${e.message}`);
+    return;
+  }
+
+  // 2. Grab the microphone.
+  try {
+    _call.micStream = await navigator.mediaDevices.getUserMedia({audio: true});
+  } catch (e) {
+    _endCall();
+    alert(`Microphone access failed: ${e.message}`);
+    return;
+  }
+
+  // 3. Build the peer connection + audio element + DataChannel.
+  _call.pc = new RTCPeerConnection({
+    iceServers: [{urls: "stun:stun.l.google.com:19302"}],
+  });
+  _call.micStream.getAudioTracks().forEach(t => _call.pc.addTrack(t, _call.micStream));
+
+  // FastRTC's AudioCallback gates the entire input pump on a DataChannel
+  // being ready (see wait_for_channel() in fastrtc/tracks.py) — without one
+  // in the offer SDP, RTP audio arrives at aiortc but is never drained into
+  // the VAD, and the handler never fires. The channel itself stays unused on
+  // our side; events ride the SSE stream below.
+  _call.dc = _call.pc.createDataChannel("text");
+
+  _call.audioEl = document.createElement("audio");
+  _call.audioEl.autoplay = true;
+  _call.audioEl.playsInline = true;
+  _call.audioEl.style.display = "none";
+  document.body.appendChild(_call.audioEl);
+  _call.pc.addEventListener("track", e => {
+    if (e.streams && e.streams[0]) _call.audioEl.srcObject = e.streams[0];
+  });
+
+  _call.pc.addEventListener("connectionstatechange", () => {
+    const s = _call.pc?.connectionState;
+    if (s === "connected") {
+      _call.state = "talking";
+    } else if (s === "failed" || s === "disconnected" || s === "closed") {
+      if (_call.state !== "hanging-up" && _call.state !== "idle") _endCall();
+    }
+  });
+
+  // 4. SDP offer/answer with the voice service. FastRTC keys its per-session
+  //    state on a client-supplied webrtc_id, so we generate one here and reuse
+  //    it for the lifetime of this call.
+  const webrtcId = (crypto.randomUUID && crypto.randomUUID())
+    || `call-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  _call.webrtcId = webrtcId;
+  try {
+    await _call.pc.setLocalDescription(await _call.pc.createOffer());
+    // Non-trickle ICE: wait until all candidates are gathered, then send the
+    // *complete* SDP. FastRTC's /webrtc/offer doesn't support trickling, so a
+    // partial offer would leave us with no usable candidates server-side.
+    await _waitForIceGatheringComplete(_call.pc, 3000);
+    const local = _call.pc.localDescription;
+    const r = await fetch(`${callBase}/offer`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({sdp: local.sdp, type: local.type, webrtc_id: webrtcId}),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text().catch(() => "")}`);
+    const answer = await r.json();
+    await _call.pc.setRemoteDescription(answer);
+  } catch (e) {
+    _endCall();
+    alert(`Call failed: ${e.message}`);
+    return;
+  }
+
+  // 5. Subscribe to the server's AdditionalOutputs stream (transcript /
+  //    chunk / end / error). FastRTC keeps these in an internal queue keyed
+  //    by webrtc_id; the SSE endpoint forwards them to us.
+  try {
+    _call.events = new EventSource(`${callBase}/events/${webrtcId}`);
+    _call.events.onmessage = e => {
+      let ev;
+      try { ev = JSON.parse(e.data); } catch { return; }
+      _onCallDataEvent(ev);
+    };
+    _call.events.onerror = () => {
+      // EventSource will auto-reconnect; we only care if the call itself ended.
+      if (_call.state === "idle" || _call.state === "hanging-up") {
+        try { _call.events?.close(); } catch (_) {}
+      }
+    };
+  } catch (e) {
+    console.warn("Could not open call events stream:", e);
+  }
+}
+
+
+function _waitForIceGatheringComplete(pc, timeoutMs) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise(resolve => {
+    let done = false;
+    const finish = () => { if (done) return; done = true; resolve(); };
+    const handler = () => { if (pc.iceGatheringState === "complete") finish(); };
+    pc.addEventListener("icegatheringstatechange", handler);
+    // Hard timeout — some networks never reach "complete"; the SDP we have
+    // already has *some* candidates, send it and let the other side cope.
+    setTimeout(finish, timeoutMs || 3000);
+  });
+}
+
+
+function _endCall() {
+  _call.state = "hanging-up";
+  _finalizeCallAssistantBubble();
+  if (_call.events) {
+    try { _call.events.close(); } catch (_) {}
+    _call.events = null;
+  }
+  if (_call.pc) {
+    try { _call.pc.close(); } catch (_) {}
+    _call.pc = null;
+  }
+  if (_call.micStream) {
+    _call.micStream.getTracks().forEach(t => { try { t.stop(); } catch (_) {} });
+    _call.micStream = null;
+  }
+  if (_call.audioEl) {
+    _call.audioEl.srcObject = null;
+    try { _call.audioEl.remove(); } catch (_) {}
+    _call.audioEl = null;
+  }
+  _call.webrtcId = null;
+  els.callBtn?.classList.remove("calling");
+  _setCallStatus(null);
+  _call.state = "idle";
+}
+
+
+function initCallButton() {
+  if (!els.callBtn) return;
+  els.callBtn.addEventListener("click", () => {
+    if (_call.state === "idle") _startCall();
+    else _endCall();
+  });
+}
+
 
 // ---------- API code modal ----------
 // Each conversation is a saved microservice: its model, system prompt, and
@@ -4133,6 +4826,17 @@ function _refreshMicAffordance() {
   if (!els.micBtn) return;
   const hasVoice = (backendCache || []).some(b => b.kind === "voice" && b.enabled);
   els.micBtn.hidden = !hasVoice;
+  _refreshCallAffordance();
+}
+
+// Show the 📞 button only when a voice backend is registered AND we're on a
+// secure context (WebRTC requires it). On plain-HTTP LAN access, the button
+// stays hidden so users don't get a confusing failure when they click.
+function _refreshCallAffordance() {
+  if (!els.callBtn) return;
+  const hasVoice = (backendCache || []).some(b => b.kind === "voice" && b.enabled);
+  const secure = window.isSecureContext;
+  els.callBtn.hidden = !(hasVoice && secure);
 }
 
 function _backendStatusDot(running, enabled, hadErr) {
@@ -5562,6 +6266,7 @@ async function init() {
   initHSplitter();
   initSuggestionChips();
   initMicButton();
+  initCallButton();
   if (typeof initBackendsUI === "function") initBackendsUI();
   initUiDialog();
   initLogsUI();

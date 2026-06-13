@@ -310,11 +310,25 @@
           <div class="composer-main">
             <div id="attachment-list" class="attachment-list" hidden></div>
             <div id="attachment-warning" class="attachment-warning" hidden></div>
+            <!-- Live transcription preview while holding the mic. The browser's
+                 SpeechRecognition API gives instant partial transcripts; the
+                 final Whisper transcript from the server replaces this chip
+                 with the real user message bubble. -->
+            <div id="voice-preview" class="voice-preview" hidden aria-live="polite"></div>
             <textarea id="input" rows="1" placeholder="Message your model…"></textarea>
           </div>
           <button type="button" id="mic-btn" class="composer-attach-btn" hidden data-tooltip="Hold to speak (or click to toggle)" data-tooltip-side="top" aria-label="Push to talk">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
           </button>
+          <button type="button" id="voice-stop-btn" class="composer-attach-btn voice-stop-btn" hidden data-tooltip="Stop bot audio" data-tooltip-side="top" aria-label="Stop audio playback">
+            <!-- Stop-circle: a filled square for "stop the sound" -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6" rx="1" fill="currentColor"/></svg>
+          </button>
+          <button type="button" id="call-btn" class="composer-attach-btn" hidden data-tooltip="Call the bot (continuous conversation; click again to hang up)" data-tooltip-side="top" aria-label="Call the bot">
+            <!-- Feather: phone — start/end a live duplex audio call -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+          </button>
+          <span id="call-status" class="call-status" hidden aria-live="polite"></span>
           <button type="submit" id="send-btn" class="btn btn-primary" data-tooltip="Send (Enter)" data-tooltip-side="top" aria-label="Send">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
           </button>

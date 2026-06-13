@@ -1,0 +1,68 @@
+# miniclosedai-voice — standalone compose for the open-source ASR + TTS service.
+#
+# Boot:
+#   cd miniclosedai-voice && docker compose up -d
+#
+# Tail logs:
+#   docker compose logs -f
+#
+# Stop:
+#   docker compose down
+#
+# The published port `8090:8090` binds on 0.0.0.0 by default — so once this is
+# up you can reach it from any host on the LAN at  http://<this-host-ip>:8090
+# (e.g. http://192.168.0.110:8090 from your other laptop). If your host firewall
+# (ufw, etc.) blocks inbound 8090, allow it explicitly, e.g.
+#     sudo ufw allow from 192.168.0.0/24 to any port 8090 proto tcp
+#
+# To restrict to a specific NIC instead of 0.0.0.0, replace the ports line with
+#   - "192.168.0.110:8090:8090"
+# (loopback-only would be "127.0.0.1:8090:8090".)
+services:
+  voice:
+    build: .
+    image: miniclosedai-voice:latest
+    container_name: miniclosedai-voice
+    restart: unless-stopped
+    # Host networking is REQUIRED for WebRTC (call mode 📞) to work. The
+    # FastRTC handler opens UDP sockets for the media stream and advertises
+    # those sockets' IPs as ICE candidates in its SDP answer. With Docker
+    # bridge networking, those candidates are the bridge IPs (172.x.x.x),
+    # which a browser on the LAN can't route to — ICE fails silently and the
+    # call connects on paper but no audio ever reaches the handler.
+    # With host mode, the container shares the host's network stack so its
+    # ICE candidates are the host's actual LAN IPs (e.g. 192.168.0.110).
+    # Side effect: the `ports:` block below is ignored — 8090 is just on the
+    # host directly. Push-to-talk (🎤) and Settings → Test still work fine.
+    network_mode: host
+    ports:
+      - "8090:8090"            # → 0.0.0.0:8090 → container :8090
+    environment:
+      # CPU defaults — change to large-v3 + cuda when running on a GPU pod.
+      VOICE_ASR_MODEL: ${VOICE_ASR_MODEL:-tiny}
+      VOICE_DEVICE: ${VOICE_DEVICE:-auto}
+      VOICE_API_KEY: ${VOICE_API_KEY:-}
+      VOICE_PORT: 8090
+    volumes:
+      - voice_models:/root/.cache/huggingface   # whisper model cache
+      - voice_pipers:/voices                    # Piper voice .onnx files
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Uncomment the next block if you have an NVIDIA GPU + the container
+    # toolkit installed, and want CUDA inside the container:
+    #
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  voice_models:
+  voice_pipers:
