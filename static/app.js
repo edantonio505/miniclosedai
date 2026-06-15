@@ -6228,6 +6228,35 @@ function initLogsUI() {
   const filterEl = document.getElementById("logs-filter");
   const pauseEl = document.getElementById("logs-pause-toggle");
   const clearEl = document.getElementById("logs-clear-btn");
+  const exportEl = document.getElementById("logs-export-btn");
+  if (exportEl) {
+    exportEl.addEventListener("click", async () => {
+      // Hit the export endpoint and trigger a browser save via Content-
+      // Disposition. We use a Blob URL + click rather than location.assign
+      // so we can surface a failure as an alert instead of a blank tab.
+      exportEl.disabled = true;
+      const orig = exportEl.textContent;
+      exportEl.textContent = "Exporting…";
+      try {
+        const r = await fetch("/api/logs/export");
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const blob = await r.blob();
+        const disp = r.headers.get("Content-Disposition") || "";
+        const m = /filename="([^"]+)"/.exec(disp);
+        const fname = m ? m[1] : `miniclosedai-logs-${Date.now()}.json`;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = fname;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        alert("Export failed: " + (e?.message || e));
+      } finally {
+        exportEl.textContent = orig;
+        exportEl.disabled = false;
+      }
+    });
+  }
   if (filterEl) {
     filterEl.addEventListener("input", () => {
       _logsState.filter = filterEl.value || "";
