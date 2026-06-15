@@ -346,13 +346,14 @@
       <div class="logs-header">
         <div>
           <h1>LLM logs</h1>
-          <p class="logs-hint">Live record of every chat call across all endpoints — request metadata, response preview, and latency. Up to 500 most-recent entries; reset on server restart.</p>
+          <p class="logs-hint">Live record of every chat call across all endpoints — request metadata, response preview, and latency. Up to 200 most-recent entries; reset on server restart. <strong>Export</strong> downloads the full request+response pairs as JSON.</p>
         </div>
         <div class="logs-actions">
           <label class="logs-pause">
             <input type="checkbox" id="logs-pause-toggle" />
             <span>Pause</span>
           </label>
+          <button type="button" id="logs-export-btn" class="btn btn-small" title="Download every captured request paired with its full response as JSON">Export</button>
           <button type="button" id="logs-clear-btn" class="btn btn-small">Clear</button>
         </div>
       </div>

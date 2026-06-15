@@ -17,11 +17,14 @@ from collections import deque
 from datetime import datetime, timezone
 from threading import Lock
 
-_MAX_ENTRIES = 500
+_MAX_ENTRIES = 200            # smaller now that each entry stores full content
 _RESPONSE_PREVIEW_CHARS = 2000
 _THINKING_PREVIEW_CHARS = 1000
 _PER_MESSAGE_PREVIEW = 500
-_MESSAGES_TAIL = 3   # only the last N turns get included; older ones are silently dropped
+_MESSAGES_TAIL = 3   # only the last N turns get included in the preview list view
+# Full-content cap to avoid blowing memory on a runaway response. Plenty for
+# normal chats; truncations are flagged on the entry so the export shows it.
+_FULL_RESPONSE_CAP = 200_000
 
 _buffer: deque[dict] = deque(maxlen=_MAX_ENTRIES)
 _lock = Lock()
@@ -91,6 +94,11 @@ def record_chat(
     try:
         resp_preview, resp_truncated = _truncate(response_text, _RESPONSE_PREVIEW_CHARS)
         think_preview, think_truncated = _truncate(thinking_text, _THINKING_PREVIEW_CHARS)
+        # Full content for the Export button — capped only by _FULL_RESPONSE_CAP.
+        # The list view still uses the truncated `messages` / `response.preview`
+        # fields so polling /api/logs stays cheap.
+        full_resp = (response_text or "")[:_FULL_RESPONSE_CAP]
+        full_think = (thinking_text or "")[:_FULL_RESPONSE_CAP] if thinking_text else None
         entry = {
             "id": next(_counter),
             "ts": _now_iso(),
@@ -116,6 +124,13 @@ def record_chat(
             "status": status,
             "error": error,
             "latency_ms": latency_ms,
+            # Full payload for export. Not surfaced by /api/logs (the polling
+            # list endpoint) to keep that response small.
+            "_full": {
+                "messages": messages or [],
+                "response_text": full_resp,
+                "thinking_text": full_think,
+            },
         }
         with _lock:
             _buffer.append(entry)
@@ -126,10 +141,25 @@ def record_chat(
 
 
 def get_all() -> list[dict]:
-    """Newest-first snapshot of the buffer. The GUI renders top-down so the
-    most recent call is at the top of the list."""
+    """Newest-first snapshot for the polling list view. Strips the heavy
+    `_full` payload to keep the response small — use `get_all_full()` for the
+    export endpoint instead."""
     with _lock:
-        return list(reversed(_buffer))
+        return [{k: v for k, v in e.items() if k != "_full"} for e in reversed(_buffer)]
+
+
+def get_all_full() -> list[dict]:
+    """Newest-first snapshot with the full request messages + full response
+    text inlined. Used by `GET /api/logs/export`."""
+    with _lock:
+        return [
+            {**{k: v for k, v in e.items() if k != "_full"},
+             "request_messages": e.get("_full", {}).get("messages", []),
+             "response_text": e.get("_full", {}).get("response_text", ""),
+             "thinking_text": e.get("_full", {}).get("thinking_text"),
+             }
+            for e in reversed(_buffer)
+        ]
 
 
 def clear() -> None:

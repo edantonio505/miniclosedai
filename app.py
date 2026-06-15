@@ -729,6 +729,37 @@ def api_clear_logs():
     return {"ok": True}
 
 
+@app.get("/api/logs/export")
+def api_export_logs():
+    """Paired request/response CSV — two columns, the entire LLM input as text
+    and the entire LLM output as text. Messages are JSON-stringified so the
+    full system prompt + history + user turn is preserved in one cell. Used by
+    the Logs page Export button. QUOTE_ALL keeps Excel/Sheets happy when the
+    content contains commas, newlines, or quotes."""
+    import csv
+    import io as _io
+    items = chat_logs.get_all_full()
+    buf = _io.StringIO()
+    w = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    w.writerow(["request", "response"])
+    for e in items:
+        request_text = json.dumps(
+            e.get("request_messages") or [], ensure_ascii=False
+        )
+        response_text = e.get("response_text") or ""
+        w.writerow([request_text, response_text])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="miniclosedai-logs-'
+                f'{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")}.csv"'
+            )
+        },
+    )
+
+
 @app.delete("/api/backends/{backend_id}/pulls/{name:path}")
 async def api_cancel_pull(backend_id: int, name: str):
     key = _pull_key(backend_id, name)
