@@ -3833,6 +3833,7 @@ function _finalizeCallAssistantBubble() {
 // Per-stage status labels with emoji prefixes — server emits the raw stage,
 // browser maps to the user-facing string. `null` hides the pill.
 const _CALL_STATUS_LABELS = {
+  connecting:   "🔌 Connecting…",
   listening:    "🎙 Listening…",
   transcribing: "✍ Transcribing…",
   thinking:     "💭 Thinking…",
@@ -3899,9 +3900,13 @@ async function _startCall() {
   if (_call.state !== "idle") return;
   _call.state = "dialing";
   els.callBtn.classList.add("calling");
-  // Show a placeholder status while the connection comes up; the server
-  // will start emitting real {status: ...} events the moment audio flows.
-  _setCallStatus("listening");
+  // Show "Connecting…" until the WebRTC peer connection actually establishes
+  // and the voice server is ready to receive audio. Once the connectionstate
+  // listener (below) flips to "connected", we switch the pill to "Listening".
+  // Otherwise the UI says "Listening" while the call is still in the multi-
+  // second WebRTC handshake / model-warmup window — misleading the user
+  // into talking before the pipeline can hear them.
+  _setCallStatus("connecting");
 
   const voiceBackend = (backendCache || []).find(b => b.kind === "voice" && b.enabled);
   if (!voiceBackend) {
@@ -3986,6 +3991,11 @@ async function _startCall() {
     const s = _call.pc?.connectionState;
     if (s === "connected") {
       _call.state = "talking";
+      // Audio is now actually flowing — flip the pill from "Connecting…"
+      // to "Listening" so the user knows it's safe to speak. The server
+      // will overwrite this with transcribing / thinking / speaking as
+      // each pipeline stage takes over.
+      _setCallStatus("listening");
     } else if (s === "failed" || s === "disconnected" || s === "closed") {
       if (_call.state !== "hanging-up" && _call.state !== "idle") _endCall();
     }
