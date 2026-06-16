@@ -2916,6 +2916,158 @@ class VoiceSayRequest(BaseModel):
     language: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Voice text-processing helpers — kept local to the voice section so the
+# main chat path stays free of TTS-specific cleanup.
+# ---------------------------------------------------------------------------
+# Sentence terminator followed by whitespace + a likely next-sentence cue
+# (uppercase letter / opening quote / paren / digit). Lookahead so we don't
+# consume the next sentence's first character.
+_VOICE_SPLIT_PAT = re.compile(r"[.!?][\"')\]]?(\s+)(?=[A-Z\"'(0-9])")
+# Soft boundary: terminator + newline (paragraph end).
+_VOICE_NEWLINE_PAT = re.compile(r"[.!?][\"')\]]?\n+")
+# Abbreviations whose trailing dot must NOT be treated as a sentence boundary.
+_VOICE_ABBREVIATIONS = frozenset({
+    "mr.", "mrs.", "ms.", "dr.", "sr.", "jr.", "st.", "vs.", "etc.",
+    "e.g.", "i.e.", "u.s.", "u.k.", "u.n.", "inc.", "ltd.", "co.", "no.",
+    "fig.", "vol.", "ed.", "ch.", "pg.", "p.", "pp.", "approx.", "min.",
+    "max.", "avg.", "incl.", "excl.", "rev.", "est.",
+})
+_VOICE_LAST_WORD_PAT = re.compile(r"\S+$")
+
+
+def _next_voice_sentence(buf: str, *, min_len: int = 20, force_max: int = 240) -> tuple[str | None, str]:
+    """Pop the next complete sentence off `buf`. Returns (sentence, remaining)."""
+    if len(buf) >= force_max:
+        # Hard cap so a runaway no-punctuation reply still flushes to TTS.
+        for i in range(force_max, max(force_max - 60, 1), -1):
+            if i < len(buf) and buf[i].isspace():
+                return buf[:i].strip(), buf[i:].lstrip()
+        return buf[:force_max].strip(), buf[force_max:]
+
+    candidates: list[int] = []
+    for m in _VOICE_NEWLINE_PAT.finditer(buf):
+        candidates.append(m.end())
+    for m in _VOICE_SPLIT_PAT.finditer(buf):
+        # Skip if the word just before the terminator looks like an abbreviation.
+        before = buf[:m.start() + 1]
+        wmatch = _VOICE_LAST_WORD_PAT.search(before)
+        if wmatch and wmatch.group(0).lower() in _VOICE_ABBREVIATIONS:
+            continue
+        candidates.append(m.end())
+    if not candidates:
+        return None, buf
+    cut = min(candidates)
+    sentence = buf[:cut].strip()
+    if len(sentence) < min_len:
+        return None, buf
+    return sentence, buf[cut:].lstrip()
+
+
+# Patterns for clean_for_tts — same set call.py uses, kept in sync manually.
+_TTS_BOLD_ITALIC   = re.compile(r"\*{1,3}([^*]+?)\*{1,3}")
+_TTS_HEADER        = re.compile(r"^#{1,6}\s*", re.MULTILINE)
+_TTS_BULLET        = re.compile(r"^\s*[-*•·]\s+", re.MULTILINE)
+_TTS_LETTER_BULLET = re.compile(r"^\s*[A-Za-z]\)\s+", re.MULTILINE)
+_TTS_DIGIT_BULLET  = re.compile(r"^\s*\d+[.)]\s+", re.MULTILINE)
+_TTS_BACKTICKS     = re.compile(r"`+")
+_TTS_PIPES         = re.compile(r"\|")
+_TTS_BRACKETS      = re.compile(r"[\[\]]")
+_TTS_LINK_URL      = re.compile(r"\(https?://[^\s)]+\)")
+_TTS_TILDE_HEAVY   = re.compile(r"~{1,3}([^~]+?)~{1,3}")
+_TTS_ANGLE_TAGS    = re.compile(r"<[^>]+>")
+_TTS_NON_ASCII     = re.compile(r"[^\x00-\x7F]+")
+_TTS_MANY_BLANKS   = re.compile(r"\n{2,}")
+_TTS_WS            = re.compile(r"\s+")
+
+
+def _clean_for_tts(text: str) -> str:
+    """Strip markdown / emojis / list bullets that the TTS would read literally.
+
+    Mirrors `clean_for_tts` in miniclosedai-voice/call.py so the call path AND
+    push-to-talk path produce identical, TTS-safe input.
+    """
+    if not text:
+        return ""
+    t = text
+    t = re.sub(r"```[\s\S]*?```", " ", t)
+    t = _TTS_BOLD_ITALIC.sub(r"\1", t)
+    t = _TTS_TILDE_HEAVY.sub(r"\1", t)
+    t = _TTS_HEADER.sub("", t)
+    t = _TTS_BULLET.sub("", t)
+    t = _TTS_LETTER_BULLET.sub("", t)
+    t = _TTS_DIGIT_BULLET.sub("", t)
+    t = _TTS_BACKTICKS.sub("", t)
+    t = _TTS_LINK_URL.sub("", t)
+    t = _TTS_BRACKETS.sub("", t)
+    t = _TTS_PIPES.sub(" ", t)
+    t = _TTS_ANGLE_TAGS.sub("", t)
+    t = _TTS_NON_ASCII.sub("", t)
+    t = _TTS_MANY_BLANKS.sub(" ", t)
+    t = _TTS_WS.sub(" ", t)
+    return t.strip()
+
+
+async def _stream_llm_and_tts(
+    *,
+    llm_backend: dict, model: str, messages: list[dict], eff: dict,
+    voice_backend: dict, voice_id: str, lang: str,
+):
+    """Stream LLM tokens, sentence-buffer them, clean each, TTS per sentence.
+
+    Yields a sequence of SSE-bound dict events:
+        {"chunk": "<assistant token>"}                  × N   — verbatim LLM tokens
+        {"audio_chunk_b64": "...", "sample_rate": int}  × M   — TTS audio per sentence
+        {"_full_reply": "<complete reply text>"}              — terminal, for persistence
+
+    Each completed sentence is fed to the voice backend's /speak/stream as
+    soon as the LLM emits a sentence boundary, so the user starts hearing
+    the bot's first sentence while later sentences are still being generated.
+    """
+    collected: list[str] = []
+    buffer = ""
+
+    async def _flush_to_tts(text: str):
+        cleaned = _clean_for_tts(text)
+        if not cleaned:
+            return
+        async for audio_ev in voice.speak_stream(voice_backend, cleaned, voice_id, lang):
+            if "chunk_b64" in audio_ev:
+                yield {
+                    "audio_chunk_b64": audio_ev["chunk_b64"],
+                    "sample_rate": audio_ev.get("sample_rate"),
+                }
+
+    async for ev in llm.chat_stream(
+        llm_backend, model, messages,
+        temperature=eff["temperature"], max_tokens=eff["max_tokens"],
+        top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
+    ):
+        if "content" not in ev:
+            continue
+        piece = ev["content"]
+        collected.append(piece)
+        yield {"chunk": piece}
+        buffer += piece
+        # Drain every complete sentence currently in the buffer; one LLM
+        # chunk can finish multiple short sentences in a row.
+        while True:
+            sentence, buffer = _next_voice_sentence(buffer)
+            if not sentence:
+                break
+            async for audio_ev in _flush_to_tts(sentence):
+                yield audio_ev
+
+    # Final flush — any trailing fragment that didn't end with a terminator
+    # still gets spoken, otherwise the user wouldn't hear the last words.
+    tail = buffer.strip()
+    if tail:
+        async for audio_ev in _flush_to_tts(tail):
+            yield audio_ev
+
+    yield {"_full_reply": "".join(collected).strip()}
+
+
 def _load_conv_for_voice(conv_id: int) -> dict:
     with db.get_conn() as conn:
         row = conn.execute(
@@ -3102,46 +3254,41 @@ async def api_conv_voice_turn(
             yield f"data: {json.dumps({'end': True})}\n\n"
             return
 
-        collected: list[str] = []
-        try:
-            async for ev in llm.chat_stream(
-                llm_backend, eff["model"], messages,
-                temperature=eff["temperature"], max_tokens=eff["max_tokens"],
-                top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
-            ):
-                if "content" in ev:
-                    collected.append(ev["content"])
-                    yield f"data: {json.dumps({'chunk': ev['content']})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': f'LLM stream: {e}'})}\n\n"
-            yield f"data: {json.dumps({'end': True})}\n\n"
-            return
-
-        reply = "".join(collected).strip()
-        # Persist the turn (best-effort — UI surfaces the audio playback even
-        # if the DB write hits a transient error).
-        try:
-            user_msg = {"role": "user", "content": transcript}
-            _persist_conv_chat_turn(conv_id, [user_msg], reply, eff, llm_backend)
-        except Exception:
-            pass
-        if not reply:
-            yield f"data: {json.dumps({'end': True})}\n\n"
-            return
-
-        # 3. TTS
+        # 3. Resolve TTS voice up front so we can stream sentence-by-sentence.
         try:
             voice_id, lang = await _resolve_voice_choice(conv, voice_backend)
         except HTTPException as e:
             yield f"data: {json.dumps({'error': f'voice choice: {e.detail}'})}\n\n"
             yield f"data: {json.dumps({'end': True})}\n\n"
             return
+
+        # 4. Stream LLM tokens AND TTS audio interleaved — each completed
+        #    sentence is cleaned and fed to the voice backend's /speak/stream
+        #    immediately, so the first audio chunk lands while the model is
+        #    still producing later sentences.
+        full_reply = ""
         try:
-            async for ev in voice.speak_stream(voice_backend, reply, voice_id, lang):
-                if "chunk_b64" in ev:
-                    yield f"data: {json.dumps({'audio_chunk_b64': ev['chunk_b64'], 'sample_rate': ev.get('sample_rate')})}\n\n"
+            async for ev in _stream_llm_and_tts(
+                llm_backend=llm_backend, model=eff["model"],
+                messages=messages, eff=eff,
+                voice_backend=voice_backend, voice_id=voice_id, lang=lang,
+            ):
+                if "_full_reply" in ev:
+                    full_reply = ev["_full_reply"]
+                    continue
+                yield f"data: {json.dumps(ev)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'error': f'TTS: {e}'})}\n\n"
+            yield f"data: {json.dumps({'error': f'LLM/TTS stream: {e}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        # Persist the turn (best-effort — UI surfaces the audio playback even
+        # if the DB write hits a transient error).
+        try:
+            user_msg = {"role": "user", "content": transcript}
+            _persist_conv_chat_turn(conv_id, [user_msg], full_reply, eff, llm_backend)
+        except Exception:
+            pass
 
         yield f"data: {json.dumps({'end': True})}\n\n"
 
@@ -3203,35 +3350,7 @@ async def api_conv_voice_say(conv_id: int, req: VoiceSayRequest):
             yield f"data: {json.dumps({'end': True})}\n\n"
             return
 
-        # 3. Stream LLM reply.
-        collected: list[str] = []
-        try:
-            async for ev in llm.chat_stream(
-                llm_backend, eff["model"], messages,
-                temperature=eff["temperature"], max_tokens=eff["max_tokens"],
-                top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
-            ):
-                if "content" in ev:
-                    collected.append(ev["content"])
-                    yield f"data: {json.dumps({'chunk': ev['content']})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': f'LLM stream: {e}'})}\n\n"
-            yield f"data: {json.dumps({'end': True})}\n\n"
-            return
-
-        reply = "".join(collected).strip()
-        # Persist the (user, assistant) pair so refresh + history still work.
-        try:
-            user_msg = {"role": "user", "content": transcript}
-            _persist_conv_chat_turn(conv_id, [user_msg], reply, eff, llm_backend)
-        except Exception:
-            pass
-        if not reply:
-            yield f"data: {json.dumps({'end': True})}\n\n"
-            return
-
-        # 4. TTS — same voice resolution as /voice/turn. The req can override
-        #    the bot's saved prefs for this one turn.
+        # 3. Resolve TTS voice up front so we can stream sentence-by-sentence.
         try:
             voice_id, lang = await _resolve_voice_choice(
                 conv, voice_backend,
@@ -3241,12 +3360,33 @@ async def api_conv_voice_say(conv_id: int, req: VoiceSayRequest):
             yield f"data: {json.dumps({'error': f'voice choice: {e.detail}'})}\n\n"
             yield f"data: {json.dumps({'end': True})}\n\n"
             return
+
+        # 4. Stream LLM tokens AND TTS audio interleaved. Each completed
+        #    sentence is cleaned (strip markdown / emojis / bullets) and
+        #    handed to the voice backend's /speak/stream as soon as it
+        #    closes, so the first audio chunk lands while the LLM is still
+        #    generating later sentences — same pattern as call.py.
+        full_reply = ""
         try:
-            async for ev in voice.speak_stream(voice_backend, reply, voice_id, lang):
-                if "chunk_b64" in ev:
-                    yield f"data: {json.dumps({'audio_chunk_b64': ev['chunk_b64'], 'sample_rate': ev.get('sample_rate')})}\n\n"
+            async for ev in _stream_llm_and_tts(
+                llm_backend=llm_backend, model=eff["model"],
+                messages=messages, eff=eff,
+                voice_backend=voice_backend, voice_id=voice_id, lang=lang,
+            ):
+                if "_full_reply" in ev:
+                    full_reply = ev["_full_reply"]
+                    continue
+                yield f"data: {json.dumps(ev)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'error': f'TTS: {e}'})}\n\n"
+            yield f"data: {json.dumps({'error': f'LLM/TTS stream: {e}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        try:
+            user_msg = {"role": "user", "content": transcript}
+            _persist_conv_chat_turn(conv_id, [user_msg], full_reply, eff, llm_backend)
+        except Exception:
+            pass
 
         yield f"data: {json.dumps({'end': True})}\n\n"
 
