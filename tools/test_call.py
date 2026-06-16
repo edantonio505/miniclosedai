@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import subprocess
 import sys
@@ -62,15 +63,26 @@ def main() -> int:
                    help="Print the raw JSON report instead of the human-readable summary")
     args = p.parse_args()
 
-    repo = Path(__file__).resolve().parent.parent
-    compose_yml = repo / "miniclosedai-voice" / "docker-compose.yml"
-    if not compose_yml.exists():
-        print(f"{RED}docker-compose.yml not found at {compose_yml}{RESET}", file=sys.stderr)
+    # The voice service is its own repo, sibling to miniclosedai/ by default.
+    # Override with MINICLOSEDAI_VOICE_DIR for non-default layouts.
+    voice_dir = Path(
+        os.environ.get("MINICLOSEDAI_VOICE_DIR")
+        or (Path(__file__).resolve().parent.parent.parent / "miniclosedai-voice")
+    )
+    test_client = voice_dir / "test_client.py"
+    if not test_client.exists():
+        print(f"{RED}test_client.py not found at {test_client}{RESET}", file=sys.stderr)
+        print(f"{DIM}Set MINICLOSEDAI_VOICE_DIR to point at your miniclosedai-voice checkout.{RESET}",
+              file=sys.stderr)
         return 2
 
+    # Prefer the venv Python (setup.sh creates it). Fall back to system Python
+    # if running against a Docker container's exec or some other layout.
+    venv_python = voice_dir / "env" / "bin" / "python"
+    py = str(venv_python) if venv_python.exists() else "python3"
+
     cmd = [
-        "docker", "compose", "-f", str(compose_yml), "exec", "-T", "voice",
-        "python", "/app/test_client.py",
+        py, str(test_client),
         "--url", args.url,
         "--conv-id", str(args.conv_id),
         "--phrase", args.phrase,
