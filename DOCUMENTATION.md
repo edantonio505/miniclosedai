@@ -26,7 +26,7 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 3. [Running](#running)
 4. [Docker deployment](#docker-deployment)
 5. [UI features](#ui-features)
-6. [Voice — push-to-talk (Dockerized ASR + TTS service)](#voice-push-to-talk-via-a-separate-dockerized-asr--tts-service)
+6. [Voice — push-to-talk + call mode (separate microservice repo)](#voice-push-to-talk--call-mode-via-a-separate-microservice)
 7. [Apps + per-app SDK generation (TypeScript / JavaScript / Python)](#apps-groups-of-bots-and-per-app-sdk-generation)
 8. [Knowledge base (RAG)](#knowledge-base-rag)
 7. [Extensibility — MCP plugins](#extensibility--mcp-plugins)
@@ -431,46 +431,77 @@ Vertical-nav button (terminal icon, between Bots and Settings in the activity ba
 
 ---
 
-## Voice (push-to-talk via a separate Dockerized ASR + TTS service)
+## Voice (push-to-talk + call mode via a separate microservice)
 
-A self-hosted voice surface for any bot: hold the 🎤 on the chat composer, talk, release; the transcript appears as the user turn, the assistant reply streams in **and speaks back**, all in one round trip. The audio plumbing is intentionally split between **two containers** so MiniClosedAI doesn't carry GPU-heavy model dependencies and so the voice service is interchangeable between local (CPU) and remote (RunPod GPU) without touching MiniClosedAI's code.
+Self-hosted voice for any bot. **Push-to-talk** (🎤) for short turns, **call mode** (📞) for full-duplex WebRTC conversation. The voice service runs in its own process — and **its own GitHub repo**, [edantonio505/miniclosedai-voice](https://github.com/edantonio505/miniclosedai-voice) — so MiniClosedAI carries no GPU dependencies and the voice service can swap engines without touching MiniClosedAI's code.
 
 ### Architecture
 
+**Push-to-talk turn:**
+
 ```
-Browser                       MiniClosedAI                 Voice Docker             Ollama / LLM
-─────────                     ─────────────                 ────────────             ────────────
+Browser                         MiniClosedAI                          Voice service                 Ollama / LLM
+─────────                       ─────────────                         ─────────────                 ────────────
 🎤 hold
   ↓ MediaRecorder (WebM/Opus)
   ↓ POST multipart
-  ───────────────────────►   /api/conversations/{id}/voice/turn
-                               │  (1) /transcribe ─────►    faster-whisper → text
-                               │  (2) chat path ──────────────────────────────►   bot reply (streamed)
-                               │  (3) /speak/stream ───►    Piper → SSE PCM chunks
-                               ◄──────────────────────────
+  ─────────────────────────►   /api/conversations/{id}/voice/turn
+                                 │  (1) /transcribe ──────────────►   HF Whisper → text
+                                 │  (2) chat path streams ───────────────────────────────────►   bot reply (tokens)
+                                 │  (3) sentence-buffer + clean_for_tts → /speak/stream  ─►   Chatterbox Turbo → PCM
+                                 ◄────────────────────────────────
   ◄── SSE: {transcript}, {chunk} × N, {audio_chunk_b64} × M, {end} ──
   Web Audio playback queue
 ```
 
-### Voice service — `miniclosedai-voice/`
+**Call mode turn:**
 
-A standalone FastAPI app (one folder, one Docker image). MIT-licensed open-source stack:
+```
+Browser                         MiniClosedAI                          Voice service                 Ollama / LLM
+─────────                       ─────────────                         ─────────────                 ────────────
+📞 click
+  ↓ getUserMedia + RTCPeerConnection.createOffer
+  ↓ POST /call/configure        (proxied as same-origin HTTPS)
+  ↓ POST /call/offer            (SDP exchange)
+  ◄── SDP answer
+  ───── WebRTC media flows browser ↔ voice service ─────►
+                                                                     Silero VAD waits for pause
+                                                                     HF Whisper → text
+                                ◄── POST /chat/stream ───────────────
+                                  bot reply tokens stream ──────────►   tokens
+                                                                     sentence-buffer + clean_for_tts
+                                                                     Chatterbox Turbo per sentence
+                                ─── SSE /call/events/{webrtc_id} ──►   browser updates bubble + status pill
+                                  {transcript}, {chunk}, {audio plays via WebRTC track}, {end}
+```
+
+### Voice service — separate repo
+
+A standalone FastAPI app. Clone it as a sibling directory; `dev.sh` and `tools/test_call.py` auto-discover it (or set `MINICLOSEDAI_VOICE_DIR`). Bash install — no Docker required.
 
 | Layer | Library | Notes |
 |---|---|---|
-| ASR | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | CTranslate2 Whisper. Multilingual. fp16 on GPU, int8 on CPU. `VOICE_ASR_MODEL` picks `tiny`/`base`/`small`/`medium`/`large-v3`. |
-| TTS | [Piper](https://github.com/rhasspy/piper) | ONNX runtime. v1 ships 4 EN + 4 ES voices; auto-downloads from `rhasspy/piper-voices` on Hugging Face on first use. |
-| HTTP | FastAPI + uvicorn | Single worker (GPU is serialized). CORS open. Optional `VOICE_API_KEY` Bearer auth. |
+| ASR | HuggingFace **Whisper** via `transformers` + PyTorch (cu118 / cu124 / cu128 / cu130 / cpu) | `small.en` default; switchable to `tiny.en` / `medium.en` / `large-v3` via `VOICE_ASR_MODEL`. p50 ASR ~350ms on GB10. |
+| TTS | **Chatterbox Turbo** (`chatterbox-tts` 0.1.6, installed `--no-deps` to bypass its torch==2.6 hard pin) | Token-streaming, fp16 transformer, **4** CFM diffusion steps (vs default 1000). ~700ms median first-chunk latency. Voice cloning via reference WAVs in `voices/<id>.wav`. |
+| VAD | Silero VAD via `fastrtc[vad]` | `min_silence_duration_ms=300`, `can_interrupt=False` (anti-echo). |
+| Denoise | DeepFilterNet (sed-patched for torchaudio≥2.10) | ONNX, single-digit ms on GPU. |
+| WebRTC | aiortc via FastRTC | mounts `/webrtc/offer`; `/call/events` SSE forwards `AdditionalOutputs` from the BotCallHandler. |
+| HTTP | FastAPI + uvicorn | Single worker (GPU serialized). Optional `VOICE_API_KEY` Bearer auth. |
 
-The five-endpoint contract (`miniclosedai-voice/server.py`):
+The endpoint contract (`miniclosedai-voice/server.py`):
 
 ```
-GET  /health         — {ok, asr_model, tts_model, device, voices_loaded}
-GET  /voices         — {"en": [{id,name,gender}, ...], "es": [...]}
-POST /transcribe     — multipart audio (+optional language) → {text, language, segments}
-POST /speak          — JSON {text, voice, language, speed?} → audio/wav body
-POST /speak/stream   — same body → SSE: {chunk_b64, sample_rate} × N, then {done:true}
+GET  /health                      — {ok, asr_model, tts_model, device, voices_loaded}
+GET  /voices                      — {"en": [{id,name,gender}, ...], "es": [...]}
+POST /transcribe                  — multipart audio (+optional language) → {text, language, segments}
+POST /speak                       — JSON {text, voice, language, speed?} → audio/wav body
+POST /speak/stream                — same body → SSE: {chunk_b64, sample_rate} × N, then {done:true}
+POST /call/configure              — per-call config (conv_id, miniclosedai_url, voice, language)
+POST /webrtc/offer                — SDP offer → SDP answer (mounted by FastRTC)
+GET  /call/events/{webrtc_id}     — SSE: {status}, {transcript}, {chunk}, {audio frames over WebRTC}, {end}
 ```
+
+The voice service ships its own **`./test.sh`** smoke harness (15 assertions covering imports, GPU, all HTTP endpoints, ASR round-trip, WebRTC handshake) — run it before every voice-side commit.
 
 ### MiniClosedAI side
 

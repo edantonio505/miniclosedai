@@ -26,7 +26,7 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 3. [Install](#install) · [One-line install](#quickest--one-line-install-macos-linux-wsl) · [Docker quick start (with baked models)](#docker-quick-start-with-baked-models)
 4. [Run](#run)
 5. [Your first bot — 60 seconds](#your-first-bot--60-seconds)
-6. [UI guide](#ui-guide) · [Sidebar panels — Knowledge / Extensions / Evals](#sidebar) · [Apps + per-app SDK (TypeScript / JavaScript / Python)](#apps-page-grouping-bots--generate-a-per-app-sdk) · [Voice — push-to-talk](#voice--push-to-talk-in-the-chat-composer)
+6. [UI guide](#ui-guide) · [Sidebar panels — Knowledge / Extensions / Evals](#sidebar) · [Apps + per-app SDK (TypeScript / JavaScript / Python)](#apps-page-grouping-bots--generate-a-per-app-sdk) · [Voice — push-to-talk + call mode](#voice--push-to-talk--call-mode)
 7. [Connecting LM Studio and other OpenAI-compatible endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)
 8. [Generating system prompts](#generating-system-prompts)
 9. [The microservice pattern](#the-microservice-pattern)
@@ -430,46 +430,68 @@ What each language gives you:
 - Bot ids are **pinned in the generated files** — recreate a bot and its id changes; regenerate the SDK after structural changes.
 - There's **no auth on the API** and CORS is wide open (`allow_origins=["*"]`). Fine for LAN / your own infra; put a reverse proxy + auth in front before exposing port `8095` to the public internet.
 
-### Voice — push-to-talk in the chat composer
+### Voice — push-to-talk + call mode
 
-MiniClosedAI's chat composer can show a **🎤 push-to-talk button**, fed by a separate **voice service** (open-source ASR + TTS in a Docker container). The voice service connects to MiniClosedAI exactly like Ollama or LM Studio: you paste its URL into **Settings → LLM Endpoints → + Add endpoint**, pick **Voice (ASR + TTS)** as the kind, and the mic button appears.
+MiniClosedAI's chat composer surfaces **two voice buttons**, both fed by a separate **voice service** running as its own microservice. The voice service connects to MiniClosedAI exactly like Ollama or LM Studio: you paste its URL into **Settings → LLM Endpoints → + Add endpoint**, pick **Voice (ASR + TTS)** as the kind, and the voice buttons appear in the composer.
 
-The voice service lives in `miniclosedai-voice/` — a single FastAPI app wrapping **faster-whisper** (ASR) and **Piper** (TTS), packaged as one Docker image you run yourself.
+- **🎤 Push-to-talk** — hold the button, speak, release. Browser uploads the clip; ASR + LLM + TTS chain runs in one merged SSE.
+- **📞 Call mode** — click once, full-duplex WebRTC call. Continuous listening with VAD-based turn detection; the bot's reply streams back as audio while the text appears live in the bubble. Click again to hang up. A "Connecting…" pill shows during WebRTC handshake; flips to "Listening" the moment audio is actually flowing.
 
-**One image, two deployments:**
+If no voice backend is registered, both buttons stay hidden and the rest of MiniClosedAI works exactly as before — voice is strictly opt-in.
+
+#### The voice service lives in its own repo
+
+The voice microservice was split out of this repo into [**edantonio505/miniclosedai-voice**](https://github.com/edantonio505/miniclosedai-voice). It's a FastAPI app wrapping:
+
+| Layer | Engine | Notes |
+|---|---|---|
+| ASR | HuggingFace **Whisper** via `transformers` + PyTorch | `small.en` default; `tiny.en` / `medium.en` / `large-v3` selectable |
+| TTS | **Chatterbox Turbo** (token-streaming, fp16, 4 CFM steps) | ~700ms median first-chunk latency on GPU |
+| VAD | Silero VAD via `fastrtc[vad]` | tuned for conversational turn-taking (`min_silence_duration_ms=300`) |
+| Denoise | DeepFilterNet | ONNX, single-digit ms on GPU |
+| WebRTC | aiortc via FastRTC | mounts `/webrtc/offer`, exposes a `/call/events` SSE channel |
+
+It runs on any Linux machine with an NVIDIA driver (CUDA 11.8 / 12.4 / 12.8 / 13.x — auto-detected) **or CPU-only**. No Docker required.
+
+#### Bring it up
 
 ```bash
-# Local laptop (CPU is fine for the v1 'small' whisper + Piper voices)
-docker run --rm -p 8090:8090 \
-    -v voice_models:/root/.cache/huggingface \
-    -v voice_pipers:/voices \
-    miniclosedai-voice:latest
-
-# RunPod / any NVIDIA GPU host
-docker run --rm --gpus all -p 8090:8090 \
-    -e VOICE_ASR_MODEL=large-v3 -e VOICE_DEVICE=cuda \
-    -v voice_models:/root/.cache/huggingface \
-    -v voice_pipers:/voices \
-    miniclosedai-voice:latest
+git clone https://github.com/edantonio505/miniclosedai-voice.git
+cd miniclosedai-voice
+./setup.sh                  # detect CUDA, create env/, install everything
+./start.sh -d               # daemon mode; log → /tmp/voice.log
 ```
 
-Then in MiniClosedAI: Settings → LLM Endpoints → **+ Add endpoint** → kind **Voice (ASR + TTS)** → paste the URL (`http://localhost:8090` locally, or your RunPod proxy URL like `https://<pod-id>-8090.proxy.runpod.net`) → Test → Save. The mic button on the chat composer lights up once a voice backend is enabled.
+Then in MiniClosedAI: **Settings → + Add endpoint** → kind **Voice (ASR + TTS)** → paste the URL (`http://localhost:8090` locally, or your RunPod proxy URL like `https://<pod-id>-8090.proxy.runpod.net`) → Test → Save.
 
-**Voices in v1**: 4 English (Amy/Ryan/Alan/Jenny) and 4 Spanish (Dave/Sharvard/Claude/Ald) — Piper's MIT-licensed voices, sample rates 16–22 kHz. Add more by appending to `tts.py`'s `VOICE_CATALOG`; [the gallery](https://rhasspy.github.io/piper-samples/) lists 40+ EN and 10+ ES voices.
+Both buttons light up once a voice backend is enabled. Refresh the page if it doesn't pick up immediately.
 
-**How a turn flows:**
+#### How each turn flows
 
-1. Hold the 🎤 button → `MediaRecorder` captures audio (browser default codec — WebM/Opus on Chrome, OGG/Opus on Firefox, MP4 on Safari).
+**Push-to-talk (🎤):**
+
+1. Hold the button → `MediaRecorder` captures audio (WebM/Opus on Chrome, OGG/Opus on Firefox, MP4 on Safari).
 2. Release → the blob POSTs to `/api/conversations/{id}/voice/turn`.
-3. MiniClosedAI calls the voice service's `/transcribe` (ASR), runs the bot's normal chat path (RAG + relay-route + persistence intact), then calls `/speak/stream` for the reply.
-4. One merged SSE stream comes back: `{transcript}` (the ASR text appears as a user message), `{chunk}` × N (assistant text streams in), `{audio_chunk_b64}` × M (base64 PCM-16 plays seamlessly via Web Audio).
+3. MiniClosedAI calls the voice service's `/transcribe`, then streams the bot reply from `/chat/stream` while **buffering tokens into sentences**, **cleaning each one** (strips markdown `*` / `#` / `_`, emojis, list bullets, `<think>` tags, code fences — anything the TTS would mispronounce), and forwarding it to `/speak/stream`.
+4. One merged SSE stream comes back: `{transcript}` (user bubble), `{chunk}` × N (assistant text streams in live), `{audio_chunk_b64}` × M (base64 PCM-16 plays via Web Audio).
 
-**Caveats:**
-- No auth on the API by default; set `VOICE_API_KEY=…` on the voice container and use it as the backend's API key field if you expose it to the public internet.
-- Push-to-talk only in v1. Continuous-listen / wake-word voice mode is a follow-up that fits the same SSE backbone.
-- Per-bot voice + language selection isn't in the sidebar yet — the voice service defaults to the first English voice for every bot in v1. The plumbing (`conversations.voice_settings` JSON column + `voice_backend_id`/`voice_id`/`language` schema) is already in place for v2.
+**Call mode (📞):**
 
-See [`miniclosedai-voice/README.md`](./miniclosedai-voice/README.md) for the full API, the env-var matrix, and how to add more Piper voices.
+1. Click 📞 → browser opens a WebRTC peer connection to the voice service. Status pill shows **🔌 Connecting…**.
+2. WebRTC handshake completes → pill flips to **🎙 Listening…**. Silero VAD detects end-of-speech, the voice service runs Whisper → calls MiniClosedAI's `/chat/stream` → sentence-buffers tokens with the same cleaner → speaks per sentence via Chatterbox.
+3. Audio plays back through the same WebRTC connection. Text bubble updates live via the `/call/events/{webrtc_id}` SSE channel.
+4. Click 📞 again to hang up.
+
+#### Voice cloning
+
+Drop a 5–10 s clean speech WAV into `miniclosedai-voice/voices/` named `<id>.wav`. The shipped `voices/default.wav` is the fallback. Restart the voice service to pick up new voices.
+
+#### Caveats
+
+- No auth on the API by default; set `VOICE_API_KEY=…` on the voice service and use it as the backend's API key field if you expose it to the public internet.
+- `can_interrupt=False` is hardcoded in the voice service to prevent speaker→mic echo from cancelling the bot's reply mid-sentence. Re-enable for headsets with proper AEC. See the voice repo's README.
+
+See [the voice repo's README](https://github.com/edantonio505/miniclosedai-voice/blob/main/README.md) for the full API, performance numbers (ASR p50 ~350 ms, TTS first chunk ~700 ms), tuning knobs, and `./test.sh` end-to-end smoke harness.
 
 ### Chat view — topbar
 
@@ -2478,13 +2500,23 @@ MiniClosedAI ships a single-file end-to-end test suite. One command, no extra de
 python test_e2e.py
 ```
 
-Typical output: **28 tests, ~1.5 seconds, exits 0 on success** (1 on any failure, so it slots into CI or a pre-commit hook with no config).
+Typical output: **163 tests, ~16 seconds, exits 0 on success** (1 on any failure, so it slots into CI or a pre-commit hook with no config).
+
+For live voice-pipeline verification — once both servers are up via `./dev.sh up` — there's a separate **`tools/test_call.py`** harness that drives a real WebRTC call through the full ASR → LLM → TTS chain and reports per-stage timing:
+
+```bash
+./dev.sh test                                    # against the default bot
+./dev.sh test --conv-id 42 --phrase "..."        # against a specific bot
+```
+
+This is the right tool to run after changing the voice integration in `app.py` or the voice service itself.
 
 ### What it checks
 
 The suite is designed so every time you add or change a feature, running it catches the regressions that cost an afternoon to debug:
 
 - **Schema + migration** — additive `ALTER TABLE ADD COLUMN` is non-destructive, built-in Ollama is seeded at id=1, `init_db()` is idempotent.
+- **Voice integration — with and without backend** — `FakeVoice` fixture + a live-service probe verify `/transcribe`, `/speak`, `/speak/stream`, `/voice/turn` (sentence-streaming through the TTS), `/voice/say`, and the call signaling proxies (`/call/configure`, `/call/offer`, `/call/events`). A separate test confirms that **with no voice backend registered, voice endpoints return a clean 404 with a `Settings → + Add endpoint` hint** — proving the architectural guarantee that voice is fully optional.
 - **Backends CRUD** — create, patch, delete with guardrails (403 for the built-in, 409 when conversations are still bound); `api_key` scrubbed from responses.
 - **Probes** — `/api/backends/{id}/status`, `/models`, and the server-side `/api/backends/test` draft probe.
 - **Aggregated `/api/models`** — new grouped shape plus back-compat legacy keys.
@@ -2531,16 +2563,23 @@ Now every commit runs the suite first and refuses to record if anything is red.
 miniclosedai/
 ├── app.py                     # FastAPI routes (native + OpenAI-compat, multi-backend)
 ├── llm.py                     # Kind-dispatched client: Ollama + OpenAI-compat
+├── voice.py                   # Client for kind='voice' backends (transcribe / speak / call signaling)
 ├── db.py                      # SQLite schema + MINICLOSEDAI_DB_PATH env override
-├── logs.py                    # In-memory chat request/response buffer for the Logs page
+├── logs.py                    # In-memory chat request/response buffer for the Logs page (+ CSV export)
 ├── requirements.txt           # fastapi, uvicorn, httpx, pypdf, python-multipart
 ├── upgrade.sh                 # in-place upgrade: git pull + reinstall + restart with auto-rollback
+├── dev.sh                     # one-command launcher: brings up HTTPS uvicorn + voice service (if sibling)
+├── dev-https.sh               # generate self-signed dev cert + start HTTPS uvicorn (for mic on LAN)
 ├── static/
 │   ├── index.html             # Single-page UI (activity bar + Dashboard + Settings)
 │   ├── style.css              # Design system (light + dark)
-│   └── app.js                 # Theme, splitters, chat, endpoint CRUD, grouped model dropdown
+│   └── app.js                 # Theme, splitters, chat, endpoint CRUD, grouped model dropdown,
+│                              #   push-to-talk recorder, call mode WebRTC client
 ├── scripts/
 │   └── bake-models.sh         # Docker: background-daemon Ollama pull with clean shutdown
+├── tools/
+│   └── test_call.py           # Programmatic call-quality test — drives the full WebRTC pipeline
+│                              #   end-to-end with timing breakdown (run via `./dev.sh test`)
 ├── Dockerfile                 # App image — python:3.12-slim, ~160 MB
 ├── Dockerfile.ollama          # Ollama image with 3 models baked in, ~10.3 GB
 ├── docker-compose.yml         # Two-service orchestration, GPU, healthchecks
@@ -2560,11 +2599,13 @@ miniclosedai/
 │       ├── Support Ticket Router.md        # JSON extractor / classifier
 │       ├── Inbound Lead Qualifier.md       # Scoring + routing
 │       └── RAG Query Router.md             # Bonsai-paired classifier
-├── test_e2e.py                # Single-file end-to-end regression suite
+├── test_e2e.py                # Single-file end-to-end regression suite (163 tests, ~16s)
 └── miniclosedai.db            # SQLite file (gitignored; Docker: in named volume)
 ```
 
-**Backend:** ~900 LoC Python total. **Frontend:** ~1700 LoC JS + ~850 CSS + ~240 HTML. **Docker scaffolding:** ~200 LoC across 6 files.
+**Voice service** lives in its **own repo** at [edantonio505/miniclosedai-voice](https://github.com/edantonio505/miniclosedai-voice). Clone it as a sibling directory (e.g. `../miniclosedai-voice/`) and `dev.sh` will find it automatically, or set `MINICLOSEDAI_VOICE_DIR` to a custom path.
+
+**Backend:** ~1100 LoC Python total. **Frontend:** ~2200 LoC JS + ~900 CSS + ~250 HTML. **Docker scaffolding:** ~200 LoC across 6 files.
 
 ---
 
