@@ -2916,6 +2916,20 @@ class VoiceSayRequest(BaseModel):
     language: str | None = None
 
 
+class CallTurnPersistRequest(BaseModel):
+    """Body for POST /api/conversations/{id}/voice/persist-call-turn.
+
+    Call mode uses persist=False on its /chat/stream POST for the latency
+    win (skips the resilient-background-task path). This separate endpoint
+    lets the voice service fire-and-forget the completed (user, assistant)
+    pair into the conversation history AFTER the audio is delivered to the
+    browser — same persistence shape as a normal /chat/stream turn, just
+    decoupled from the LLM call's hot path."""
+    model_config = ConfigDict(extra="forbid")
+    user: str = Field(..., min_length=1, max_length=8000)
+    assistant: str = Field(..., min_length=1, max_length=64000)
+
+
 # ---------------------------------------------------------------------------
 # Voice text-processing helpers — kept local to the voice section so the
 # main chat path stays free of TTS-specific cleanup.
@@ -3394,6 +3408,33 @@ async def api_conv_voice_say(conv_id: int, req: VoiceSayRequest):
         gen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/conversations/{conv_id}/voice/persist-call-turn")
+async def api_conv_voice_persist_call_turn(conv_id: int, req: CallTurnPersistRequest):
+    """Append a (user, assistant) pair from a completed call-mode turn.
+
+    Call mode hits /chat/stream with persist=False so the LLM hot path stays
+    fast. After the turn finishes streaming audio to the browser, the voice
+    service fires-and-forgets a POST here to write the turn into the
+    conversation's history — same shape as a normal /chat/stream persist,
+    just decoupled from the response-time-critical loop.
+
+    Returns 404 if the conversation doesn't exist, 200 on persist. Errors
+    in persistence are swallowed by the caller (fire-and-forget) so a
+    transient DB hiccup doesn't surface as a user-visible call failure.
+    """
+    conv = _load_conv_for_voice(conv_id)
+    # Reuse the chat resolver to produce the same `eff` + `backend` snapshot
+    # a normal turn would carry, so the persisted message has the same
+    # `params` dict the GUI renders alongside text-chat history.
+    chat_req = ConversationChatRequest(
+        message=req.user, include_history=False, persist=False,
+    )
+    _, _, eff, llm_backend = _resolve_conversation_chat(conv_id, chat_req)
+    user_msg = {"role": "user", "content": req.user.strip()}
+    _persist_conv_chat_turn(conv_id, [user_msg], req.assistant.strip(), eff, llm_backend)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
