@@ -3027,57 +3027,101 @@ async def _stream_llm_and_tts(
     llm_backend: dict, model: str, messages: list[dict], eff: dict,
     voice_backend: dict, voice_id: str, lang: str,
 ):
-    """Stream LLM tokens, sentence-buffer them, clean each, TTS per sentence.
+    """Stream LLM tokens AND TTS audio with FULL concurrency.
 
-    Yields a sequence of SSE-bound dict events:
-        {"chunk": "<assistant token>"}                  × N   — verbatim LLM tokens
-        {"audio_chunk_b64": "...", "sample_rate": int}  × M   — TTS audio per sentence
+    Yields SSE-bound dict events:
+        {"chunk": "<assistant token>"}                  × N — verbatim LLM tokens
+        {"audio_chunk_b64": "...", "sample_rate": int}  × M — TTS audio per sentence
         {"_full_reply": "<complete reply text>"}              — terminal, for persistence
 
-    Each completed sentence is fed to the voice backend's /speak/stream as
-    soon as the LLM emits a sentence boundary, so the user starts hearing
-    the bot's first sentence while later sentences are still being generated.
+    Earlier serial version awaited voice.speak_stream inside the LLM read
+    loop. While the audio chunks for sentence 1 were being yielded (~1 s of
+    Chatterbox synthesis), the LLM SSE socket was suspended — tokens 6, 7, 8
+    piled up in the network buffer, then drained as a burst, and you'd see
+    "complete paragraph then all audio at once". This concurrent version
+    splits the work into two tasks sharing one output queue, exactly the
+    same pattern call.py uses:
+
+      _llm_reader  ──reads SSE non-stop──►  text events to out_q
+                                            sentence_q for the TTS worker
+      _tts_worker  ──pops sentence──►  await voice.speak_stream  ──►  audio to out_q
+
+    The LLM SSE socket is read continuously regardless of TTS state, so
+    text events forward at LLM cadence. Audio chunks flow back the moment
+    Chatterbox emits each one.
     """
     collected: list[str] = []
     buffer = ""
+    out_q: asyncio.Queue = asyncio.Queue()
+    sentence_q: asyncio.Queue = asyncio.Queue()
+    SENTINEL = object()
 
-    async def _flush_to_tts(text: str):
-        cleaned = _clean_for_tts(text)
-        if not cleaned:
-            return
-        async for audio_ev in voice.speak_stream(voice_backend, cleaned, voice_id, lang):
-            if "chunk_b64" in audio_ev:
-                yield {
-                    "audio_chunk_b64": audio_ev["chunk_b64"],
-                    "sample_rate": audio_ev.get("sample_rate"),
-                }
+    async def _llm_reader():
+        nonlocal buffer
+        try:
+            async for ev in llm.chat_stream(
+                llm_backend, model, messages,
+                temperature=eff["temperature"], max_tokens=eff["max_tokens"],
+                top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
+            ):
+                if "content" not in ev:
+                    continue
+                piece = ev["content"]
+                collected.append(piece)
+                buffer += piece
+                # Forward the text IMMEDIATELY — the bubble streams at the LLM's
+                # actual token cadence regardless of what TTS is doing.
+                await out_q.put({"chunk": piece})
+                # Pump complete sentences onto sentence_q for the TTS worker.
+                while True:
+                    sentence, buffer = _next_voice_sentence(buffer)
+                    if not sentence:
+                        break
+                    await sentence_q.put(sentence)
+            # Trailing fragment that didn't end with a sentence terminator.
+            tail = buffer.strip()
+            if tail:
+                await sentence_q.put(tail)
+        except Exception as e:
+            await out_q.put({"error": f"LLM stream: {e}"})
+        finally:
+            await sentence_q.put(None)  # signal end-of-sentences to tts worker
 
-    async for ev in llm.chat_stream(
-        llm_backend, model, messages,
-        temperature=eff["temperature"], max_tokens=eff["max_tokens"],
-        top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
-    ):
-        if "content" not in ev:
-            continue
-        piece = ev["content"]
-        collected.append(piece)
-        yield {"chunk": piece}
-        buffer += piece
-        # Drain every complete sentence currently in the buffer; one LLM
-        # chunk can finish multiple short sentences in a row.
+    async def _tts_worker():
+        try:
+            while True:
+                sentence = await sentence_q.get()
+                if sentence is None:
+                    break
+                cleaned = _clean_for_tts(sentence)
+                if not cleaned:
+                    continue
+                try:
+                    async for audio_ev in voice.speak_stream(
+                        voice_backend, cleaned, voice_id, lang,
+                    ):
+                        if "chunk_b64" in audio_ev:
+                            await out_q.put({
+                                "audio_chunk_b64": audio_ev["chunk_b64"],
+                                "sample_rate": audio_ev.get("sample_rate"),
+                            })
+                except Exception as e:
+                    await out_q.put({"error": f"TTS: {e}"})
+        finally:
+            await out_q.put(SENTINEL)
+
+    llm_task = asyncio.create_task(_llm_reader())
+    tts_task = asyncio.create_task(_tts_worker())
+    try:
         while True:
-            sentence, buffer = _next_voice_sentence(buffer)
-            if not sentence:
+            ev = await out_q.get()
+            if ev is SENTINEL:
                 break
-            async for audio_ev in _flush_to_tts(sentence):
-                yield audio_ev
-
-    # Final flush — any trailing fragment that didn't end with a terminator
-    # still gets spoken, otherwise the user wouldn't hear the last words.
-    tail = buffer.strip()
-    if tail:
-        async for audio_ev in _flush_to_tts(tail):
-            yield audio_ev
+            yield ev
+    finally:
+        for t in (llm_task, tts_task):
+            if not t.done():
+                t.cancel()
 
     yield {"_full_reply": "".join(collected).strip()}
 
