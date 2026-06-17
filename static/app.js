@@ -3803,12 +3803,65 @@ const _call = {
   assistantEl: null,
   assistantBody: null,
   assistantContentEl: null,
-  assistantText: "",
+  assistantText: "",       // full text received so far (target)
+  assistantRendered: 0,    // characters actually painted into the DOM
+  renderRaf: 0,            // requestAnimationFrame handle (0 = not pumping)
 };
+
+
+// Cloud LLMs (deepseek, openai, etc.) batch multiple tokens per HTTP frame —
+// the SSE stream arrives in bursts: 5-10 chunks in a tight ms-scale window,
+// then 100-300ms of nothing, repeat. Re-rendering the bubble on every chunk
+// reproduces that rhythm visually as smooth-then-pause-then-smooth.
+//
+// This typewriter pump decouples the DOM update rate from the network arrival
+// rate. _call.assistantText is the "target" (everything we've received).
+// _call.assistantRendered is what's currently painted. A requestAnimationFrame
+// loop drips characters from one to the other; bursts queue, gaps drain.
+//
+// CATCH_UP_RATIO tunes how aggressively we catch up when we fall behind:
+// 1/12 means we'll paint roughly 1/12 of the gap each frame (~60fps), which
+// drains a 50-char burst in about 0.5s — fast enough to feel responsive,
+// slow enough that the burst doesn't visibly re-create the stutter.
+const _CALL_RENDER_CHARS_MIN  = 1;   // always paint at least 1 char/frame while pumping
+const _CALL_RENDER_CHARS_MAX  = 8;   // cap so we don't burst the whole queue in one frame
+const _CALL_RENDER_CATCH_UP   = 12;  // gap fraction painted per frame
+
+
+function _pumpCallTypewriter() {
+  _call.renderRaf = 0;
+  if (!_call.assistantContentEl) return;
+  const target = _call.assistantText.length;
+  const current = _call.assistantRendered;
+  if (current >= target) return;
+  const gap = target - current;
+  // The further behind we are, the larger the step — keeps text smooth
+  // during a slow stream while still draining big bursts in a half-second.
+  const step = Math.min(
+    _CALL_RENDER_CHARS_MAX,
+    Math.max(_CALL_RENDER_CHARS_MIN, Math.ceil(gap / _CALL_RENDER_CATCH_UP)),
+  );
+  _call.assistantRendered = current + step;
+  _call.assistantContentEl.innerHTML = render(
+    _call.assistantText.slice(0, _call.assistantRendered),
+  );
+  scrollToBottom();
+  if (_call.assistantRendered < _call.assistantText.length) {
+    _call.renderRaf = requestAnimationFrame(_pumpCallTypewriter);
+  }
+}
 
 
 function _finalizeCallAssistantBubble() {
   if (!_call.assistantEl) return;
+  // Cancel any in-flight typewriter pump and flush the final text in one
+  // shot — the turn is over, no reason to keep dripping characters when
+  // the bubble is being finalized (the user might re-open the chat right
+  // after hanging up and we want the full reply there immediately).
+  if (_call.renderRaf) {
+    cancelAnimationFrame(_call.renderRaf);
+    _call.renderRaf = 0;
+  }
   _call.assistantEl.classList.remove("cursor");
   if (_call.assistantContentEl) {
     _call.assistantContentEl.innerHTML = render(_call.assistantText);
@@ -3827,6 +3880,7 @@ function _finalizeCallAssistantBubble() {
   _call.assistantBody = null;
   _call.assistantContentEl = null;
   _call.assistantText = "";
+  _call.assistantRendered = 0;
 }
 
 
@@ -3878,14 +3932,20 @@ function _onCallDataEvent(ev) {
     return;
   }
   if (ev.chunk != null && _call.assistantEl) {
+    // Append to the "target" text but DON'T re-render the bubble here.
+    // The requestAnimationFrame typewriter pump (above) renders at a steady
+    // ~60fps cadence regardless of how bursty the upstream is, so a 10-token
+    // batch arriving in 1ms is dripped into the DOM as 10 frames instead of
+    // a single jarring repaint followed by a 200ms gap.
     _call.assistantText += ev.chunk;
     if (!_call.assistantContentEl) {
       _call.assistantBody.innerHTML = "";
       _call.assistantContentEl = document.createElement("div");
       _call.assistantBody.appendChild(_call.assistantContentEl);
     }
-    _call.assistantContentEl.innerHTML = render(_call.assistantText);
-    scrollToBottom();
+    if (!_call.renderRaf) {
+      _call.renderRaf = requestAnimationFrame(_pumpCallTypewriter);
+    }
     return;
   }
   if (ev.end) {
