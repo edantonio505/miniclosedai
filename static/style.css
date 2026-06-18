@@ -2220,6 +2220,14 @@ body.sidebar-collapsed #sidebar-toggle {
   overflow-x: hidden;                      /* avoid sideways flicker during collapse */
   scrollbar-width: none;
   -ms-overflow-style: none;
+  /* Promote the sidebar to its own stacking context that sits above the
+     topbar (z-index:100) and the chat panel, so [data-tooltip]::after
+     elements inside the sidebar (z-index:9999) can actually paint over the
+     chat content. Without this they were stuck behind the topbar regardless
+     of how high their own z-index was — the tooltip's z-index can only beat
+     siblings inside its OWN stacking context. */
+  position: relative;
+  z-index: 150;
   display: flex;
   flex-direction: column;
   gap: 14px;
