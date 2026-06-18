@@ -2216,25 +2216,33 @@ body.sidebar-collapsed #sidebar-toggle {
   background: var(--panel);
   border-right: 1px solid var(--border);
   padding: 16px;
-  overflow-y: auto;
-  overflow-x: hidden;                      /* avoid sideways flicker during collapse */
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+  /* `.sidebar` itself MUST be overflow:visible so [data-tooltip]::after
+     bubbles can escape into the chat area. The scrollable behaviour is
+     delegated to the inner `.sidebar-scroll` wrapper below — that's the
+     only way around the CSS rule that overflow-x:visible + overflow-y:auto
+     both collapse to `auto` (which would re-introduce the tooltip clip).  */
+  overflow: visible;
   /* Promote the sidebar to its own stacking context that sits above the
-     topbar (z-index:100) and the chat panel, so [data-tooltip]::after
-     elements inside the sidebar (z-index:9999) can actually paint over the
-     chat content. Without this they were stuck behind the topbar regardless
-     of how high their own z-index was — the tooltip's z-index can only beat
-     siblings inside its OWN stacking context. */
+     topbar (z-index:100) and the chat panel, so tooltip pseudo-elements
+     with z-index:9999 can paint above the chat. */
   position: relative;
   z-index: 150;
   display: flex;
   flex-direction: column;
-  gap: 14px;
   min-height: 0;
   transition: opacity 200ms ease;
 }
-.sidebar::-webkit-scrollbar {
+.sidebar-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.sidebar-scroll::-webkit-scrollbar {
   display: none;
 }
 
