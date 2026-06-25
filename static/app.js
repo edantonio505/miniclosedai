@@ -6017,12 +6017,19 @@ async function _handleImportFile(file) {
   const result = await _runImport(parsed, null);
   if (result.ok) return;
   if (result.needsBackend) {
-    _importPending = { data: parsed, payload: result.payload };
+    _importPending = { kind: "bot", data: parsed, payload: result.payload };
+    _setImportModalTitle("Import bot — pick a backend");
     _renderImportPickerBody(parsed, result.payload);
     _openImportPickerModal();
     return;
   }
   alert(`Import failed: ${result.error}`);
+}
+
+function _setImportModalTitle(text) {
+  const modal = document.getElementById("import-modal-backdrop");
+  const h3 = modal && modal.querySelector(".modal-header h3");
+  if (h3) h3.textContent = text;
 }
 
 function initImportBotUI() {
@@ -6051,11 +6058,129 @@ function initImportBotUI() {
     const picked = document.querySelector('input[name="import-backend"]:checked');
     if (!picked) return;
     const backendId = parseInt(picked.value, 10);
-    const data = _importPending.data;
+    const { kind, data } = _importPending;
     _closeImportPickerModal();
-    const result = await _runImport(data, backendId);
+    const result = kind === "app"
+      ? await _runAppImport(data, backendId)
+      : await _runImport(data, backendId);
     if (!result.ok) alert(`Import failed: ${result.error || "unknown"}`);
   });
+}
+
+// =====================================================================
+// Application import — same shape as the bot importer, one level up. The
+// file is .miniclosed-app.json; we POST to /api/apps/import and reuse the
+// same backend-picker modal. One backend is chosen for every bot in the
+// imported app (matches the user's chosen UX over a per-bot picker).
+// =====================================================================
+
+async function _runAppImport(data, backendId) {
+  const r = await fetch("/api/apps/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ data, backend_id: backendId }),
+  });
+  const body = await r.json().catch(() => ({}));
+  if (r.status === 201) {
+    if (body.warnings && body.warnings.length) {
+      console.warn("app import warnings:", body.warnings);
+    }
+    // Refresh the bot list (the new app's bots showed up there too) and the
+    // app list, then drop the user into the freshly-imported app.
+    if (typeof loadConversations === "function") await loadConversations();
+    if (typeof loadApps === "function") await loadApps();
+    if (typeof renderAppsPage === "function") renderAppsPage();
+    if (body.id && typeof openApp === "function") await openApp(body.id);
+    return { ok: true };
+  }
+  if (r.status === 409 && body.needs_backend) {
+    return { needsBackend: true, payload: body };
+  }
+  return { ok: false, error: body.detail || `HTTP ${r.status}` };
+}
+
+function _renderAppImportPickerBody(parsed, payload) {
+  const body = document.getElementById("import-modal-body");
+  const confirmBtn = document.getElementById("import-confirm-btn");
+  if (!body) return;
+  const models = (payload.models || []).slice();
+  const backends = payload.available_backends || [];
+  const botCount = (parsed.bots || []).length;
+  const lines = backends.length
+    ? backends.map(b => {
+        const need = b.needed_count ?? models.length;
+        const have = b.matched_count ?? 0;
+        const tail = b.model_present
+          ? " — has every model in this app"
+          : ` — has ${have}/${need} required models`;
+        const label = `${b.name} (${b.kind})${tail}`;
+        return `<label style="display:block; padding:6px 0;">
+          <input type="radio" name="import-backend" value="${b.id}" ${b.model_present ? "checked" : ""} />
+          ${label}
+        </label>`;
+      }).join("")
+    : `<p>No enabled backends found. Add one from Settings, then retry.</p>`;
+  body.innerHTML = `
+    <p>This application bundles <strong>${botCount}</strong> bot${botCount === 1 ? "" : "s"} that need these models: <code>${models.join(", ") || "(none)"}</code>. No enabled backend covers them all. Pick one backend to run every bot against:</p>
+    ${lines}
+    <p style="color: var(--text-muted); font-size: 12px; margin-top: 10px;">
+      Tip: the cleanest fit is a backend that lists all the required models. If none does, pick the closest match — bots will still run, just against whatever models that backend actually serves.
+    </p>`;
+  if (confirmBtn) {
+    // Enable as soon as any backend is selected; default-checked if any backend has them all.
+    confirmBtn.disabled = !backends.some(b => b.model_present);
+    body.querySelectorAll('input[name="import-backend"]').forEach(r => {
+      r.addEventListener("change", () => { confirmBtn.disabled = false; });
+    });
+  }
+}
+
+async function _handleAppImportFile(file) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch (e) {
+    alert(`Couldn't parse ${file.name} as JSON: ${e.message}`);
+    return;
+  }
+  if (parsed?.format !== "miniclosed-app") {
+    alert(`Not a MiniClosedAI application file (format=${parsed?.format ?? "missing"}).`);
+    return;
+  }
+  const result = await _runAppImport(parsed, null);
+  if (result.ok) return;
+  if (result.needsBackend) {
+    _importPending = { kind: "app", data: parsed, payload: result.payload };
+    _setImportModalTitle("Import application — pick a backend for all bots");
+    _renderAppImportPickerBody(parsed, result.payload);
+    _openImportPickerModal();
+    return;
+  }
+  alert(`Import failed: ${result.error}`);
+}
+
+function initAppsImportUI() {
+  const btn = document.getElementById("apps-import-btn");
+  const input = document.getElementById("apps-import-file");
+  if (!btn || !input) return;
+  btn.addEventListener("click", () => input.click());
+  input.addEventListener("change", async () => {
+    const f = input.files && input.files[0];
+    input.value = "";  // reset so picking the same file twice still fires change
+    if (f) await _handleAppImportFile(f);
+  });
+}
+
+function _downloadApp(appId, includeHistory) {
+  const path = includeHistory
+    ? `export?include_history=true`
+    : `export?include_history=false`;
+  const a = document.createElement("a");
+  a.href = `/api/apps/${appId}/${path}`;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 // =====================================================================
@@ -6903,6 +7028,13 @@ function renderAppsPage() {
     sdkBtn.setAttribute("aria-label", `Generate SDK for ${a.name}`);
     sdkBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>';
     sdkBtn.addEventListener("click", e => { e.stopPropagation(); openSdkModal(a.id, a.name); });
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button"; exportBtn.className = "bot-card-action";
+    exportBtn.dataset.tooltip = "Export as .miniclosed-app.json (config-only — Shift-click to include history)";
+    exportBtn.setAttribute("aria-label", `Export ${a.name}`);
+    // Download-cloud icon (matches the import button's family).
+    exportBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="8 17 12 21 16 17"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>';
+    exportBtn.addEventListener("click", e => { e.stopPropagation(); _downloadApp(a.id, e.shiftKey); });
     const editBtn = document.createElement("button");
     editBtn.type = "button"; editBtn.className = "bot-card-action"; editBtn.dataset.tooltip = "Edit application";
     editBtn.setAttribute("aria-label", `Edit ${a.name}`);
@@ -6913,7 +7045,7 @@ function renderAppsPage() {
     delBtn.setAttribute("aria-label", `Delete ${a.name}`);
     delBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>';
     delBtn.addEventListener("click", e => { e.stopPropagation(); _deleteApp(a); });
-    actions.append(sdkBtn, editBtn, delBtn);
+    actions.append(sdkBtn, exportBtn, editBtn, delBtn);
     card.appendChild(actions);
 
     const open = () => openApp(a.id);
@@ -7028,9 +7160,14 @@ function renderAppDetail(app) {
   addBtn.addEventListener("click", () => _openAddBotModal(app));
   const editBtn = document.createElement("button"); editBtn.className = "btn btn-small"; editBtn.textContent = "Edit";
   editBtn.addEventListener("click", () => _openAppFormModal({ app }));
+  const exportBtn = document.createElement("button");
+  exportBtn.className = "btn btn-small";
+  exportBtn.textContent = "Export";
+  exportBtn.title = "Download as .miniclosed-app.json — config only. Shift-click to also include each bot's message history.";
+  exportBtn.addEventListener("click", e => _downloadApp(app.id, e.shiftKey));
   const sdkBtn = document.createElement("button"); sdkBtn.className = "btn btn-primary btn-small"; sdkBtn.textContent = "Generate SDK";
   sdkBtn.addEventListener("click", () => openSdkModal(app.id, app.name));
-  actions.append(count, spacer, addBtn, editBtn, sdkBtn);
+  actions.append(count, spacer, addBtn, editBtn, exportBtn, sdkBtn);
   c.appendChild(actions);
 
   const list = document.createElement("div");
@@ -7306,6 +7443,7 @@ function initAppsUI() {
   if (newBtn) newBtn.addEventListener("click", () => _openAppFormModal({}));
   const filter = document.getElementById("apps-filter");
   if (filter) filter.addEventListener("input", () => { _appsState.filter = filter.value; renderAppsPage(); });
+  initAppsImportUI();
 
   const close = document.getElementById("sdk-modal-close");
   if (close) close.addEventListener("click", _closeSdkModal);
