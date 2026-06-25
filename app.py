@@ -2104,6 +2104,8 @@ def _persist_turn(req: ChatRequest, assistant_text: str, backend: dict) -> None:
 
 _BOT_EXPORT_FORMAT = "miniclosed-bot"
 _BOT_EXPORT_FORMAT_VERSION = 1
+_APP_EXPORT_FORMAT = "miniclosed-app"
+_APP_EXPORT_FORMAT_VERSION = 1
 
 
 class BotImportRequest(BaseModel):
@@ -2113,6 +2115,85 @@ class BotImportRequest(BaseModel):
     # When set, skip the auto-match probe and use this backend. The GUI sends
     # this on the second pass after the user picks from `available_backends`.
     backend_id: int | None = None
+
+
+class AppImportRequest(BaseModel):
+    """POST /api/apps/import body. Same shape as BotImportRequest — `backend_id`,
+    if set, is applied to every bot in the imported app."""
+    model_config = ConfigDict(extra="forbid")
+    data: dict
+    backend_id: int | None = None
+
+
+def _build_bot_export(row, include_history: bool) -> dict:
+    """The `bot`-shaped block that both the bot export and the app export emit.
+
+    `row` is a sqlite Row with title, model, system_prompt, params, messages.
+    Returns just the bot dict (no format envelope) — the caller wraps it.
+    """
+    return {
+        "title": row["title"],
+        "model": row["model"],
+        "system_prompt": row["system_prompt"],
+        "params": json.loads(row["params"] or "{}"),
+        "sample_messages": json.loads(row["messages"] or "[]") if include_history else [],
+    }
+
+
+def _validate_bot_payload(bot: dict) -> tuple[str, str, str, dict, list]:
+    """Validate a single bot block from an import file.
+
+    Returns (title, model, system_prompt, params, sample_messages). Raises
+    HTTPException(400) on malformed input. `sample_messages` may be absent
+    in the source dict (defaults to []); if present but not a list we drop
+    it and the caller can record a warning.
+    """
+    if not isinstance(bot, dict):
+        raise HTTPException(400, "Each entry in 'bots' must be an object")
+    title = (bot.get("title") or "Imported bot").strip() or "Imported bot"
+    model = bot.get("model")
+    system_prompt = bot.get("system_prompt") or "You are a helpful AI assistant."
+    params = bot.get("params") or {}
+    if not isinstance(model, str) or not model:
+        raise HTTPException(400, "Missing 'bot.model' (string)")
+    if not isinstance(params, dict):
+        raise HTTPException(400, "'bot.params' must be an object")
+    sample_messages = bot.get("sample_messages")
+    if sample_messages is not None and not isinstance(sample_messages, list):
+        sample_messages = None  # caller will record a warning
+    return title, model, system_prompt, params, sample_messages or []
+
+
+def _unique_title(title: str, taken: set[str]) -> str:
+    """Suffix `(2)`, `(3)`, ... onto `title` until it's not in `taken`.
+    Returns the resolved title AND mutates `taken` to include it — callers
+    importing multiple bots in one transaction pass the same set across calls
+    so titles created earlier in the loop don't collide with later ones."""
+    out = title
+    if out in taken:
+        suffix = 2
+        while f"{title} ({suffix})" in taken:
+            suffix += 1
+        out = f"{title} ({suffix})"
+    taken.add(out)
+    return out
+
+
+def _insert_bot_row(
+    title: str, model: str, system_prompt: str, params: dict,
+    sample_messages: list, backend_id: int, app_id: int | None = None,
+) -> int:
+    """Insert a conversation row and return its new id. Shared by both
+    `/api/conversations/import` and the per-bot loop in `/api/apps/import`."""
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO conversations (title, model, system_prompt, params, messages, backend_id, app_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (title, model, system_prompt, json.dumps(params),
+             json.dumps(sample_messages), backend_id, app_id),
+        )
+        conn.commit()
+        return cur.lastrowid
 
 
 def _slugify_filename(s: str, fallback: str = "bot") -> str:
@@ -2173,19 +2254,18 @@ def api_export_conversation_bot(conv_id: int, include_history: bool = False):
     if not row:
         raise HTTPException(404, "Conversation not found")
 
-    params = json.loads(row["params"] or "{}")
-    bot_payload = {
-        "title": row["title"],
-        "model": row["model"],
-        "system_prompt": row["system_prompt"],
-        "params": params,
-    }
+    bot_block = _build_bot_export(row, include_history)
+    # Legacy on-disk shape: top-level `bot` and `sample_messages` siblings.
+    # _build_bot_export folds sample_messages into the bot block for the
+    # app export's per-bot entries; pop it back out here to keep the old
+    # file layout unchanged for cross-version compatibility.
+    sample_messages = bot_block.pop("sample_messages", [])
     export = {
         "format": _BOT_EXPORT_FORMAT,
         "format_version": _BOT_EXPORT_FORMAT_VERSION,
         "exported_at": datetime.now(timezone.utc).isoformat(),
-        "bot": bot_payload,
-        "sample_messages": json.loads(row["messages"] or "[]") if include_history else [],
+        "bot": bot_block,
+        "sample_messages": sample_messages,
     }
     fname = f"{_slugify_filename(row['title'])}.miniclosed-bot.json"
     return Response(
@@ -2218,14 +2298,7 @@ async def api_import_conversation_bot(req: BotImportRequest):
     bot = data.get("bot")
     if not isinstance(bot, dict):
         raise HTTPException(400, "Missing 'bot' object")
-    title = (bot.get("title") or "Imported bot").strip() or "Imported bot"
-    model = bot.get("model")
-    system_prompt = bot.get("system_prompt") or "You are a helpful AI assistant."
-    params = bot.get("params") or {}
-    if not isinstance(model, str) or not model:
-        raise HTTPException(400, "Missing 'bot.model' (string)")
-    if not isinstance(params, dict):
-        raise HTTPException(400, "'bot.params' must be an object")
+    title, model, system_prompt, params, _ = _validate_bot_payload(bot)
 
     warnings: list[str] = []
 
@@ -2260,25 +2333,16 @@ async def api_import_conversation_bot(req: BotImportRequest):
         existing_titles = {
             r["title"] for r in conn.execute("SELECT title FROM conversations").fetchall()
         }
-    if title in existing_titles:
-        suffix = 2
-        while f"{title} ({suffix})" in existing_titles:
-            suffix += 1
-        title = f"{title} ({suffix})"
+    title = _unique_title(title, existing_titles)
 
-    # 3. Insert -------------------------------------------------------------
+    # 3. Insert. The legacy bot file carries `sample_messages` at the top
+    # level (sibling of `bot`); validate it separately from the bot block.
     sample_messages = data.get("sample_messages") or []
     if not isinstance(sample_messages, list):
         warnings.append("'sample_messages' was not a list — dropped")
         sample_messages = []
-    with db.get_conn() as conn:
-        cur = conn.execute(
-            """INSERT INTO conversations (title, model, system_prompt, params, messages, backend_id)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (title, model, system_prompt, json.dumps(params), json.dumps(sample_messages), backend_id),
-        )
-        conn.commit()
-        new_id = cur.lastrowid
+    new_id = _insert_bot_row(title, model, system_prompt, params,
+                             sample_messages, backend_id)
 
     return {
         "id": new_id,
@@ -2286,6 +2350,209 @@ async def api_import_conversation_bot(req: BotImportRequest):
         "matched_backend_id": backend_id,
         "warnings": warnings,
     }
+
+
+# ---------------------------------------------------------------------------
+# Application export / import — same shape one level up: an app envelope
+# wrapping N bot blocks. One backend is resolved for the whole app and
+# applied to every bot, matching the user's chosen UX (single picker, not
+# per-bot picker). The bot block format inside `bots[]` is exactly the
+# `bot` object the per-bot export emits (minus the file-level envelope).
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/apps/{app_id}/export")
+def api_export_app(app_id: int, include_history: bool = False):
+    """Export an application (metadata + every bot in it) as portable JSON."""
+    with db.get_conn() as conn:
+        app_row = _app_row(conn, app_id)
+        bot_rows = conn.execute(
+            """SELECT title, model, system_prompt, params, messages
+               FROM conversations WHERE app_id = ? ORDER BY id""",
+            (app_id,),
+        ).fetchall()
+
+    export = {
+        "format": _APP_EXPORT_FORMAT,
+        "format_version": _APP_EXPORT_FORMAT_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "application": {
+            "name": app_row["name"],
+            "description": app_row["description"] or "",
+            "link": app_row["link"] or "",
+            "avatar": app_row["avatar"],
+        },
+        "bots": [_build_bot_export(r, include_history) for r in bot_rows],
+    }
+    fname = f"{_slugify_filename(app_row['name'], fallback='app')}.miniclosed-app.json"
+    return Response(
+        content=json.dumps(export, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.post("/api/apps/import", status_code=201)
+async def api_import_app(req: AppImportRequest):
+    """Import an application from a .miniclosed-app.json file.
+
+    Always creates a NEW app + N new conversation rows. Backend resolution:
+    caller-supplied `backend_id` wins; otherwise we look for a single enabled
+    backend that advertises EVERY unique `model` mentioned in `bots[]`. If no
+    such backend exists, return 409 with the candidate list so the GUI can
+    prompt — same shape as the bot import 409, with `models` (plural) instead
+    of `model`.
+    """
+    data = req.data
+    if not isinstance(data, dict) or data.get("format") != _APP_EXPORT_FORMAT:
+        raise HTTPException(400, f"Not a {_APP_EXPORT_FORMAT} file")
+    fmt_ver = data.get("format_version")
+    if not isinstance(fmt_ver, int) or fmt_ver > _APP_EXPORT_FORMAT_VERSION:
+        raise HTTPException(
+            400,
+            f"Unsupported format_version {fmt_ver!r}; this server understands up to {_APP_EXPORT_FORMAT_VERSION}",
+        )
+
+    application = data.get("application")
+    if not isinstance(application, dict):
+        raise HTTPException(400, "Missing 'application' object")
+    app_name = (application.get("name") or "").strip()
+    if not app_name:
+        raise HTTPException(400, "Missing 'application.name'")
+    app_description = application.get("description") or ""
+    app_link = application.get("link") or ""
+    app_avatar = application.get("avatar")
+    if app_avatar is not None and (
+        not isinstance(app_avatar, str) or not app_avatar.startswith("data:image/")
+    ):
+        # Don't fail the import over a malformed avatar — just drop it.
+        app_avatar = None
+
+    bots = data.get("bots")
+    if not isinstance(bots, list):
+        raise HTTPException(400, "Missing 'bots' array")
+
+    warnings: list[str] = []
+    # Pre-validate every bot up front so a bad bot at index 7 doesn't half-
+    # commit the app. Each tuple: (title, model, system_prompt, params,
+    # sample_messages, sample_messages_was_invalid).
+    parsed_bots: list[tuple[str, str, str, dict, list, bool]] = []
+    for i, b in enumerate(bots):
+        try:
+            t, m, sp, p, sm = _validate_bot_payload(b)
+        except HTTPException as e:
+            raise HTTPException(400, f"bots[{i}]: {e.detail}")
+        sm_invalid = b.get("sample_messages") is not None and not isinstance(
+            b.get("sample_messages"), list
+        )
+        if sm_invalid:
+            warnings.append(f"bots[{i}].sample_messages was not a list — dropped")
+        parsed_bots.append((t, m, sp, p, sm, sm_invalid))
+
+    # 1. Resolve backend — one for ALL bots ---------------------------------
+    if req.backend_id is not None:
+        try:
+            _load_backend(req.backend_id)
+        except HTTPException:
+            raise HTTPException(400, f"backend_id {req.backend_id} not found")
+        backend_id = req.backend_id
+    else:
+        backend_id = await _resolve_backend_for_app(parsed_bots, warnings)
+        if isinstance(backend_id, JSONResponse):
+            return backend_id  # 409 with the picker payload
+
+    # 2. App-name uniqueness (suffix scheme) --------------------------------
+    with db.get_conn() as conn:
+        existing_app_names = {
+            r["name"] for r in conn.execute("SELECT name FROM apps").fetchall()
+        }
+    app_name = _unique_title(app_name, existing_app_names)
+
+    # 3. Insert app row -----------------------------------------------------
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO apps (name, description, link, avatar) VALUES (?, ?, ?, ?)",
+            (app_name, app_description, app_link, app_avatar),
+        )
+        conn.commit()
+        new_app_id = cur.lastrowid
+
+    # 4. Insert each bot ----------------------------------------------------
+    with db.get_conn() as conn:
+        existing_titles = {
+            r["title"] for r in conn.execute("SELECT title FROM conversations").fetchall()
+        }
+    bot_ids: list[int] = []
+    for (title, model, system_prompt, params, sample_messages, _) in parsed_bots:
+        title = _unique_title(title, existing_titles)
+        new_id = _insert_bot_row(title, model, system_prompt, params,
+                                 sample_messages, backend_id, app_id=new_app_id)
+        bot_ids.append(new_id)
+
+    return {
+        "id": new_app_id,
+        "name": app_name,
+        "matched_backend_id": backend_id,
+        "bot_ids": bot_ids,
+        "warnings": warnings,
+    }
+
+
+async def _resolve_backend_for_app(
+    parsed_bots: list[tuple], warnings: list[str]
+) -> int | JSONResponse:
+    """For app import: pick one backend whose model list covers EVERY unique
+    `model` referenced by `parsed_bots`. Returns the backend id on success,
+    or a 409 JSONResponse (with the candidate list) on failure."""
+    unique_models = sorted({m for (_, m, *_rest) in parsed_bots})
+    if not unique_models:
+        raise HTTPException(400, "App has no bots to import")
+
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM backends WHERE enabled = 1 ORDER BY id"
+        ).fetchall()
+    backends = [db.row_to_dict(r) for r in rows]
+
+    summary: list[dict] = []
+    matched_id: int | None = None
+    for b in backends:
+        models: list[dict] = []
+        try:
+            if await llm.is_running(b):
+                models = await llm.list_models(b)
+        except Exception as e:
+            warnings.append(f"backend '{b['name']}' probe failed: {e}")
+        names = [m.get("name") or m.get("id") or "" for m in models]
+        present_count = sum(1 for m in unique_models if m in names)
+        all_present = present_count == len(unique_models)
+        if matched_id is None and all_present:
+            matched_id = b["id"]
+        summary.append({
+            "id": b["id"],
+            "name": b["name"],
+            "kind": b["kind"],
+            "model_present": all_present,
+            "model_count": len(names),
+            "matched_count": present_count,
+            "needed_count": len(unique_models),
+        })
+    if matched_id is not None:
+        return matched_id
+    return JSONResponse(
+        status_code=409,
+        content={
+            "needs_backend": True,
+            "models": unique_models,
+            "available_backends": summary,
+            "warnings": warnings,
+            "detail": (
+                "No enabled backend serves every model in this application "
+                f"({', '.join(unique_models)}). Pick a backend and every bot "
+                "will run against it."
+            ),
+        },
+    )
 
 
 @app.post("/api/chat")

@@ -3598,6 +3598,240 @@ def _():
     assert r.status_code == 400, r.text
 
 
+# ---- App import/export ----
+
+@test("app export: returns miniclosed-app json with metadata + each bot block")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    b1 = client.post("/api/conversations", json={
+        "title": "App Bot Alpha", "model": "ollama-a:3b",
+        "system_prompt": "alpha system", "temperature": 0.4, "backend_id": 1,
+    }).json()["id"]
+    b2 = client.post("/api/conversations", json={
+        "title": "App Bot Beta", "model": "ollama-a:3b",
+        "system_prompt": "beta system", "temperature": 0.7, "backend_id": 1,
+    }).json()["id"]
+    aid = client.post("/api/apps", json={
+        "name": "Exportable App", "description": "for the test", "link": "https://e.example",
+    }).json()["id"]
+    try:
+        assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b1}).status_code == 201
+        assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b2}).status_code == 201
+
+        r = client.get(f"/api/apps/{aid}/export")
+        assert r.status_code == 200, r.text
+        assert ".miniclosed-app.json" in r.headers.get("content-disposition", ""), r.headers
+        j = r.json()
+        assert j["format"] == "miniclosed-app"
+        assert j["format_version"] == 1
+        assert j["application"]["name"] == "Exportable App"
+        assert j["application"]["description"] == "for the test"
+        assert j["application"]["link"] == "https://e.example"
+        # Bots come through as a list of bot blocks (same shape as bot export's `bot`).
+        assert isinstance(j["bots"], list) and len(j["bots"]) == 2
+        titles = sorted(b["title"] for b in j["bots"])
+        assert titles == ["App Bot Alpha", "App Bot Beta"], titles
+        for b in j["bots"]:
+            assert "backend_id" not in b, "backend_id must not leak — it's per-instance"
+            assert "id" not in b, "DB id must not leak"
+            assert isinstance(b["params"], dict)
+            assert b["sample_messages"] == []  # include_history defaults to false
+    finally:
+        client.delete(f"/api/apps/{aid}")
+        client.delete(f"/api/conversations/{b1}")
+        client.delete(f"/api/conversations/{b2}")
+
+
+@test("app export: include_history=true carries each bot's messages")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    cid = _seed_conv_with_turn("app-export-history")
+    aid = client.post("/api/apps", json={"name": "History App"}).json()["id"]
+    try:
+        assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": cid}).status_code == 201
+        r = client.get(f"/api/apps/{aid}/export?include_history=true")
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert len(j["bots"]) == 1
+        msgs = j["bots"][0]["sample_messages"]
+        assert isinstance(msgs, list) and len(msgs) >= 2, msgs
+        roles = [m.get("role") for m in msgs]
+        assert "user" in roles and "assistant" in roles, roles
+    finally:
+        client.delete(f"/api/apps/{aid}")
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("app import: round-trip — export then import recreates app + bots with one backend")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    b1 = client.post("/api/conversations", json={
+        "title": "RT App Bot 1", "model": "ollama-a:3b",
+        "system_prompt": "one", "temperature": 0.3, "backend_id": 1,
+    }).json()["id"]
+    b2 = client.post("/api/conversations", json={
+        "title": "RT App Bot 2", "model": "ollama-a:3b",
+        "system_prompt": "two", "temperature": 0.9, "backend_id": 1,
+    }).json()["id"]
+    aid = client.post("/api/apps", json={"name": "Roundtrip App"}).json()["id"]
+    new_app_id = None
+    new_bot_ids: list[int] = []
+    try:
+        client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b1})
+        client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b2})
+        export = client.get(f"/api/apps/{aid}/export").json()
+
+        r = client.post("/api/apps/import", json={"data": export})
+        assert r.status_code == 201, r.text
+        body = r.json()
+        new_app_id = body["id"]
+        new_bot_ids = list(body["bot_ids"])
+        assert body["matched_backend_id"] == 1, body
+        # App name collides with source -> suffix appended.
+        assert body["name"].startswith("Roundtrip App") and body["name"] != "Roundtrip App", body
+        # Detail page returns both bots, bound to the new app.
+        detail = client.get(f"/api/apps/{new_app_id}").json()
+        assert len(detail["bots"]) == 2
+        assert {b["title"].split(" (")[0] for b in detail["bots"]} == {"RT App Bot 1", "RT App Bot 2"}
+        for b in detail["bots"]:
+            assert b["backend_id"] == 1
+        # Each bot also appears in the global conversation list with the new app_id.
+        convs = {c["id"]: c["app_id"] for c in client.get("/api/conversations").json()}
+        for nb in new_bot_ids:
+            assert convs[nb] == new_app_id, (nb, convs.get(nb))
+    finally:
+        for nb in new_bot_ids:
+            client.delete(f"/api/conversations/{nb}")
+        if new_app_id is not None:
+            client.delete(f"/api/apps/{new_app_id}")
+        client.delete(f"/api/apps/{aid}")
+        client.delete(f"/api/conversations/{b1}")
+        client.delete(f"/api/conversations/{b2}")
+
+
+@test("app import: 409 needs_backend when no enabled backend covers every model")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    export = {
+        "format": "miniclosed-app",
+        "format_version": 1,
+        "application": {"name": "Unmatched App"},
+        "bots": [
+            {"title": "X", "model": "no-such-model:99b", "system_prompt": "x", "params": {}},
+            {"title": "Y", "model": "also-missing:1b", "system_prompt": "y", "params": {}},
+        ],
+    }
+    r = client.post("/api/apps/import", json={"data": export})
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body.get("needs_backend") is True
+    assert set(body.get("models", [])) == {"no-such-model:99b", "also-missing:1b"}, body
+    # Built-in backend appears in candidates but doesn't have either model.
+    assert any(b["id"] == 1 for b in body["available_backends"])
+    assert all(not b["model_present"] for b in body["available_backends"]), body
+
+
+@test("app import: explicit backend_id bypasses auto-match and is applied to every bot")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    export = {
+        "format": "miniclosed-app",
+        "format_version": 1,
+        "application": {"name": "Forced App"},
+        "bots": [
+            {"title": "F1", "model": "no-such-model:99b", "system_prompt": "f1", "params": {}},
+            {"title": "F2", "model": "also-missing:1b", "system_prompt": "f2", "params": {}},
+        ],
+    }
+    r = client.post("/api/apps/import", json={"data": export, "backend_id": 1})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    new_app_id = body["id"]
+    new_bot_ids = list(body["bot_ids"])
+    try:
+        assert body["matched_backend_id"] == 1
+        for nb in new_bot_ids:
+            row = client.get(f"/api/conversations/{nb}").json()
+            assert row["backend_id"] == 1, row
+    finally:
+        for nb in new_bot_ids:
+            client.delete(f"/api/conversations/{nb}")
+        client.delete(f"/api/apps/{new_app_id}")
+
+
+@test("app import: title-collision suffix applied per bot and to the app name")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    # Pre-seed a conv whose title will clash with one of the imported bots.
+    existing = client.post("/api/conversations", json={
+        "title": "Collider Bot", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()["id"]
+    existing_app = client.post("/api/apps", json={"name": "Collider App"}).json()["id"]
+    export = {
+        "format": "miniclosed-app",
+        "format_version": 1,
+        "application": {"name": "Collider App"},
+        "bots": [
+            {"title": "Collider Bot", "model": "ollama-a:3b", "system_prompt": "s", "params": {}},
+            {"title": "Other Bot", "model": "ollama-a:3b", "system_prompt": "s", "params": {}},
+        ],
+    }
+    r = client.post("/api/apps/import", json={"data": export})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    new_app_id = body["id"]
+    new_bot_ids = list(body["bot_ids"])
+    try:
+        assert body["name"] != "Collider App", body
+        assert body["name"].startswith("Collider App"), body
+        new_titles = {
+            client.get(f"/api/conversations/{nb}").json()["title"]
+            for nb in new_bot_ids
+        }
+        # The "Collider Bot" title clashed with the seeded conv -> suffix.
+        assert "Collider Bot" not in new_titles, new_titles
+        assert any(t.startswith("Collider Bot") for t in new_titles), new_titles
+    finally:
+        for nb in new_bot_ids:
+            client.delete(f"/api/conversations/{nb}")
+        client.delete(f"/api/apps/{new_app_id}")
+        client.delete(f"/api/apps/{existing_app}")
+        client.delete(f"/api/conversations/{existing}")
+
+
+@test("app import: malformed payload rejected with 400")
+def _():
+    # Wrong format string
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-bot", "format_version": 1, "application": {"name": "x"}, "bots": []}})
+    assert r.status_code == 400, r.text
+    # Missing application
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-app", "format_version": 1, "bots": []}})
+    assert r.status_code == 400, r.text
+    # Empty application.name
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-app", "format_version": 1,
+                                   "application": {"name": "  "}, "bots": []}})
+    assert r.status_code == 400, r.text
+    # Missing bots array
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-app", "format_version": 1,
+                                   "application": {"name": "ok"}}})
+    assert r.status_code == 400, r.text
+    # Bad bot inside list (no model)
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-app", "format_version": 1,
+                                   "application": {"name": "ok"},
+                                   "bots": [{"title": "missing-model"}]}})
+    assert r.status_code == 400, r.text
+    # Future format_version
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-app", "format_version": 99,
+                                   "application": {"name": "ok"}, "bots": []}})
+    assert r.status_code == 400, r.text
+
+
 # ---- LLM request/response log buffer ----
 
 @test("logs: chat calls are recorded with status, latency, response preview")
