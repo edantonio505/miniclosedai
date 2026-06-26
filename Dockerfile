@@ -23,9 +23,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Application code — explicit COPY instead of `COPY . .` so new files don't
-# accidentally land in the image. .dockerignore is defense-in-depth.
-COPY app.py db.py evals.py knowledge.py llm.py logs.py mcp_host.py ./
+# Application code — glob all root-level .py files (sdkgen.py, voice.py,
+# and any future module are picked up automatically). .dockerignore excludes
+# test_e2e.py and editor cruft so the glob doesn't drag in non-runtime files.
+# voice.py is the LAN client adapter MiniClosedAI uses to talk to a separately-
+# deployed voice service; it must be present even when no voice backend is
+# configured — without it `import voice` at app.py:36 crashes the process.
+COPY *.py ./
 COPY static/ ./static/
 
 # Build-time SHA so Docker installs (which don't ship .git inside the image)
