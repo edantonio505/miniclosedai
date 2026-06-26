@@ -41,7 +41,8 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 16. [Worked example — chatbot frontends (Python CLI + HTML widget)](#worked-example--chatbot-frontends-python-cli--html-widget)
 17. [Client SDK — composing bots from your code](#client-sdk--composing-bots-from-your-code)
 18. [Bot import / export](#bot-import--export)
-19. [Self-upgrade](#self-upgrade)
+19. [Application import / export](#application-import--export)
+20. [Self-upgrade](#self-upgrade)
 20. [Prompt generator](#prompt-generator)
 21. [Activity logs](#activity-logs)
 22. [Database](#database)
@@ -370,7 +371,7 @@ The UI is a **list/detail** pattern, not flat tabs. The activity bar has three i
 - **Bot card row actions** — appear on `:hover` / `:focus-within` only, in `.bot-card-actions` (an absolutely-positioned strip on the right edge with a gradient mask fade): `</>` API code, **📚 Manage knowledge**, **🧩 Manage extensions**, and 🗑 Delete. All call `e.stopPropagation()` and carry the card's `data-conv-id`.
   - **📚 → Manage Knowledge modal** (`openKnowledgeModal`): lists the bot's documents (filename · chunk count · size · date) with per-doc delete, plus **+ Add document** which routes the shared hidden file input (`#bots-kb-file`) via `_triggerKbUpload({convId, onStatus, onDone})` → `_uploadKnowledgeToConv`.
   - **🧩 → Manage Extensions modal** (`openMcpModal`): lists the bot's MCP servers with a per-server **enable toggle** + remove (each mutation PUTs the full list via `_saveMcpModal`), plus an add-by-URL row → `_addMcpToConv`.
-  - Both modals reuse the same endpoints as the sidebar panels; if the edited bot is the one currently open, the matching sidebar panel (`loadKnowledge` / `loadMcp`) refreshes so the two surfaces stay in sync. The card itself gets `z-index: 5` on hover so the actions and their tooltips can paint over the next card's border (`.bot-card-actions` uses `transform`, which creates a local stacking context, so the tooltip's `z-index: 9999` only competes within that subtree). Delete is wired to `deleteConvById(id, { title })`, which prunes the id from `_streaming` / `_unread` so stale dots don't linger, then falls back to opening the next-most-recent bot (or the Bots empty state if none remain). API code is wired to `openApiCodeForConv(id)` (see below) which scopes the modal to that id without disturbing `state.conversationId`.
+  - Both modals reuse the same endpoints as the sidebar panels; if the edited bot is the one currently open, the matching sidebar panel (`loadKnowledge` / `loadMcp`) refreshes so the two surfaces stay in sync. The card itself gets `z-index: 5` on hover so the actions paint over the next card's border. Tooltip painting is no longer affected by stacking contexts — every `[data-tooltip]` element is hijacked by the global tooltip system (`#global-tooltip` on `<body>`, see [Global tooltip](#global-tooltip) below) so even tooltips on elements nested inside `transform` / `overflow: hidden` ancestors render above everything. Delete is wired to `deleteConvById(id, { title })`, which prunes the id from `_streaming` / `_unread` so stale dots don't linger, then falls back to opening the next-most-recent bot (or the Bots empty state if none remain). API code is wired to `openApiCodeForConv(id)` (see below) which scopes the modal to that id without disturbing `state.conversationId`.
 - **Topbar `<` back button** — leftmost element of the chat topbar; returns to the Bots list with a reverse slide. `Esc` is the keyboard equivalent (skipped when a modal is open).
 - **Pulse dot** on the Bots icon AND on individual bot cards — driven by two sets:
   - `_streaming` — convs whose chat stream is currently in flight.
@@ -420,6 +421,14 @@ Two draggable dividers persist to `localStorage`:
 - **Horizontal splitter** (between System Prompt and Parameters) — drag to resize the System Prompt panel height. Double-click to reset to 220 px.
 
 The sidebar's scrollbar is hidden across all browsers; scrolling still works via wheel / trackpad / keyboard.
+
+### Global tooltip
+
+Every `[data-tooltip]` element in the GUI shares **one** fixed-positioned bubble appended directly to `<body>` — `#global-tooltip` — instead of each trigger painting its own `::after` pseudo-element. Why: a pseudo on the trigger renders inside its parent's stacking + clipping contexts, so any ancestor with `overflow: hidden`, `transform`, `filter`, or its own stacking context (sidebar panels, sticky toolbars, scrollable cards, modal frames) would clip or layer-cover the bubble — a defect we hit on the sidebar tooltip behind the chat panel. A single body-mounted fixed element sits in the root stacking context with `z-index: 2147483647`, so it is GUARANTEED to render above every other element on the page regardless of where the trigger lives in the DOM.
+
+**Wiring** (`static/app.js:initGlobalTooltip`): one delegated `pointerover` + `pointerout` handler on `document` walks the target's ancestors via `closest("[data-tooltip]")`. On hit, `_showGlobalTooltip(trigger)` reads `data-tooltip`, measures the trigger's viewport rect with `getBoundingClientRect()`, places the bubble directly under it (or above when `data-tooltip-side="top"` is set), and clamps the position into the viewport so wide tooltips on edge-aligned buttons don't fall off-screen. If the requested side would clip, it auto-flips to the other side. The bubble hides on `pointerout` (unless `relatedTarget` is a descendant of the active trigger), on `focusout`, on `scroll`/`resize`, and on `Escape`. Pre-existing UX semantics survive: `aria-expanded="true"` suppresses the tooltip during an open menu/popover, and the global handler still respects the `data-tooltip-side` attribute used by composer-bottom buttons.
+
+**Implication for new UI work**: just add `data-tooltip="…"` (and optionally `data-tooltip-side="top"`) to any element — no CSS positioning, no z-index plumbing, no concern about which container it lives in. The global handler picks up dynamically-inserted elements (cards built by JS, modal contents) for free since the listeners are on `document`.
 
 ### Logs page
 
@@ -556,7 +565,7 @@ A second top-level surface beside Bots: an **application** is a named group of b
 
 A single **`apps`** table (`db.py:111-119`): `id`, `name`, `description`, `link`, `avatar` (data URL), `created_at`, `updated_at`. Bots belong to an app via a `conversations.app_id` column (additive migration in `init_db`), with `idx_conversations_app` for the per-app lookup. Assignment is one-to-many — a bot is in zero or one apps. Removing a bot from an app sets `app_id = NULL`; deleting the app does the same to its bots (the bots are not deleted).
 
-### Endpoints (`app.py:1033-1209`)
+### Endpoints (`app.py:1033-1252`)
 
 CRUD on apps:
 - `GET  /api/apps` — list apps with `bot_count`.
@@ -574,6 +583,10 @@ SDK generation:
 - `GET /api/apps/{id}/sdk?lang=ts|js|py` — JSON preview: `{app, lang, files: [{path, content}]}`. `lang` defaults to `ts` (backwards-compat); unknown lang → 400.
 - `GET /api/apps/{id}/sdk.zip?lang=…` — download as a zip. Filename keeps `<slug>-sdk.zip` for `ts` (no breakage); `js` / `py` use `<slug>-<lang>-sdk.zip` so all three can coexist in a downloads folder.
 
+Portable export / import (same shape as the per-bot file, one level up — see [Application import / export](#application-import--export)):
+- `GET /api/apps/{id}/export?include_history=false` → `.miniclosed-app.json` carrying app metadata + every bot's config block.
+- `POST /api/apps/import` body `{data, backend_id?}` → creates a NEW app + N new conversation rows, all bound to one backend. 409 with a picker list when no enabled backend covers every model.
+
 ### `sdkgen.py` — the generator
 
 Stdlib-only, with three parallel emitters dispatched by `generate_sdk(lang, app, bots, base_url)` (`SDK_LANGS = ("ts", "js", "py")`):
@@ -586,9 +599,10 @@ Identifiers are deduplicated on collision by appending the bot id, and reserved 
 
 ### UI (`static/index.html`, `static/app.js`, `static/style.css`)
 
-- **Apps page** (`body[data-page="apps"]`, `renderAppsPage`): grid of app cards (`_appsState.cache`) with filter, "New application" button, and a per-card **Generate SDK** action.
-- **App detail** (`body[data-page="app-detail"]`, `renderAppDetail`): back-to-Apps button, the app's bot grid, plus a top-level Generate-SDK button. `_appsState.current` holds the open app.
+- **Apps page** (`body[data-page="apps"]`, `renderAppsPage`): list of app cards (`_appsState.cache`) with a filter, an **Import** button (upload-cloud) + hidden `#apps-import-file`, a **+ New application** button, and per-card actions: **Generate SDK**, **Export** (download-cloud — Shift-click to also include each bot's message history), **Edit**, **Delete**. The toolbar carries a **list ↔ grid view toggle** (`#apps-view-list` / `#apps-view-grid`), persisted to `localStorage` under `miniclosedai:appsView`, that flips the `#apps-list` container between the default vertical stack and the responsive auto-fill `.bots-list.grid-view` grid — exact mirror of the Bots-page toggle. View state is restored on boot and re-applied on every `renderAppsPage()` redraw.
+- **App detail** (`body[data-page="app-detail"]`, `renderAppDetail`): back-to-Apps button, the app's bot grid, plus a top-level row of buttons: **+ Add bot**, **Edit**, **Export** (Shift-click for history), **Generate SDK**. `_appsState.current` holds the open app.
 - **SDK modal** (`#sdk-modal-backdrop`, `openSdkModal`): three-language tab strip (`.sdk-lang-tab[data-lang="ts|js|py"]`); each tab refetches `/sdk?lang=…` via `_loadSdkFiles()` and re-renders the file tree + preview. Download button targets `/sdk.zip?lang=…`. State carries `{ files, active, appId, appName, lang }`.
+- **Backend-picker modal** — the same `#import-modal-backdrop` used by bot import is reused for app import. The modal title swaps to *"Import application — pick a backend for all bots"*, and the body lists each backend with `<matched>/<needed>` model coverage. One backend is applied to every bot in the imported app; per-bot pickers were deliberately skipped for simplicity.
 - **Context-aware back** (`enterChat()` / `exitChatToReturn()` in `app.js`): the chat view remembers which surface launched it (`state.chatReturnTo`), so back from a bot opened *inside* an app returns to that app's detail view — not the global Bots page. On Esc the same restore runs.
 
 ### Drop-in usage caveats
@@ -962,6 +976,8 @@ GET    /api/conversations/{id}/export.zip             → multimodal SFT bundle 
 GET    /api/conversations/{id}/export.classify.zip    → image-classification dataset (image,label CSV + images/)
 GET    /api/conversations/{id}/export                 → portable bot config (.miniclosed-bot.json)
 POST   /api/conversations/import                      → import a .miniclosed-bot.json file
+GET    /api/apps/{id}/export                          → portable app + every bot in it (.miniclosed-app.json)
+POST   /api/apps/import                               → import a .miniclosed-app.json file
 ```
 
 **Create body**:
@@ -1857,6 +1873,145 @@ If you need to *also* share an endpoint (e.g. a hosted Bonsai relay you want a t
 
 ---
 
+## Application import / export
+
+The bot file is for moving *one* bot between instances. The **application file** is the same idea one level up: an envelope wrapping every bot in an application plus the app's own metadata, so a whole grouped surface (sales pipeline, intake triage, support stack, …) round-trips in one JSON.
+
+### Endpoints
+
+```
+GET  /api/apps/{id}/export?include_history=false
+       → 200 application/json
+       → Content-Disposition: attachment; filename="<app-slug>.miniclosed-app.json"
+
+POST /api/apps/import
+       → 201 (auto-matched a backend that covers every bot's model)
+       → 409 (no enabled backend covers every model — payload lists candidates)
+       → 400 (malformed file, missing application.name, bad bots[i], unknown format_version)
+```
+
+### File schema (`format_version: 1`)
+
+```json
+{
+  "format": "miniclosed-app",
+  "format_version": 1,
+  "exported_at": "2026-06-25T...",
+  "application": {
+    "name": "GA Probate",
+    "description": "Intake triage + drafter for Georgia probate.",
+    "link": "https://example.com/ga-probate",
+    "avatar": "data:image/png;base64,..." | null
+  },
+  "bots": [
+    {
+      "title": "Triage",
+      "model": "qwen3:8b",
+      "system_prompt": "Classify the inbound message into one of...",
+      "params": {"temperature": 0.2, "max_tokens": 1024, "top_p": 0.9, "top_k": 40},
+      "sample_messages": []
+    },
+    {
+      "title": "Drafter",
+      "model": "qwen3:8b",
+      "system_prompt": "Draft a polite reply covering...",
+      "params": {"temperature": 0.6, "max_tokens": 2048, "top_p": 0.9, "top_k": 40},
+      "sample_messages": []
+    }
+  ]
+}
+```
+
+Each entry in `bots[]` is the **same shape** as the per-bot file's top-level `bot` block (minus the file-level envelope) — same backwards-compatibility guarantees, same forward-compat policy on unknown `params` keys, same exclusion of `backend_id` / API keys / DB ids. With `?include_history=true`, each bot's `sample_messages` carries that bot's `messages` column verbatim.
+
+### Import resolution (one backend for the whole app)
+
+```
+                ┌──────────────────────────────────────┐
+POST /import ─► │ Validate format + format_version ≤ 1 │
+                │ + application.name + bots is a list  │
+                │ + every bots[i] has model (string)   │
+                └──────────────┬───────────────────────┘
+                               │
+                  ┌────────────┴──────────────┐
+                  ▼                           ▼
+         backend_id given?            backend_id missing
+                  │                           │
+                  ▼                           ▼
+         Use it (validate           Collect the unique set of
+         it exists, 400              `bots[i].model` strings;
+         otherwise) — one             find the FIRST enabled
+         backend for every            backend whose model list
+         bot in the app               contains EVERY one.
+                  │                           │
+                  │              found? ──── no ──► 409 needs_backend
+                  │              yes                  (payload: models[],
+                  │                                    available_backends[].model_present)
+                  └─────────┬───────────────┘
+                            ▼
+                Insert NEW apps row (name suffixed
+                if it collides), then insert N NEW
+                conversation rows (titles suffixed
+                independently) — every row bound to
+                the chosen backend_id and linked to
+                the new app_id.
+                            ▼
+                201 { id, name, matched_backend_id,
+                      bot_ids: [...], warnings: [...] }
+```
+
+Important behaviours:
+
+1. **One backend for the whole app.** The 409 picker asks *one* question, not N. We deliberately skipped per-bot pickers — for a coherent application all bots usually run on the same backend, and forcing per-bot decisions adds clicks without adding power. If you genuinely need different backends per bot, import the app, then PATCH each bot's `backend_id` afterwards.
+2. **Auto-match requires FULL coverage.** A backend only auto-matches if its model list contains *every* unique model in `bots[]`. If you've got 5 bots needing `qwen3:8b` and one needing `llama3:70b`, and your local Ollama only has `qwen3:8b`, you get a 409. The picker payload carries `model_present` (boolean — does this backend have everything?) plus `matched_count`/`needed_count` so the UI can render "Backend X has 4/5 of the required models" hints.
+3. **Title collisions are independent.** The app's name collides only against `apps.name`; each bot's title collides only against `conversations.title`. Suffix scheme matches the bot import (`(2)`, `(3)`, …).
+4. **Validation is up-front.** Every bot in `bots[]` is validated *before* any DB write — a bad bot at index 7 fails the whole import with `bots[7]: Missing 'bot.model' (string)`. Half-committed apps are impossible.
+5. **Empty `bots[]` is rejected.** An app with zero bots gives the resolver nothing to match against; the importer rejects with 400.
+
+### GUI counterparts
+
+- **Export** — Applications page → per-app **Export** icon (or **Export** button on the app detail page). Default = config only. **Shift-click** to also include each bot's message history (bigger file).
+- **Import** — Applications page header → **Import** button → file picker. Auto-match → the new app opens. 409 → the shared backend-picker modal opens with title *"Import application — pick a backend for all bots"*.
+
+### Worked round-trip
+
+```bash
+# Instance A:
+curl -o ga_probate.miniclosed-app.json \
+  http://localhost:8095/api/apps/1/export
+
+# Carry the file to instance B.
+
+# Instance B, happy path (one backend serves every model):
+curl -X POST http://localhost:8095/api/apps/import \
+  -H "Content-Type: application/json" \
+  -d "{\"data\": $(cat ga_probate.miniclosed-app.json)}"
+# → 201 { "id": 5, "name": "GA Probate", "matched_backend_id": 1,
+#         "bot_ids": [42, 43, 44], "warnings": [] }
+
+# Instance B, no single backend covers every model:
+# → 409 { "needs_backend": true,
+#         "models": ["qwen3:8b", "llama3:70b"],
+#         "available_backends": [
+#           {"id": 1, "name": "Built-in Ollama", "model_present": false,
+#            "matched_count": 1, "needed_count": 2},
+#           {"id": 4, "name": "LM Studio", "model_present": false,
+#            "matched_count": 0, "needed_count": 2}
+#         ],
+#         "detail": "No enabled backend serves every model in this application..." }
+
+# Retry with explicit backend_id (every bot will run on it):
+curl -X POST http://localhost:8095/api/apps/import \
+  -H "Content-Type: application/json" \
+  -d "{\"data\": $(cat ga_probate.miniclosed-app.json), \"backend_id\": 4}"
+```
+
+### Security stance — same as the bot file
+
+No backend rows, no API keys, no DB ids, no upstream credentials. Sharable over Slack / email / git verbatim.
+
+---
+
 ## Self-upgrade
 
 Two surfaces for pulling the latest from GitHub: a CLI script (`upgrade.sh`) and a GUI button. The button is just a thin trigger over the script — the script is the source of truth, runs identically either way.
@@ -2156,7 +2311,7 @@ miniclosedai/
 ├── logs.py                    # In-memory ring buffer for the Logs page (chat req/resp records)
 ├── requirements.txt           # fastapi, uvicorn, httpx, pypdf, python-multipart
 ├── upgrade.sh                 # in-place upgrade with auto-rollback (CLI + GUI button trigger)
-├── test_e2e.py                # 39-test single-file suite, no pytest
+├── test_e2e.py                # 170-test single-file suite, no pytest
 ├── static/
 │   ├── index.html             # Single-page UI
 │   ├── style.css              # Dark-mode, responsive, no-cache headers served
@@ -2241,7 +2396,7 @@ Full end-to-end coverage lives in **`test_e2e.py`** at the repo root. Run:
 python test_e2e.py
 ```
 
-28 tests, ~1.5 seconds, no external dependencies (no pytest), no real Ollama or LM Studio required — upstream backends are simulated in-process via two tiny `http.server` instances. The test DB is a tempfile; your real `miniclosedai.db` is never touched. Exits 0 on all-pass, 1 on any failure.
+170 tests, ~16 seconds, no external dependencies (no pytest), no real Ollama or LM Studio required — upstream backends are simulated in-process via three tiny `http.server` instances (`FakeOllama`, `FakeOpenAI`, `FakeVoice`). The test DB is a tempfile; your real `miniclosedai.db` is never touched. Exits 0 on all-pass, 1 on any failure.
 
 For the full coverage matrix and hook-setup instructions, see **[README → Testing](./README.md#testing)**.
 
