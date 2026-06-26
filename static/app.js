@@ -5501,22 +5501,39 @@ const VALID_PAGES = new Set(["dashboard", "bots", "settings", "logs", "apps", "a
 const _BOTS_AREA = new Set(["bots", "dashboard"]);
 // The Apps nav-item owns both the applications list and a single app's detail.
 const _APPS_AREA = new Set(["apps", "app-detail"]);
+// Navigation hierarchy as a flat depth map. Drives the drill-in / drill-out
+// animation: a transition into a DEEPER page (apps → app-detail → dashboard,
+// or bots → dashboard) animates forward; a transition into a SHALLOWER page
+// animates back; same-depth peer hops (activity-bar clicks between top-level
+// pages) don't animate. Adding a new page = add it here and pick its depth.
+const _PAGE_DEPTH = {
+  bots: 0, apps: 0, logs: 0, settings: 0,
+  "app-detail": 1,
+  dashboard: 2,
+};
+
 function applyActivePage(page) {
   const from = document.body.dataset.page;
   const p = VALID_PAGES.has(page) ? page : "bots";
 
-  // Spatial drill-in / drill-out: slide the chat in from the right when going
-  // bots → dashboard, slide the list back in from the left when going
-  // dashboard → bots. The CSS keyframes are gated on body[data-bots-transition].
-  if (from !== p && _BOTS_AREA.has(from) && _BOTS_AREA.has(p)) {
-    const dir = (from === "bots" && p === "dashboard") ? "forward" : "back";
-    document.body.dataset.botsTransition = dir;
-    // Clear the attribute after the keyframe duration so a future toggle re-fires it.
-    setTimeout(() => {
-      if (document.body.dataset.botsTransition === dir) {
-        delete document.body.dataset.botsTransition;
-      }
-    }, 240);
+  // Spatial drill-in / drill-out animation. Direction is derived from page
+  // depth, not from a hard-coded bots-vs-dashboard pair, so EVERY drill-in
+  // (apps → app-detail, app-detail → dashboard, bots → dashboard, etc.) and
+  // every back step (back button or activity-bar climb-out) gets the same
+  // animation treatment. The CSS keyframes live on body[data-page-transition].
+  if (from && from !== p) {
+    const fromDepth = _PAGE_DEPTH[from] ?? 0;
+    const toDepth = _PAGE_DEPTH[p] ?? 0;
+    if (fromDepth !== toDepth) {
+      const dir = toDepth > fromDepth ? "forward" : "back";
+      document.body.dataset.pageTransition = dir;
+      // Clear after the keyframe duration so a future toggle re-fires it.
+      setTimeout(() => {
+        if (document.body.dataset.pageTransition === dir) {
+          delete document.body.dataset.pageTransition;
+        }
+      }, 240);
+    }
   }
 
   document.body.dataset.page = p;

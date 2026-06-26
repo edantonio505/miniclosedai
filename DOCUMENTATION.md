@@ -357,7 +357,26 @@ See [Security](#security) and the README's [LAN access](./README.md#lan-access) 
 
 ### Navigation (list → detail)
 
-The UI is a **list/detail** pattern, not flat tabs. The activity bar has three icons — **Bots** (home, message-square), **Logs** (terminal), **Settings** (gear). The "Dashboard" page still exists internally (it's the chat surface) but has no nav button; you reach it by drilling into a bot from the list.
+The UI is a **list/detail** pattern, not flat tabs. The activity bar has four page icons — **Bots** (home, message-square), **Apps** (layers — groups of bots), **Logs** (terminal), **Settings** (gear). The "Dashboard" page still exists internally (it's the chat surface) but has no nav button; you reach it by drilling into a bot from the list or from inside an app.
+
+#### Drill-in / drill-out animation (consistent across every list → detail step)
+
+Every navigation step that changes **depth** plays the same spatial slide animation — the destination page slides in from the right on a drill-in and from the left on a drill-out (or back-button climb). This is enforced by a single depth map in `static/app.js` (`_PAGE_DEPTH`) rather than per-route wiring, so adding a new page automatically inherits the behaviour by picking its depth:
+
+| Page | Depth |
+|---|---|
+| `bots`, `apps`, `logs`, `settings` | 0 (top-level peers) |
+| `app-detail` | 1 (one app, list of its bots) |
+| `dashboard` | 2 (one bot's chat) |
+
+`applyActivePage(page)` compares `_PAGE_DEPTH[from]` vs `_PAGE_DEPTH[to]`; if the depth goes up it sets `body[data-page-transition="forward"]`, down sets `"back"`, and same-depth peer hops (activity-bar clicks between top-level pages) set nothing. The CSS rule animates whichever `.page` is currently `display: flex` (one at a time — the others are `display: none` and CSS animations don't fire on hidden elements), so the rule is just `body[data-page-transition="forward"] .page { animation: drillIn ... }` with no per-page enumeration. Reduced motion preference disables both keyframes. The body attribute is auto-cleared 240 ms later so the next transition can re-fire it.
+
+Concretely this covers all the navigation steps below with the same feel:
+
+- `bots → dashboard` (forward) and `dashboard → bots` (back) — the original case.
+- `apps → app-detail` (forward) and `app-detail → apps` (back).
+- `app-detail → dashboard` (forward, clicking a bot inside an app) and `dashboard → app-detail` (back, the chat-topbar `<` returning to the app you came from — driven by `state.chatReturnTo`).
+- Any cross-area depth change (e.g. `bots → app-detail`, `dashboard → settings`) also animates in the correct direction.
 
 <p align="center">
   <img src="docs/images/bots_page_listview.png" alt="Bots page — list view" width="800"><br><em>Bots page — list view</em>
