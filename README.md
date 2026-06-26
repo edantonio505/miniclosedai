@@ -39,13 +39,14 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 16. [Building a chatbot against a saved bot](#building-a-chatbot-against-a-saved-bot)
 17. [Python client SDK](#python-client-sdk--compose-bots-in-your-own-code)
 18. [Sharing bots between instances](#sharing-bots-between-instances)
-19. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
-20. [LAN access](#lan-access)
-21. [Troubleshooting](#troubleshooting)
-22. [Testing](#testing)
-23. [Project layout](#project-layout)
-24. [Security](#security)
-25. [License](#license)
+19. [Sharing an application between instances](#sharing-an-application-between-instances)
+20. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
+21. [LAN access](#lan-access)
+22. [Troubleshooting](#troubleshooting)
+23. [Testing](#testing)
+24. [Project layout](#project-layout)
+25. [Security](#security)
+26. [License](#license)
 
 ---
 
@@ -400,6 +401,8 @@ Single full-page surface listing every saved conversation, newest first. Each ca
 ### Apps page (grouping bots) — generate a per-app SDK
 
 The **Apps** activity-bar icon opens a second top-level surface that groups bots into named **applications** (e.g. *"GA Probate"*, *"Sales Pipeline"*). Each app has a name, an optional description + link, an avatar, and a list of bots assigned to it. Clicking an app drills into its detail view — a card grid of just that app's bots — and clicking a bot from there opens the chat. The back button returns to the **same app's detail view** (not the global Bots list), so app-scoped workflows feel like their own little surface.
+
+The Apps page mirrors the Bots page's affordances one-to-one: a **search input**, a **list ↔ grid view toggle** (persisted to `localStorage` under `miniclosedai:appsView`, independent from the bots view), per-card **Generate SDK / Export / Edit / Delete** actions, a header **Import** button (upload-cloud icon — pick a `.miniclosed-app.json` to recreate the whole application on this instance), and the **+ New application** button. **Export** is a download-cloud icon on each card; **Shift-click** to include every bot's message history. See [Sharing an application between instances](#sharing-an-application-between-instances) for the full round-trip story.
 
 The headline feature is **per-app SDK generation**. Each application has a **Generate SDK** button: it opens a modal with a language tab strip — **TypeScript**, **JavaScript**, or **Python** — and downloads a ready-to-use client package wired specifically for *this app's* bots, with each bot exposed as a named function and its bot id baked in:
 
@@ -1022,6 +1025,8 @@ GET    /api/conversations/{id}/export.zip             → JSONL + images bundle 
 GET    /api/conversations/{id}/export.classify.zip    → image-classification dataset (image,label CSV + images/)
 GET    /api/conversations/{id}/export                 → portable bot config (.miniclosed-bot.json)
 POST   /api/conversations/import                      → import a .miniclosed-bot.json file
+GET    /api/apps/{id}/export                          → portable application (.miniclosed-app.json — app + all its bots)
+POST   /api/apps/import                               → import a .miniclosed-app.json file
 ```
 
 **Create** — supply any subset of config fields. `backend_id` defaults to `1` (built-in Ollama); set it to pin the bot to an OpenAI-compatible endpoint you registered in Settings.
@@ -2366,6 +2371,62 @@ Full schema reference — every field, every error case, and the resolution-flow
 
 ---
 
+## Sharing an application between instances
+
+If a single bot is the unit of portability for the Bots page, an **application** is the unit of portability for the Apps page. The same shape one level up: every bot in an app, plus the app's own metadata (name, description, link, avatar), packed into a single `.miniclosed-app.json` file.
+
+**What's in the file** — exactly the same minimal config the bot file carries, repeated for every bot in the app:
+
+- App-level: `name`, `description`, `link`, `avatar`.
+- Per-bot: `title`, `model` (as a string), `system_prompt`, `params`, and optionally `sample_messages` (each bot's history — if you exported with "+ history").
+
+**What's deliberately NOT in the file**: backend rows, API keys, DB ids. Same security stance as the bot file — safe to email / Slack / git.
+
+### Export from the GUI
+
+1. Open the **Applications** page (second activity-bar icon).
+2. On any app card, click the **download-cloud** icon (config only). Hold **Shift** while clicking to include every bot's message history.
+3. The browser downloads `<app-name>.miniclosed-app.json`.
+
+The app detail page also has an **Export** button at the top with the same Shift-click behaviour.
+
+### Import from the GUI
+
+1. On the Applications page, click the **Import** button (upload-cloud icon) next to *+ New application*.
+2. Pick the `.miniclosed-app.json` file.
+3. If a single enabled backend covers *every* model referenced by the bots in the file, the new app is created and opens automatically.
+4. Otherwise the same backend-picker modal as bot import appears — titled *"Import application — pick a backend for all bots"* — listing each backend with `<matched>/<needed>` model coverage. Pick one and click **Import**; every bot in the imported app will run against that backend.
+
+### Round-trip via API
+
+```bash
+# On instance A: export the app + every bot in it.
+curl -o ga_probate.miniclosed-app.json \
+  http://localhost:8095/api/apps/1/export
+
+# Include each bot's message history (bigger file):
+curl -o ga_probate-full.miniclosed-app.json \
+  "http://localhost:8095/api/apps/1/export?include_history=true"
+
+# On instance B: import (auto-match a backend that covers every model).
+curl -X POST http://localhost:8095/api/apps/import \
+  -H "Content-Type: application/json" \
+  -d "{\"data\": $(cat ga_probate.miniclosed-app.json)}"
+# → 201 { "id": 5, "name": "GA Probate", "matched_backend_id": 1,
+#         "bot_ids": [42, 43, 44], "warnings": [] }
+
+# On instance B: import with one backend pinned for every bot.
+curl -X POST http://localhost:8095/api/apps/import \
+  -H "Content-Type: application/json" \
+  -d "{\"data\": $(cat ga_probate.miniclosed-app.json), \"backend_id\": 4}"
+```
+
+A 409 response means *no single backend covers every model in the file*. The body's `models` array lists the unique models needed, and `available_backends[].model_present` tells you which backends have full coverage (if any). Retry with `backend_id` set to whichever you want to run the whole app against. App-name and per-bot title collisions both get the same `(2)`, `(3)`, … suffix scheme as the bot import.
+
+Full schema reference and the resolution-flow diagram live in [DOCUMENTATION.md → Application import / export](./DOCUMENTATION.md#application-import--export).
+
+---
+
 ## Upgrading MiniClosedAI
 
 Two ways to pull the latest from `https://github.com/edantonio505/miniclosedai`. Both are safe — every upgrade snapshots the current commit and **auto-rolls back** if the new code fails to start within 15 seconds.
@@ -2500,7 +2561,7 @@ MiniClosedAI ships a single-file end-to-end test suite. One command, no extra de
 python test_e2e.py
 ```
 
-Typical output: **163 tests, ~16 seconds, exits 0 on success** (1 on any failure, so it slots into CI or a pre-commit hook with no config).
+Typical output: **170 tests, ~16 seconds, exits 0 on success** (1 on any failure, so it slots into CI or a pre-commit hook with no config).
 
 For live voice-pipeline verification — once both servers are up via `./dev.sh up` — there's a separate **`tools/test_call.py`** harness that drives a real WebRTC call through the full ASR → LLM → TTS chain and reports per-stage timing:
 
@@ -2599,7 +2660,7 @@ miniclosedai/
 │       ├── Support Ticket Router.md        # JSON extractor / classifier
 │       ├── Inbound Lead Qualifier.md       # Scoring + routing
 │       └── RAG Query Router.md             # Bonsai-paired classifier
-├── test_e2e.py                # Single-file end-to-end regression suite (163 tests, ~16s)
+├── test_e2e.py                # Single-file end-to-end regression suite (170 tests, ~16s)
 └── miniclosedai.db            # SQLite file (gitignored; Docker: in named volume)
 ```
 

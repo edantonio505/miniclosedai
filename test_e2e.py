@@ -1579,6 +1579,20 @@ def _():
     assert 'id="model-picker-btn"' in body
     assert 'id="model-picker-search"' in body
     assert 'id="model-select"' in body
+    # Apps page header + toolbar wiring: import button, file input, the
+    # list/grid view toggle (mirrors the Bots page's toggle one-for-one).
+    assert 'id="apps-list"' in body
+    assert 'id="apps-import-btn"' in body
+    assert 'id="apps-import-file"' in body
+    assert 'id="apps-view-list"' in body
+    assert 'id="apps-view-grid"' in body
+    # The global tooltip element — a single fixed-positioned <body> child
+    # that every [data-tooltip] hover hijacks. Without this, tooltips fall
+    # back to per-trigger pseudo-elements that get clipped by ancestor
+    # `overflow: hidden`. Guard the architectural decision in CI.
+    assert 'id="global-tooltip"' in body
+    # Backend-picker modal is shared between bot and app import flows.
+    assert 'id="import-modal-backdrop"' in body
 
 
 @test("static: app.js is served and contains recent helpers")
@@ -1612,6 +1626,14 @@ def _():
         "initEvalsUI", "initEvalModalUI",
         # Searchable model picker
         "initModelPicker", "_rebuildModelPicker", "_syncModelPickerLabel",
+        # Application export / import — mirrors the bot pattern at the apps level.
+        "_handleAppImportFile", "_runAppImport", "_downloadApp",
+        "initAppsImportUI",
+        # Apps page grid/list view toggle (parallels the bots toggle).
+        "_APPS_VIEW_KEY", "_applyAppsView", "_setAppsView",
+        # Global tooltip system — one fixed-positioned element on <body>
+        # that escapes every stacking context / overflow clip.
+        "initGlobalTooltip", "_showGlobalTooltip", "_hideGlobalTooltip",
     ]
     for needle in needles:
         assert needle in r.text, f"missing {needle} in served app.js"
