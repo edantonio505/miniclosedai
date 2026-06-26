@@ -20,6 +20,8 @@ const els = {
   botsNewBtn: document.getElementById("bots-new-btn"),
   botsViewList: document.getElementById("bots-view-list"),
   botsViewGrid: document.getElementById("bots-view-grid"),
+  appsViewList: document.getElementById("apps-view-list"),
+  appsViewGrid: document.getElementById("apps-view-grid"),
   kbList: document.getElementById("kb-list"),
   kbEmpty: document.getElementById("kb-empty"),
   kbAddBtn: document.getElementById("kb-add-btn"),
@@ -7052,7 +7054,37 @@ function initPromptGenUI() {
 // An "application" is a named group of bots that maps to a real app. Mirrors
 // the Bots page: an overview of cards, a detail view to chat with each bot
 // individually, plus a generated TypeScript SDK per application.
-const _appsState = { cache: [], filter: "", current: null };
+const _APPS_VIEW_KEY = "miniclosedai:appsView";
+const _appsState = {
+  cache: [], filter: "", current: null,
+  // "list" (vertical stack) or "grid" (responsive tiles). Same toggle pattern
+  // as the bots page (`_botsState.view`); persisted under its own key so the
+  // two views are independent.
+  view: (() => { try { return localStorage.getItem(_APPS_VIEW_KEY) === "grid" ? "grid" : "list"; } catch { return "list"; } })(),
+};
+
+// Apply the current view mode to the apps list container + toggle buttons.
+// Direct clone of `_applyBotsView`, swapped to the apps els + state.
+function _applyAppsView() {
+  const listEl = document.getElementById("apps-list");
+  if (listEl) listEl.classList.toggle("grid-view", _appsState.view === "grid");
+  if (els.appsViewList) {
+    const isList = _appsState.view === "list";
+    els.appsViewList.classList.toggle("active", isList);
+    els.appsViewList.setAttribute("aria-pressed", String(isList));
+  }
+  if (els.appsViewGrid) {
+    const isGrid = _appsState.view === "grid";
+    els.appsViewGrid.classList.toggle("active", isGrid);
+    els.appsViewGrid.setAttribute("aria-pressed", String(isGrid));
+  }
+}
+
+function _setAppsView(view) {
+  _appsState.view = view === "grid" ? "grid" : "list";
+  try { localStorage.setItem(_APPS_VIEW_KEY, _appsState.view); } catch (_) {}
+  _applyAppsView();
+}
 const _sdkState = { files: [], active: 0, appId: null, appName: "", lang: "ts" };
 const _SDK_LANG_LABELS = { ts: "TypeScript", js: "JavaScript", py: "Python" };
 const _SDK_LANG_HINTS = {
@@ -7129,6 +7161,7 @@ function _appMatchesFilter(a, q) {
 function renderAppsPage() {
   const listEl = document.getElementById("apps-list");
   if (!listEl) return;
+  _applyAppsView();
   const q = _appsState.filter.trim().toLowerCase();
   const all = _appsState.cache || [];
   const filtered = all.filter(a => _appMatchesFilter(a, q));
@@ -7589,6 +7622,9 @@ function initAppsUI() {
   if (newBtn) newBtn.addEventListener("click", () => _openAppFormModal({}));
   const filter = document.getElementById("apps-filter");
   if (filter) filter.addEventListener("input", () => { _appsState.filter = filter.value; renderAppsPage(); });
+  if (els.appsViewList) els.appsViewList.addEventListener("click", () => _setAppsView("list"));
+  if (els.appsViewGrid) els.appsViewGrid.addEventListener("click", () => _setAppsView("grid"));
+  _applyAppsView();
   initAppsImportUI();
 
   const close = document.getElementById("sdk-modal-close");
