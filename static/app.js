@@ -6841,13 +6841,40 @@ async function _refreshPromptGenAvailability() {
   }
 }
 
+// Status line under the prompt-gen bar. Three states:
+//   _setPromptGenStatus("")                       → hidden
+//   _setPromptGenStatus("…working…")              → "loading" with spinner
+//   _setPromptGenStatus("…failed…", true)         → "error" tint, no spinner
+// The loading state is visible AS SOON AS the request fires, so the user
+// gets immediate feedback even before the first streamed token shows up
+// in the System Prompt textarea (which can take several seconds on a
+// cold-loaded model).
 function _setPromptGenStatus(text, isError = false) {
   const el = document.getElementById("prompt-gen-status");
   if (!el) return;
-  if (!text) { el.hidden = true; el.textContent = ""; return; }
+  if (!text) {
+    el.hidden = true;
+    el.textContent = "";
+    el.classList.remove("loading", "error");
+    return;
+  }
   el.hidden = false;
   el.textContent = text;
   el.classList.toggle("error", !!isError);
+  el.classList.toggle("loading", !isError);
+}
+
+// Show / clear a spinner on the prompt-gen toggle button itself, so the
+// trigger that the user just clicked visibly acknowledges the click rather
+// than going silent. The button text/label stays in place — the icon swaps
+// to a spinner via the `.is-busy` CSS class.
+function _setPromptGenBusy(busy) {
+  const toggle = document.getElementById("prompt-gen-toggle");
+  if (!toggle) return;
+  toggle.classList.toggle("is-busy", !!busy);
+  toggle.setAttribute("aria-busy", busy ? "true" : "false");
+  if (busy) toggle.setAttribute("aria-disabled", "true");
+  else toggle.removeAttribute("aria-disabled");
 }
 
 // Mode is decided by whether the System Prompt textarea has any content.
@@ -6926,6 +6953,7 @@ async function _runPromptGeneration(description) {
   }
 
   _setPromptGenStatus(`${statusVerb} with ${_promptGenModel} on ${_promptGenBackend.name}…`);
+  _setPromptGenBusy(true);
   ta.value = "";
   ta.disabled = true;
 
@@ -6995,6 +7023,7 @@ async function _runPromptGeneration(description) {
     _setPromptGenStatus(`${verb} failed: ${(e && e.message) || e}`, true);
   } finally {
     ta.disabled = false;
+    _setPromptGenBusy(false);
     _updatePromptGenAffordance();
     ta.focus();
   }
@@ -7018,11 +7047,26 @@ function initPromptGenUI() {
 
   toggle?.addEventListener("click", () => showInput(true));
   cancel?.addEventListener("click", () => { showInput(false); _setPromptGenStatus(""); });
-  const fire = () => {
+  // Submit handler. We INTENTIONALLY keep the input row visible during the
+  // request — collapsing it on click would hide the very button the user just
+  // pressed before they can see it acknowledge their click. Instead, we mark
+  // the submit button `.is-busy` (spinner replaces its label) and disable the
+  // row's controls. The row collapses only when streaming is done so the
+  // result lands cleanly into the System Prompt textarea.
+  const fire = async () => {
     const desc = (input?.value || "").trim();
     if (!desc) { input?.focus(); return; }
-    showInput(false);
-    _runPromptGeneration(desc);
+    if (submit) { submit.classList.add("is-busy"); submit.disabled = true; submit.setAttribute("aria-busy", "true"); }
+    if (input) input.disabled = true;
+    if (cancel) cancel.disabled = true;
+    try {
+      await _runPromptGeneration(desc);
+    } finally {
+      if (submit) { submit.classList.remove("is-busy"); submit.disabled = false; submit.removeAttribute("aria-busy"); }
+      if (input) input.disabled = false;
+      if (cancel) cancel.disabled = false;
+      showInput(false);
+    }
   };
   submit?.addEventListener("click", fire);
   input?.addEventListener("keydown", e => {
