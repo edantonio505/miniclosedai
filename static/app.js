@@ -20,6 +20,8 @@ const els = {
   botsNewBtn: document.getElementById("bots-new-btn"),
   botsViewList: document.getElementById("bots-view-list"),
   botsViewGrid: document.getElementById("bots-view-grid"),
+  voicePicker: document.getElementById("voice-picker"),
+  voiceSelect: document.getElementById("voice-select"),
   appsViewList: document.getElementById("apps-view-list"),
   appsViewGrid: document.getElementById("apps-view-grid"),
   kbList: document.getElementById("kb-list"),
@@ -303,13 +305,28 @@ function syncParamDisplay() {
 // Debounced autosave of the current conversation's config.
 let saveTimer = null;
 
+function _buildVoiceSettingsPatch() {
+  // Only emit a voice_settings patch when the picker is actually present
+  // and visible — otherwise we'd overwrite an existing setting on every save.
+  if (!els.voiceSelect || !els.voicePicker || els.voicePicker.hidden) return undefined;
+  const opt = els.voiceSelect.selectedOptions[0];
+  const vid = (opt && opt.value) || "";
+  if (!vid) return {};   // "Default voice" → clear stored setting
+  const lang = opt.dataset.language || "";
+  const out = { voice_id: vid };
+  if (lang) out.language = lang;
+  return out;
+}
+
 function _buildConfigPatch() {
   const opt = els.modelSelect.selectedOptions[0];
   const backendId = opt && opt.dataset.backendId ? parseInt(opt.dataset.backendId, 10) : undefined;
+  const voice_settings = _buildVoiceSettingsPatch();
   return {
     ...getParams(),
     model: (opt && opt.value) || undefined,
     backend_id: Number.isFinite(backendId) ? backendId : undefined,
+    ...(voice_settings !== undefined ? { voice_settings } : {}),
     system_prompt: els.systemPrompt.value || undefined,
   };
 }
@@ -351,6 +368,9 @@ function bindParamDisplay() {
   els.think.addEventListener("change", () => { syncParamDisplay(); saveSettings(); scheduleSaveToConversation(); });
   els.systemPrompt.addEventListener("input", () => { saveSettings(); scheduleSaveToConversation(); });
   els.modelSelect.addEventListener("change", () => { saveSettings(); scheduleSaveToConversation(); });
+  if (els.voiceSelect) {
+    els.voiceSelect.addEventListener("change", () => { saveSettings(); scheduleSaveToConversation(); });
+  }
   els.resetParams.addEventListener("click", () => {
     els.temperature.value = DEFAULTS.temperature;
     els.maxTokens.value = DEFAULTS.max_tokens;
@@ -391,6 +411,129 @@ function _sortModels(models) {
     if (aRec !== bRec) return aRec ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
+}
+
+// =====================================================================
+// TTS voice picker. Strictly separate from the LLM model picker — voices
+// live on a different backend kind (`kind="voice"`) and are surfaced via
+// their own `/api/voices` endpoint. Hidden whenever no voice backend is
+// registered (mirrors the mic-button affordance rule). Persisted per-bot
+// in `voice_settings.voice_id` / `voice_settings.language`.
+// =====================================================================
+const _voicesState = {
+  cache: [],         // [{id, name, language, gender?}, ...]
+  byId: new Map(),   // id → {id, name, language, ...}
+  loaded: false,
+};
+
+async function loadVoices() {
+  if (!els.voicePicker || !els.voiceSelect) return;
+  try {
+    const r = await fetch("/api/voices");
+    if (!r.ok) {
+      // 404 (no voice backend) or 502 (registered but server unreachable).
+      // We just empty the cache here; VISIBILITY is decided separately by
+      // `_hasVoiceBackend()` against `backendCache`. So if a voice backend
+      // is registered but its server is down, the picker stays visible
+      // with only the "Default voice" placeholder — matches the mic and
+      // call buttons, which also stay visible in that case.
+      _voicesState.cache = [];
+      _voicesState.byId.clear();
+      _voicesState.loaded = true;
+      _renderVoicePicker();
+      return;
+    }
+    const j = await r.json();
+    _voicesState.cache = Array.isArray(j.voices) ? j.voices : [];
+    _voicesState.byId = new Map(_voicesState.cache.map(v => [v.id, v]));
+  } catch {
+    _voicesState.cache = [];
+    _voicesState.byId.clear();
+  }
+  _voicesState.loaded = true;
+  _renderVoicePicker();
+}
+
+// True when at least one enabled `kind='voice'` backend is registered. The
+// same predicate `_refreshMicAffordance()` uses to show the mic button, so
+// the three voice affordances (mic, call, TTS picker) stay perfectly in
+// sync: they all appear the instant a voice backend is registered in
+// Settings and vanish the instant it's removed/disabled. Read-only against
+// `backendCache` so there's no network round-trip — the visibility gate
+// updates immediately whenever `loadBackends()` runs.
+function _hasVoiceBackend() {
+  return (backendCache || []).some(b => b.kind === "voice" && b.enabled);
+}
+
+// Toggle just the picker's visibility based on the registered-voice-backend
+// predicate. Called from `loadBackends()` alongside the mic / call helpers,
+// so Settings edits propagate without waiting for a `/api/voices` round-trip.
+function _refreshVoicePickerAffordance() {
+  if (!els.voicePicker) return;
+  els.voicePicker.hidden = !_hasVoiceBackend();
+}
+
+function _renderVoicePicker() {
+  const sel = els.voiceSelect;
+  const wrap = els.voicePicker;
+  if (!sel || !wrap) return;
+  // Visibility tracks REGISTRATION (mirrors the mic button), NOT catalog
+  // availability. If the voice server is temporarily unreachable the picker
+  // still shows — populated only with the "Default voice" placeholder — so
+  // the UI doesn't flap when the voice backend flaps. TTS calls will 502
+  // at request time, same as the mic / call buttons.
+  const visible = _hasVoiceBackend();
+  wrap.hidden = !visible;
+  if (!visible) return;
+
+  // Preserve current selection across re-renders.
+  const prev = sel.value;
+  sel.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "Default voice";
+  sel.appendChild(placeholder);
+
+  // Group by language so the dropdown is browsable when there are many.
+  const byLang = new Map();
+  for (const v of _voicesState.cache) {
+    const lang = v.language || "?";
+    if (!byLang.has(lang)) byLang.set(lang, []);
+    byLang.get(lang).push(v);
+  }
+  // English first, then alphabetical.
+  const langs = [...byLang.keys()].sort((a, b) => {
+    if (a === "en") return -1;
+    if (b === "en") return 1;
+    return a.localeCompare(b);
+  });
+  for (const lang of langs) {
+    const grp = document.createElement("optgroup");
+    grp.label = lang.toUpperCase();
+    for (const v of byLang.get(lang)) {
+      const opt = document.createElement("option");
+      opt.value = v.id;
+      opt.dataset.language = v.language || "";
+      const gender = v.gender ? ` (${v.gender})` : "";
+      opt.textContent = `${v.name || v.id}${gender}`;
+      grp.appendChild(opt);
+    }
+    sel.appendChild(grp);
+  }
+  // Restore previous if still valid.
+  if (prev && _voicesState.byId.has(prev)) sel.value = prev;
+}
+
+function _setVoiceSelectFromConv(conv) {
+  if (!els.voiceSelect || !_voicesState.loaded) return;
+  const vs = (conv && conv.voice_settings) || {};
+  const vid = vs.voice_id || "";
+  // Only set if the option exists; otherwise fall back to "Default voice".
+  if (vid && _voicesState.byId.has(vid)) {
+    els.voiceSelect.value = vid;
+  } else {
+    els.voiceSelect.value = "";
+  }
 }
 
 async function loadModels() {
@@ -469,6 +612,9 @@ async function loadModels() {
     setStatus("ok", `${reachableCount}/${total} endpoint${total === 1 ? "" : "s"} reachable · ${totalModels} model${totalModels === 1 ? "" : "s"}`);
   }
   _rebuildModelPicker();
+  // Refresh the (separate) voice picker on the same trigger — backends were
+  // just reloaded, so the voice-backend rowset may have changed too.
+  loadVoices().catch(() => {});
   return backends;
 }
 
@@ -2215,6 +2361,10 @@ async function openConversation(id) {
   // still attempt to call, and server will 404 on backend_load.
   if (c.model) _selectModelOption(c.model, c.backend_id);
 
+  // Restore this bot's TTS voice into the picker (no-op if no voice backend
+  // is registered — the picker is hidden in that case).
+  _setVoiceSelectFromConv(c);
+
   // Load saved per-conversation params into the sliders.
   const p = c.params || {};
   if (p.temperature != null) els.temperature.value = p.temperature;
@@ -2314,6 +2464,7 @@ function resetSidebarToDefaults() {
   els.topK.value        = DEFAULTS.top_k;
   els.think.value       = "";
   els.maxThinking.value = "";
+  if (els.voiceSelect) els.voiceSelect.value = "";  // "Default voice"
   syncParamDisplay();
   saveSettings();   // update localStorage; do NOT trigger scheduleSaveToConversation
                     // (the server already has these defaults from the just-created conv)
@@ -4888,6 +5039,7 @@ async function loadBackends() {
     backendCache = [];
   }
   _refreshMicAffordance();
+  _refreshVoicePickerAffordance();
   return backendCache;
 }
 
@@ -6678,6 +6830,9 @@ async function init() {
   // Settings. loadBackends() also re-runs every time Settings renders, so
   // adding / removing a voice endpoint there propagates here on the next save.
   await loadBackends();
+  // Populate the TTS voice picker. Returns silently when no voice backend is
+  // registered (the picker stays hidden until one is added in Settings).
+  await loadVoices();
   await loadConversations();
   initPromptGenUI();
 

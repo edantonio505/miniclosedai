@@ -993,6 +993,105 @@ def _():
         client.delete(f"/api/conversations/{c['id']}")
 
 
+@test("/api/voices: 404 when no voice backend is registered")
+def _():
+    # No voice backend in default seed → endpoint refuses cleanly.
+    r = client.get("/api/voices")
+    assert r.status_code == 404, r.text
+
+
+@test("voice picker affordance: visibility tracks /api/backends, not /api/voices catalog")
+def _():
+    # The frontend gate `_hasVoiceBackend()` reads `backendCache` (populated
+    # by `/api/backends`), NOT the `/api/voices` catalog. This test pins the
+    # contract on the server side so the frontend's affordance can rely on
+    # it: `/api/backends` reports whether a voice backend is registered;
+    # `/api/voices` reports the catalog (which may be empty / unreachable
+    # even when the backend exists). Picker should appear/disappear based on
+    # the former so it stays in sync with the mic + call buttons.
+    # 1. No voice backend → /api/backends has none → picker HIDDEN.
+    backends = client.get("/api/backends").json()
+    assert not any(b.get("kind") == "voice" for b in backends), (
+        f"unexpected voice backend in default fixture: {backends}"
+    )
+    # 2. Register a voice backend → /api/backends has one → picker VISIBLE
+    #    (the frontend doesn't need to round-trip through /api/voices to know).
+    vid = _add_voice_backend()
+    try:
+        backends = client.get("/api/backends").json()
+        voice_rows = [b for b in backends if b.get("kind") == "voice" and b.get("enabled")]
+        assert len(voice_rows) == 1, voice_rows
+        # And /api/voices independently works when the backend is reachable —
+        # this is what populates the picker contents (not its visibility).
+        cat = client.get("/api/voices")
+        assert cat.status_code == 200, cat.text
+        assert cat.json()["backend_id"] == vid
+    finally:
+        client.delete(f"/api/backends/{vid}")
+    # 3. After delete → /api/backends has none again → picker HIDDEN.
+    backends = client.get("/api/backends").json()
+    assert not any(b.get("kind") == "voice" for b in backends)
+
+
+@test("/api/voices: flat list with id/name/language/gender from the voice backend")
+def _():
+    vid = _add_voice_backend()
+    try:
+        r = client.get("/api/voices")
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["backend_id"] == vid
+        voices = j["voices"]
+        # FakeVoice ships 2 English + 2 Spanish.
+        assert len(voices) == 4, voices
+        # Every entry has the four expected keys.
+        for v in voices:
+            assert {"id", "name", "language"}.issubset(v.keys()), v
+        langs = sorted({v["language"] for v in voices})
+        assert langs == ["en", "es"], langs
+        ids = sorted(v["id"] for v in voices)
+        assert ids == ["en_F_0", "en_M_0", "es_F_0", "es_M_0"], ids
+    finally:
+        client.delete(f"/api/backends/{vid}")
+
+
+@test("PATCH conversation: voice_settings persists round-trip")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "voice-pick", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        # Set
+        r = client.patch(f"/api/conversations/{c['id']}", json={
+            "voice_settings": {"voice_id": "en_F_0", "language": "en"},
+        })
+        assert r.status_code == 200, r.text
+        got = client.get(f"/api/conversations/{c['id']}").json()
+        assert got["voice_settings"] == {"voice_id": "en_F_0", "language": "en"}
+        # Clear with empty dict
+        r = client.patch(f"/api/conversations/{c['id']}", json={"voice_settings": {}})
+        assert r.status_code == 200, r.text
+        assert client.get(f"/api/conversations/{c['id']}").json()["voice_settings"] == {}
+        # Reject non-object
+        r = client.patch(f"/api/conversations/{c['id']}", json={"voice_settings": "nope"})
+        assert r.status_code == 422 or r.status_code == 400, r.text
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("static: voice picker markup present + JS symbols")
+def _():
+    html = client.get("/").text
+    # The voice picker sits to the left of the model picker in the topbar.
+    assert 'id="voice-picker"' in html
+    assert 'id="voice-select"' in html
+    js = client.get("/static/app.js").text
+    for sym in ("loadVoices", "_renderVoicePicker", "_setVoiceSelectFromConv", "_buildVoiceSettingsPatch",
+                "_hasVoiceBackend", "_refreshVoicePickerAffordance"):
+        assert sym in js, f"missing {sym} in served app.js"
+
+
 @test("/api/models: aggregated shape + legacy back-compat keys")
 def _():
     _reseed_builtin_to_fake_ollama()
@@ -1010,6 +1109,27 @@ def _():
         assert any(m["name"] == "ollama-a:3b" for m in j["models"])
     finally:
         client.delete(f"/api/backends/{bid}")
+
+
+@test("/api/models: voice backends are NOT listed — TTS voices stay out of the LLM picker")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    vid = _add_voice_backend()
+    try:
+        r = client.get("/api/models")
+        assert r.status_code == 200
+        j = r.json()
+        kinds = [b["kind"] for b in j["backends"]]
+        assert "voice" not in kinds, (
+            f"voice backend leaked into /api/models — kinds: {kinds}. "
+            "TTS voices would pollute the LLM model dropdown in the chat topbar."
+        )
+        # The voice backend itself still exists via /api/backends — only the
+        # LLM-picker endpoint excludes it.
+        all_backends = client.get("/api/backends").json()
+        assert any(b["id"] == vid and b["kind"] == "voice" for b in all_backends)
+    finally:
+        client.delete(f"/api/backends/{vid}")
 
 
 @test("conversations: CRUD roundtrip + backend_id persists")

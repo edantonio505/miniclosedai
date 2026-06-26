@@ -179,6 +179,9 @@ class ConversationUpdate(BaseModel):
     think: ThinkValue = None
     max_thinking_tokens: int | None = Field(None, ge=1, le=100000)
     backend_id: int | None = None
+    # Voice settings (TTS voice id + language). Persisted into the
+    # `voice_settings` JSON column. Pass {} to clear back to defaults.
+    voice_settings: dict | None = None
 
 
 class AvatarUpdate(BaseModel):
@@ -864,13 +867,21 @@ async def api_extract_pdf(file: UploadFile = File(...), full: bool = False):
 async def api_models():
     """Aggregated view for the Dashboard model dropdown.
 
-    Returns one entry per backend with its model list. Disabled backends are
-    included with `running=False` + empty models so the UI can still show them
-    greyed out. Preserves `ollama_running` for older front-end code until the
-    frontend is updated.
+    Returns one entry per LLM backend with its model list. Disabled backends
+    are included with `running=False` + empty models so the UI can still
+    show them greyed out. Preserves `ollama_running` for older front-end
+    code until the frontend is updated.
+
+    Voice backends (kind='voice') are excluded — they advertise a TTS voice
+    catalog, not LLM models, and were leaking into the chat-topbar model
+    picker. Voice selection has its own surface (`backendCache` on the
+    client filters by `kind='voice'` for the voice features that need it);
+    this endpoint is explicitly for the LLM picker.
     """
     with db.get_conn() as conn:
-        rows = conn.execute("SELECT * FROM backends ORDER BY id").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM backends WHERE kind != 'voice' ORDER BY id"
+        ).fetchall()
     backends = [db.row_to_dict(r) for r in rows]
 
     result = []
@@ -972,6 +983,18 @@ def api_update_conversation(conv_id: int, data: ConversationUpdate):
         if col in supplied and supplied[col] is not None:
             fields.append(f"{col} = ?")
             values.append(supplied[col])
+
+    # Voice settings (JSON column). Whole-object replace — caller sends the
+    # full desired voice_settings dict. Passing {} clears the column back to
+    # defaults (resolver falls back to first English voice on the backend).
+    if "voice_settings" in supplied:
+        vs = supplied["voice_settings"]
+        if vs is None:
+            vs = {}
+        if not isinstance(vs, dict):
+            raise HTTPException(400, "voice_settings must be an object")
+        fields.append("voice_settings = ?")
+        values.append(json.dumps(vs))
 
     # Sampling params go into the JSON `params` column. null = clear the key.
     with db.get_conn() as conn:
@@ -3458,6 +3481,53 @@ async def _resolve_voice_choice(
             if vid:
                 return vid, lang
     raise HTTPException(503, "Voice backend has no voices available.")
+
+
+@app.get("/api/voices")
+async def api_list_voices():
+    """Flat catalog of every voice the registered voice backend can produce.
+
+    Powers the chat-topbar voice picker (mirrors the LLM model picker but
+    only TTS voices, so the two pickers stay strictly separate). Returns
+    404 with a Settings hint when no voice backend is registered — the
+    frontend hides the voice picker in that case.
+
+    Response: {"voices": [{"id", "name", "language", "gender"?}, ...]}.
+    Voices are flattened across all languages so the picker is a single
+    flat dropdown (we don't ask the user to first pick a language then a
+    voice — `id` + `language` together fully identify a voice).
+    """
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM backends WHERE kind = 'voice' AND enabled = 1 ORDER BY id LIMIT 1"
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "No voice backend configured.")
+    backend = db.row_to_dict(row)
+    try:
+        cat = await voice.list_voices(backend)
+    except Exception as e:
+        raise HTTPException(502, f"Could not query voices catalog: {e}")
+    if not isinstance(cat, dict):
+        raise HTTPException(502, "Voice backend returned a malformed /voices catalog.")
+    out: list[dict] = []
+    for lang in sorted(cat.keys()):
+        voices_list = cat.get(lang) or []
+        if not isinstance(voices_list, list):
+            continue
+        for v in voices_list:
+            if not isinstance(v, dict):
+                continue
+            vid = v.get("id") or v.get("name")
+            if not vid:
+                continue
+            out.append({
+                "id": vid,
+                "name": v.get("name") or vid,
+                "language": lang,
+                "gender": v.get("gender"),
+            })
+    return {"voices": out, "backend_id": backend["id"], "backend_name": backend["name"]}
 
 
 @app.post("/api/conversations/{conv_id}/voice/transcribe")
