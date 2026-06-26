@@ -2332,14 +2332,105 @@ body.sidebar-collapsed #sidebar-toggle {
   gap: 6px;
   justify-content: flex-end;
 }
+/* Spinner on the primary "Improve" / "Generate" button while the request is
+   in flight. We keep the button's box (and therefore the row's layout)
+   exactly the same — color: transparent hides the label without collapsing
+   the width, and a centered ::after paints the spinner. Pointer events are
+   off so a stuck "is-busy" state can't be re-triggered. */
+.prompt-gen-input-actions .btn.is-busy {
+  position: relative;
+  color: transparent;
+  pointer-events: none;
+}
+.prompt-gen-input-actions .btn.is-busy::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #ffffff;
+  animation: prompt-gen-spin 0.8s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .prompt-gen-input-actions .btn.is-busy::after { animation: none; }
+}
 .prompt-gen-status {
   font-size: 11.5px;
   color: var(--text-muted);
   font-style: italic;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .prompt-gen-status.error {
   color: var(--accent);
   font-style: normal;
+}
+/* The .loading variant adds a small spinning ring before the status text.
+   We use ::before so the spinner is a single CSS-only element with no extra
+   DOM. Hidden in the error state (where the message reads naturally on its
+   own and an "error" pill would be confusing). */
+.prompt-gen-status.loading::before {
+  content: "";
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  animation: prompt-gen-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+.prompt-gen-status.error::before { display: none; }
+
+@keyframes prompt-gen-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* While the prompt generator is streaming into the System Prompt textarea
+   the textarea is `disabled` (so the user can't fight the tokens going in).
+   Add a subtle accent-tinted glow + outline so the user can SEE that the
+   field is actively being written into — pure visual feedback during the
+   dead-time before the first token lands. */
+#system-prompt[disabled] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 0 0 3px var(--accent-soft);
+  animation: prompt-gen-textarea-pulse 1.4s ease-in-out infinite;
+}
+@keyframes prompt-gen-textarea-pulse {
+  0%, 100% { box-shadow: 0 0 0 1px var(--accent), 0 0 0 3px var(--accent-soft); }
+  50%      { box-shadow: 0 0 0 1px var(--accent), 0 0 0 6px var(--accent-soft); }
+}
+
+/* The Improve / Generate button itself shows a tiny inline spinner while
+   the request is in flight, instead of just being disabled and looking
+   stuck. The spinner replaces the sparkles glyph at the same size. */
+.prompt-gen-toggle.is-busy {
+  pointer-events: none;
+  opacity: 0.9;
+}
+.prompt-gen-toggle.is-busy svg {
+  display: none;
+}
+.prompt-gen-toggle.is-busy::before {
+  content: "";
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  animation: prompt-gen-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .prompt-gen-status.loading::before,
+  .prompt-gen-toggle.is-busy::before { animation: none; }
+  #system-prompt[disabled] { animation: none; }
 }
 
 .h-splitter {
