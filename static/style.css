@@ -991,15 +991,21 @@ body[data-page="app-detail"] .page-app-detail {
   outline: none;
 }
 
-/* Spatial drill-in / drill-out animation between Bots list and chat.
-   Triggered by toggling body[data-bots-transition] to "forward" (list → chat)
-   or "back" (chat → list) just before applyActivePage flips data-page. The
-   attribute is auto-cleared once the animation ends. Pages share the same
-   slot so the transform is applied to whichever page becomes visible. */
-body[data-bots-transition="forward"] .page-dashboard {
+/* Spatial drill-in / drill-out animation between any list ↔ detail surfaces
+   (Bots ↔ chat, Apps ↔ app-detail, app-detail ↔ chat — and any cross-area
+   nav that changes depth). Triggered by toggling body[data-page-transition]
+   to "forward" (deeper) or "back" (shallower) just before applyActivePage
+   flips data-page. The attribute is auto-cleared once the animation ends.
+
+   The selector targets `.page` directly because exactly one .page-X is
+   `display: flex` at a time (the rest are `display: none` and CSS
+   animations don't run on display:none elements), so the rule manifests
+   only on whichever surface just became visible — no per-page enumeration
+   needed, and adding a new page automatically inherits the animation. */
+body[data-page-transition="forward"] .page {
   animation: drillIn 200ms cubic-bezier(0.22, 0.8, 0.22, 1) both;
 }
-body[data-bots-transition="back"] .page-bots {
+body[data-page-transition="back"] .page {
   animation: drillOut 200ms cubic-bezier(0.22, 0.8, 0.22, 1) both;
 }
 @keyframes drillIn {
@@ -1011,8 +1017,8 @@ body[data-bots-transition="back"] .page-bots {
   to   { transform: translateX(0); opacity: 1; }
 }
 @media (prefers-reduced-motion: reduce) {
-  body[data-bots-transition="forward"] .page-dashboard,
-  body[data-bots-transition="back"]    .page-bots { animation: none; }
+  body[data-page-transition="forward"] .page,
+  body[data-page-transition="back"]    .page { animation: none; }
 }
 
 /* =====================================================================

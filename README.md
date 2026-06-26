@@ -404,6 +404,8 @@ The **Apps** activity-bar icon opens a second top-level surface that groups bots
 
 The Apps page mirrors the Bots page's affordances one-to-one: a **search input**, a **list ↔ grid view toggle** (persisted to `localStorage` under `miniclosedai:appsView`, independent from the bots view), per-card **Generate SDK / Export / Edit / Delete** actions, a header **Import** button (upload-cloud icon — pick a `.miniclosed-app.json` to recreate the whole application on this instance), and the **+ New application** button. **Export** is a download-cloud icon on each card; **Shift-click** to include every bot's message history. See [Sharing an application between instances](#sharing-an-application-between-instances) for the full round-trip story.
 
+Navigation feel is consistent with the Bots page: clicking an app slides the app-detail surface in from the right; clicking a bot inside an app slides the chat in further; **Back** slides whichever surface you came from back in from the left. The same spatial drill-in / drill-out animation that powers the Bots ↔ chat transition powers every list → detail step here too.
+
 The headline feature is **per-app SDK generation**. Each application has a **Generate SDK** button: it opens a modal with a language tab strip — **TypeScript**, **JavaScript**, or **Python** — and downloads a ready-to-use client package wired specifically for *this app's* bots, with each bot exposed as a named function and its bot id baked in:
 
 ```python
