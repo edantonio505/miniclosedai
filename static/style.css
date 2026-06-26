@@ -1587,6 +1587,36 @@ body[data-page-transition="back"] .page {
    ===================================================================== */
 .model-select-hidden { display: none !important; }
 .model-picker { position: relative; flex: 0 1 280px; min-width: 0; }
+
+/* TTS voice picker — sits to the LEFT of the LLM model picker in the
+   chat topbar. Strictly separate from the model picker so the user
+   knows which choice is which (audio vs LLM). Hidden until a voice
+   backend is registered (the `hidden` attribute is toggled in JS). */
+.voice-picker { flex: 0 1 200px; min-width: 0; }
+.voice-picker .voice-select {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.12s;
+  /* Reset native chrome so it matches the model picker visually. */
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2399a' stroke='none'><path d='M7 10l5 5 5-5z'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  background-size: 16px 16px;
+  padding-right: 26px;
+}
+.voice-picker .voice-select:hover { border-color: var(--border-strong); }
+.voice-picker .voice-select:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
 .model-picker-btn {
   display: flex;
   align-items: center;

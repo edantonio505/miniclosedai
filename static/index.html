@@ -68,6 +68,17 @@
     </div>
 
     <div class="top-controls">
+      <!-- TTS voice picker. Sits LEFT of the model picker so the audio voice
+           reads as a peer choice next to the LLM. Hidden until a voice
+           backend is registered (see _updateVoicePickerAffordance in
+           app.js). The selected voice is persisted per-conversation under
+           voice_settings.voice_id (+ language). -->
+      <div class="voice-picker" id="voice-picker" hidden>
+        <select id="voice-select" class="voice-select" data-tooltip="TTS voice for audio replies" aria-label="TTS voice">
+          <option value="">Default voice</option>
+        </select>
+      </div>
+
       <!-- Searchable model picker. The native <select> stays as the backing
            state (lots of code reads its value/selectedOptions); the button +
            popover are a filter layer that write back to it. -->
