@@ -723,6 +723,11 @@
     </div>
   </div>
 
+  <!-- Single global tooltip element. Positioned with position:fixed and
+       the maximum z-index by app.js (initGlobalTooltip), so it escapes
+       every stacking context / overflow clip on the page. -->
+  <div id="global-tooltip" role="tooltip" aria-hidden="true"></div>
+
   <script src="/static/app.js"></script>
 </body>
 </html>

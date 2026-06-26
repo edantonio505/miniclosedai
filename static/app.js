@@ -6477,7 +6477,153 @@ function initLogsUI() {
   }
 }
 
+// =====================================================================
+// Global tooltip — ONE fixed-positioned element on <body> that shows
+// the `data-tooltip` text for whichever element you hover or focus.
+//
+// Why a global element instead of a per-trigger `::after` pseudo:
+//   • Every `::after` is rendered inside its parent's stacking + clipping
+//     contexts. Any ancestor with `overflow: hidden`, `transform`, or a
+//     stacking context (sidebar, modal, sticky toolbar, etc.) would clip
+//     or layer-cover the tooltip.
+//   • A single fixed-positioned <body> child sits in the root stacking
+//     context with the maximum z-index, so it's GUARANTEED to render
+//     above every other element on the page.
+//
+// Positioning runs on every show — we compute the trigger's bounding rect
+// in viewport coordinates and place the tooltip directly under it (or
+// above when `data-tooltip-side="top"` is set), clamped to the viewport
+// so it never falls off-screen at narrow widths.
+// =====================================================================
+const _GLOBAL_TOOLTIP_GAP_PX = 6;       // gap between trigger and bubble
+const _GLOBAL_TOOLTIP_VIEWPORT_PAD = 8;  // clamp this far from each edge
+
+let _globalTooltipEl = null;
+let _globalTooltipTrigger = null;        // element currently advertising
+
+function _shouldShowTooltip(trigger) {
+  if (!trigger || !trigger.isConnected) return false;
+  const text = trigger.getAttribute("data-tooltip");
+  if (!text) return false;
+  // Match the old `::after` behaviour: don't compete with an open menu/popover.
+  if (trigger.getAttribute("aria-expanded") === "true") return false;
+  // Don't show on hidden / off-screen elements.
+  if (trigger.hidden || trigger.closest("[hidden]")) return false;
+  return true;
+}
+
+function _showGlobalTooltip(trigger) {
+  if (!_globalTooltipEl || !_shouldShowTooltip(trigger)) return;
+  _globalTooltipTrigger = trigger;
+  const text = trigger.getAttribute("data-tooltip");
+  _globalTooltipEl.textContent = text;
+  _globalTooltipEl.setAttribute("aria-hidden", "false");
+
+  // Reset side class so this measurement is consistent.
+  const wantTop = trigger.getAttribute("data-tooltip-side") === "top";
+  _globalTooltipEl.classList.toggle("side-top", wantTop);
+
+  // Make sure the element is laid out so we can read its size, but stays
+  // invisible until we position it (avoids a one-frame flash at 0,0).
+  _globalTooltipEl.style.visibility = "hidden";
+  _globalTooltipEl.classList.add("visible");
+
+  const triggerRect = trigger.getBoundingClientRect();
+  const ttRect = _globalTooltipEl.getBoundingClientRect();
+  const vw = document.documentElement.clientWidth;
+  const vh = document.documentElement.clientHeight;
+
+  // Horizontal: center under the trigger, then clamp into the viewport so
+  // wide tooltips on edge-aligned buttons don't fall off-screen.
+  let left = triggerRect.left + (triggerRect.width - ttRect.width) / 2;
+  left = Math.max(
+    _GLOBAL_TOOLTIP_VIEWPORT_PAD,
+    Math.min(left, vw - ttRect.width - _GLOBAL_TOOLTIP_VIEWPORT_PAD)
+  );
+
+  // Vertical: prefer the requested side; if it would clip the viewport,
+  // auto-flip.
+  let top;
+  let placedTop = wantTop;
+  if (placedTop) {
+    top = triggerRect.top - ttRect.height - _GLOBAL_TOOLTIP_GAP_PX;
+    if (top < _GLOBAL_TOOLTIP_VIEWPORT_PAD) {
+      placedTop = false;
+      top = triggerRect.bottom + _GLOBAL_TOOLTIP_GAP_PX;
+    }
+  } else {
+    top = triggerRect.bottom + _GLOBAL_TOOLTIP_GAP_PX;
+    if (top + ttRect.height > vh - _GLOBAL_TOOLTIP_VIEWPORT_PAD) {
+      placedTop = true;
+      top = triggerRect.top - ttRect.height - _GLOBAL_TOOLTIP_GAP_PX;
+    }
+  }
+  _globalTooltipEl.classList.toggle("side-top", placedTop);
+
+  _globalTooltipEl.style.left = `${Math.round(left)}px`;
+  _globalTooltipEl.style.top = `${Math.round(top)}px`;
+  _globalTooltipEl.style.visibility = "";
+}
+
+function _hideGlobalTooltip() {
+  if (!_globalTooltipEl) return;
+  _globalTooltipEl.classList.remove("visible");
+  _globalTooltipEl.setAttribute("aria-hidden", "true");
+  _globalTooltipTrigger = null;
+}
+
+function _findTooltipTarget(el) {
+  // Walk up to find an element advertising a `data-tooltip` attribute,
+  // skipping the global tooltip itself.
+  if (!el || el === _globalTooltipEl) return null;
+  return el.closest ? el.closest("[data-tooltip]") : null;
+}
+
+function initGlobalTooltip() {
+  _globalTooltipEl = document.getElementById("global-tooltip");
+  if (!_globalTooltipEl) return;
+
+  // Delegated pointer + keyboard events on document so dynamically-added
+  // [data-tooltip] elements (cards built by JS, modal contents, etc.) get
+  // the tooltip behaviour for free.
+  document.addEventListener("pointerover", e => {
+    const target = _findTooltipTarget(e.target);
+    if (target === _globalTooltipTrigger) return;
+    // Moved off the current trigger (or onto a different one) — drop the
+    // existing tooltip first, then show the new one if present.
+    if (_globalTooltipTrigger) _hideGlobalTooltip();
+    if (target) _showGlobalTooltip(target);
+  });
+  document.addEventListener("pointerout", e => {
+    if (!_globalTooltipTrigger) return;
+    // relatedTarget is where the pointer is going. If it's still inside the
+    // active trigger we're not actually leaving it — let the move stand.
+    const next = e.relatedTarget;
+    if (next && _globalTooltipTrigger.contains(next)) return;
+    // If we're moving from the trigger directly onto another tooltip
+    // trigger, pointerover above will handle the swap — so just hide.
+    _hideGlobalTooltip();
+  });
+  document.addEventListener("focusin", e => {
+    const t = _findTooltipTarget(e.target);
+    if (t) _showGlobalTooltip(t);
+  });
+  document.addEventListener("focusout", e => {
+    const t = _findTooltipTarget(e.target);
+    if (t && _globalTooltipTrigger === t) _hideGlobalTooltip();
+  });
+
+  // Hide on scroll/resize — the cached rect is now wrong, and reshowing on
+  // pointermove is good enough.
+  window.addEventListener("scroll", _hideGlobalTooltip, true);
+  window.addEventListener("resize", _hideGlobalTooltip);
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") _hideGlobalTooltip();
+  });
+}
+
 async function init() {
+  initGlobalTooltip();
   initTheme();
   initSidebarToggle();
   initActivityBar();
