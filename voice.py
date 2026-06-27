@@ -21,6 +21,15 @@ from typing import AsyncIterator
 
 import httpx
 
+# Every httpx.AsyncClient below is built with `verify=False`. A voice backend
+# is, by design, a user-registered LAN endpoint — usually the sibling
+# miniclosedai-voice service over a self-signed dev cert (start.sh generates
+# one in .devcerts/ on first run). The browser's getUserMedia API forces the
+# voice service onto HTTPS, but its dev cert isn't in the system trust store,
+# so a default httpx call would fail with SSL: CERTIFICATE_VERIFY_FAILED.
+# `verify=False` is the correct default here — the user already told us this
+# URL is trusted by registering it in Settings.
+
 # Short timeout for status / probe calls; long timeout for streaming TTS so a
 # generous reply doesn't kill the connection mid-utterance.
 _PROBE_TIMEOUT = httpx.Timeout(8.0, connect=5.0)
@@ -53,7 +62,7 @@ def _headers(backend: dict) -> dict:
 async def health(backend: dict) -> dict:
     """Return the /health payload. Raises httpx errors on network/HTTP failures."""
     url = f"{_base_url(backend)}/health"
-    async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
+    async with httpx.AsyncClient(verify=False, timeout=_PROBE_TIMEOUT) as client:
         r = await client.get(url, headers=_headers(backend))
         r.raise_for_status()
         return r.json()
@@ -80,7 +89,7 @@ async def list_voices(backend: dict) -> dict:
     place.
     """
     url = f"{_base_url(backend)}/voices"
-    async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
+    async with httpx.AsyncClient(verify=False, timeout=_PROBE_TIMEOUT) as client:
         r = await client.get(url, headers=_headers(backend))
         r.raise_for_status()
         return r.json()
@@ -99,7 +108,7 @@ async def transcribe(
     url = f"{_base_url(backend)}/transcribe"
     files = {"audio": (filename, audio, content_type)}
     data = {"language": language} if language else None
-    async with httpx.AsyncClient(timeout=_TURN_TIMEOUT) as client:
+    async with httpx.AsyncClient(verify=False, timeout=_TURN_TIMEOUT) as client:
         r = await client.post(url, files=files, data=data, headers=_headers(backend))
         r.raise_for_status()
         return r.json()
@@ -121,7 +130,7 @@ async def transcribe(
 async def call_configure(backend: dict, payload: dict) -> dict:
     """POST /call/configure on the voice backend; return the JSON response."""
     url = f"{_base_url(backend)}/call/configure"
-    async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
+    async with httpx.AsyncClient(verify=False, timeout=_PROBE_TIMEOUT) as client:
         r = await client.post(url, json=payload, headers=_headers(backend))
         r.raise_for_status()
         return r.json()
@@ -133,7 +142,7 @@ async def call_offer(backend: dict, payload: dict) -> dict:
     inside this SDP — once exchanged, audio flows direct browser↔voice, NOT
     through MiniClosedAI."""
     url = f"{_base_url(backend)}/webrtc/offer"
-    async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
+    async with httpx.AsyncClient(verify=False, timeout=_PROBE_TIMEOUT) as client:
         r = await client.post(url, json=payload, headers=_headers(backend))
         if r.status_code >= 400:
             raise httpx.HTTPStatusError(
@@ -149,7 +158,7 @@ async def call_events(backend: dict, webrtc_id: str) -> AsyncIterator[dict]:
     parsed event dict (the per-stage status / transcript / chunk / end / error
     messages the call handler emits via AdditionalOutputs)."""
     url = f"{_base_url(backend)}/call/events/{webrtc_id}"
-    async with httpx.AsyncClient(timeout=_TURN_TIMEOUT) as client:
+    async with httpx.AsyncClient(verify=False, timeout=_TURN_TIMEOUT) as client:
         async with client.stream(
             "GET", url,
             headers={**_headers(backend), "Accept": "text/event-stream"},
@@ -190,7 +199,7 @@ async def speak_stream(
     payload: dict = {"text": text, "voice": voice, "language": language}
     if speed is not None:
         payload["speed"] = speed
-    async with httpx.AsyncClient(timeout=_TURN_TIMEOUT) as client:
+    async with httpx.AsyncClient(verify=False, timeout=_TURN_TIMEOUT) as client:
         async with client.stream(
             "POST", url, json=payload,
             headers={**_headers(backend), "Accept": "text/event-stream"},
