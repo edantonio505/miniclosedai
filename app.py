@@ -4658,6 +4658,29 @@ def index():
     return resp
 
 
+# Browsers automatically request `/favicon.ico` (and some new ones request
+# `/favicon.svg`) from the site root, NOT from /static/. The `<link>` in
+# index.html points to /static/favicon.svg, but if the HTML hasn't been
+# re-parsed yet (cached old version) the browser will only fire the
+# default-location request. Serving the SVG at the root URL covers both
+# paths so first-visit tabs always pick up the icon.
+@app.get("/favicon.svg")
+def favicon_svg():
+    resp = FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
+
+
+@app.get("/favicon.ico")
+def favicon_ico():
+    # Same SVG served as image/svg+xml — modern browsers accept this even
+    # when the URL ends in `.ico`. Avoids needing to generate a separate
+    # raster .ico file just to silence the default-location request.
+    resp = FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="127.0.0.1", port=8095, reload=False)
