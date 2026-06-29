@@ -4449,6 +4449,317 @@ def _():
 
 
 # ==================================================================
+# xbench-methodology endpoints — clone, in-flight 409, nested params,
+# auto-register against a fake miniclosedai-llm manager.
+# ==================================================================
+
+@test("clone: POST /api/conversations/{id}/clone copies config with empty messages")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    src = client.post("/api/conversations", json={
+        "title": "extractor", "model": "ollama-a:3b",
+        "system_prompt": "Return pure JSON.", "temperature": 0.2,
+    }).json()
+    try:
+        r = client.post(f"/api/conversations/{src['id']}/clone", json={})
+        assert r.status_code == 201, r.text
+        new = r.json()
+        try:
+            assert new["from_id"] == src["id"]
+            assert new["title"].startswith("extractor")
+            got = client.get(f"/api/conversations/{new['id']}").json()
+            assert got["model"] == "ollama-a:3b"
+            assert got["system_prompt"] == "Return pure JSON."
+            assert got["params"]["temperature"] == 0.2
+            assert got["messages"] == []
+        finally:
+            client.delete(f"/api/conversations/{new['id']}")
+    finally:
+        client.delete(f"/api/conversations/{src['id']}")
+
+
+@test("clone: body overrides apply (title + nested params merge)")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    src = client.post("/api/conversations", json={
+        "title": "src", "model": "ollama-a:3b", "temperature": 0.7,
+    }).json()
+    try:
+        r = client.post(f"/api/conversations/{src['id']}/clone", json={
+            "title": "worker-0",
+            "params": {"temperature": 0.0, "max_tokens": 999},
+        })
+        assert r.status_code == 201, r.text
+        new_id = r.json()["id"]
+        try:
+            assert r.json()["title"] == "worker-0"
+            got = client.get(f"/api/conversations/{new_id}").json()
+            assert got["params"]["temperature"] == 0.0
+            assert got["params"]["max_tokens"] == 999
+        finally:
+            client.delete(f"/api/conversations/{new_id}")
+    finally:
+        client.delete(f"/api/conversations/{src['id']}")
+
+
+@test("clone: title-collision adds a numeric suffix")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    src = client.post("/api/conversations", json={
+        "title": "dup", "model": "ollama-a:3b",
+    }).json()
+    a = client.post(f"/api/conversations/{src['id']}/clone", json={"title": "dup"}).json()
+    b = client.post(f"/api/conversations/{src['id']}/clone", json={"title": "dup"}).json()
+    try:
+        assert a["title"] != b["title"], f"both clones got {a['title']!r}"
+        assert "dup" in a["title"] and "dup" in b["title"]
+    finally:
+        client.delete(f"/api/conversations/{a['id']}")
+        client.delete(f"/api/conversations/{b['id']}")
+        client.delete(f"/api/conversations/{src['id']}")
+
+
+@test("clone: 404 when source conv does not exist")
+def _():
+    r = client.post("/api/conversations/99999/clone", json={})
+    assert r.status_code == 404, r.text
+
+
+@test("conversations: accept nested params.temperature on create")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    r = client.post("/api/conversations", json={
+        "model": "ollama-a:3b", "backend_id": 1,
+        "params": {"temperature": 0.0, "top_p": 0.5},
+    })
+    assert r.status_code == 200, r.text
+    cid = r.json()["id"]
+    try:
+        got = client.get(f"/api/conversations/{cid}").json()
+        assert got["params"]["temperature"] == 0.0
+        assert got["params"]["top_p"] == 0.5
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("conversations: nested + top-level temperature CONFLICT → 400")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    r = client.post("/api/conversations", json={
+        "model": "ollama-a:3b", "backend_id": 1,
+        "temperature": 0.5, "params": {"temperature": 0.0},
+    })
+    assert r.status_code == 400, r.text
+    assert "temperature" in r.text.lower()
+
+
+@test("conversations: nested + top-level agreeing → 200 (idempotent)")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    r = client.post("/api/conversations", json={
+        "model": "ollama-a:3b", "backend_id": 1,
+        "temperature": 0.0, "params": {"temperature": 0.0},
+    })
+    assert r.status_code == 200, r.text
+    cid = r.json()["id"]
+    try:
+        assert client.get(f"/api/conversations/{cid}").json()["params"]["temperature"] == 0.0
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("conversations: PATCH accepts nested params.temperature")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    cid = client.post("/api/conversations", json={"model": "ollama-a:3b"}).json()["id"]
+    try:
+        r = client.patch(f"/api/conversations/{cid}", json={"params": {"temperature": 0.0}})
+        assert r.status_code == 200, r.text
+        assert client.get(f"/api/conversations/{cid}").json()["params"]["temperature"] == 0.0
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+# ----- Auto-register against a fake miniclosedai-llm manager -----
+
+class FakeManager(_FakeServer):
+    """Speaks just enough of miniclosedai-llm's /api/models for the
+    auto-register endpoint to find a served model."""
+
+    def _handler_class(self):
+        outer = self
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a, **kw): pass
+            def do_GET(self):
+                if self.path == "/api/models":
+                    body = json.dumps([
+                        {
+                            "id": "qwen3-vl-8b",
+                            "served_name": "qwen3-vl-8b",
+                            "hf_id": "Qwen/Qwen3-VL-8B-Instruct",
+                            "status": "running",
+                            "base_url": "http://localhost:8001/v1",
+                            "alt_base_url": "http://host.docker.internal:8001/v1",
+                        },
+                        {
+                            "id": "stopped-model",
+                            "served_name": "stopped-model",
+                            "hf_id": "Foo/Bar",
+                            "status": "stopped",
+                            "base_url": "http://localhost:8002/v1",
+                            "alt_base_url": "http://host.docker.internal:8002/v1",
+                        },
+                    ]).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404); self.end_headers()
+        return H
+
+
+fake_manager = FakeManager()
+
+
+@test("auto-register: GET /api/models → INSERT openai backend with base_url")
+def _():
+    r = client.post("/api/backends/auto-register", json={
+        "manager_url": fake_manager.base_url,
+        "model_id": "qwen3-vl-8b",
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    bid = body["id"]
+    try:
+        assert body["kind"] == "openai"
+        assert body["base_url"] == "http://localhost:8001/v1"
+        assert body["served_model"] == "qwen3-vl-8b"
+        # Backend actually inserted in the DB.
+        all_backends = client.get("/api/backends").json()
+        assert any(b["id"] == bid for b in all_backends)
+    finally:
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("auto-register: prefer_docker_host=true picks alt_base_url")
+def _():
+    r = client.post("/api/backends/auto-register", json={
+        "manager_url": fake_manager.base_url,
+        "model_id": "qwen3-vl-8b",
+        "prefer_docker_host": True,
+    })
+    assert r.status_code == 201, r.text
+    bid = r.json()["id"]
+    try:
+        assert r.json()["base_url"] == "http://host.docker.internal:8001/v1"
+    finally:
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("auto-register: unknown model_id → 404 with available list")
+def _():
+    r = client.post("/api/backends/auto-register", json={
+        "manager_url": fake_manager.base_url,
+        "model_id": "no-such-model",
+    })
+    assert r.status_code == 404, r.text
+    body = r.json()
+    assert "available" in body["detail"]
+    assert "qwen3-vl-8b" in body["detail"]["available"]
+
+
+@test("auto-register: model exists but is stopped → 422")
+def _():
+    r = client.post("/api/backends/auto-register", json={
+        "manager_url": fake_manager.base_url,
+        "model_id": "stopped-model",
+    })
+    assert r.status_code == 422, r.text
+    assert "not running" in r.text.lower() or "mc start" in r.text.lower()
+
+
+@test("auto-register: unreachable manager → 502")
+def _():
+    r = client.post("/api/backends/auto-register", json={
+        "manager_url": "http://127.0.0.1:1",   # nothing listening
+        "model_id": "anything",
+    })
+    assert r.status_code == 502, r.text
+
+
+# ----- In-flight 409 guard -----
+
+@test("in-flight 409: second persist+message chat on same conv is rejected")
+def _():
+    """Manually park a 'running' generation in _generations[cid], then verify
+    both /chat and /chat/stream reject new persist+message turns with 409.
+
+    We park the marker directly (same trick the cancel-test uses, test_e2e.py
+    around line 1493) rather than racing a real HTTP stream — TestClient
+    consumes streams synchronously, which doesn't reliably leave the bg task
+    in 'running' state long enough for sibling requests to observe it."""
+    _reseed_builtin_to_fake_ollama()
+    cid = client.post("/api/conversations", json={
+        "model": "ollama-a:3b", "backend_id": 1, "temperature": 0.0,
+    }).json()["id"]
+    try:
+        # Park a "running" generation marker on this conv.
+        gen = app_mod._new_generation()
+        app_mod._generations[cid] = gen
+
+        # Streaming sibling → 409.
+        r = client.post(f"/api/conversations/{cid}/chat/stream",
+                        json={"message": "second", "persist": True})
+        assert r.status_code == 409, r.text
+        body = r.json()
+        assert body["detail"]["code"] == "generation_in_flight"
+        assert "clone" in body["detail"]["message"].lower()
+
+        # Non-streaming sibling → 409 too.
+        r = client.post(f"/api/conversations/{cid}/chat",
+                        json={"message": "second", "persist": True})
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["code"] == "generation_in_flight"
+
+        # And reattach: true bypasses the guard (so the GUI's refresh-path
+        # behaviour from API callers can also reconnect).
+        gen["status"] = "running"   # ensure still parked
+        r = client.post(f"/api/conversations/{cid}/chat",
+                        json={"message": "second", "persist": True, "reattach": True})
+        # The non-streaming /chat with reattach=true is allowed through; it
+        # falls into the regular code path (which will fail downstream but
+        # NOT with 409 — that's the only thing we're asserting).
+        assert r.status_code != 409, r.text
+    finally:
+        app_mod._generations.pop(cid, None)
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("in-flight 409: non-persist or messages= form is NOT 409'd")
+def _():
+    """The 409 only applies to the persist + single-message path (where the
+    background-resume race lives). One-shot non-persist callers run through
+    the regular code path and never touch _generations."""
+    _reseed_builtin_to_fake_ollama()
+    cid = client.post("/api/conversations", json={
+        "model": "ollama-a:3b", "backend_id": 1, "temperature": 0.0,
+    }).json()["id"]
+    try:
+        gen = app_mod._new_generation()
+        app_mod._generations[cid] = gen
+
+        # persist=False → not guarded.
+        r = client.post(f"/api/conversations/{cid}/chat",
+                        json={"message": "fire and forget", "persist": False})
+        assert r.status_code != 409, r.text
+    finally:
+        app_mod._generations.pop(cid, None)
+        client.delete(f"/api/conversations/{cid}")
+
+
+# ==================================================================
 # Main
 # ==================================================================
 
