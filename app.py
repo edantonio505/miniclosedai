@@ -69,6 +69,28 @@ def _new_generation() -> dict:
         "cond": asyncio.Condition(),
     }
 
+
+def _is_reattach(req) -> bool:
+    """True iff this request is asking to re-bind to an existing in-flight
+    generation rather than start a new turn. Two signals:
+
+      - `reattach: true` on the body (the explicit API form), OR
+      - `X-Reattach: 1` HTTP header (legacy — emitted by the GUI's resume path).
+
+    Used by the chat endpoints to distinguish a legitimate refresh-reconnect
+    from an accidental parallel call. The latter gets a 409 with a pointer to
+    POST /api/conversations/{id}/clone."""
+    if getattr(req, "reattach", False):
+        return True
+    # Pydantic BaseModel doesn't carry HTTP headers; the route handler passes
+    # the raw Request when it wants header support. Best-effort fallback.
+    headers = getattr(req, "_headers", None)
+    if headers:
+        v = headers.get("x-reattach") or headers.get("X-Reattach")
+        if v and v.strip() not in ("0", "false", "False", ""):
+            return True
+    return False
+
 STATIC_DIR = Path(__file__).parent / "static"
 
 
@@ -166,6 +188,12 @@ class ConversationCreate(BaseModel):
     think: ThinkValue = None
     max_thinking_tokens: int | None = Field(None, ge=1, le=100000)
     backend_id: int = 1   # default: built-in Ollama
+    # Optional nested form of the sampling-param fields above. Lets API
+    # callers say `{"params": {"temperature": 0}}` — the historical
+    # methodology footgun where putting temperature here silently used 0.7.
+    # See `_merge_nested_params()` for how this is reconciled with the
+    # top-level fields (silent agreement OK, conflict → 400).
+    params: dict | None = None
 
 
 class ConversationUpdate(BaseModel):
@@ -182,6 +210,57 @@ class ConversationUpdate(BaseModel):
     # Voice settings (TTS voice id + language). Persisted into the
     # `voice_settings` JSON column. Pass {} to clear back to defaults.
     voice_settings: dict | None = None
+    # See ConversationCreate.params — same semantics on PATCH.
+    params: dict | None = None
+
+
+def _merge_nested_params(data, *, fields_set: set[str]) -> dict:
+    """Reconcile the legacy top-level sampling fields with a nested `params`.
+
+    For a model with both top-level fields (temperature, max_tokens, ...)
+    AND an optional `params: dict | None`, this returns the FINAL value for
+    each `_PARAM_KEYS` entry, merging in this priority:
+
+      1. If the caller explicitly set BOTH the top-level field and the
+         nested key AND they disagree → 400 (loud, unambiguous).
+      2. If both are set AND agree → use the value (idempotent).
+      3. If only the nested key is set → use it.
+      4. If only the top-level field is set → use it.
+      5. If neither is set → use whatever Pydantic populated (default or None).
+
+    `fields_set` is the set of top-level field names the caller explicitly
+    supplied (from `data.__fields_set__` or `model_dump(exclude_unset=True)`
+    keys), so we can distinguish "0.7 because they set it" from "0.7 because
+    that's the default".  Returns a dict of {key: value} for all _PARAM_KEYS,
+    where value may be None (means "not specified" on the PATCH side).
+    """
+    nested = getattr(data, "params", None) or {}
+    if not isinstance(nested, dict):
+        raise HTTPException(400, "`params` must be an object")
+    out: dict = {}
+    for key in _PARAM_KEYS:
+        top = getattr(data, key, None)
+        top_set = key in fields_set
+        nest = nested.get(key, None) if key in nested else None
+        nest_set = key in nested
+        if top_set and nest_set and top != nest:
+            raise HTTPException(
+                400,
+                f"`{key}` was supplied both top-level ({top!r}) and under "
+                f"`params` ({nest!r}); remove one — they must not disagree.",
+            )
+        if nest_set:
+            out[key] = nest
+        elif top_set:
+            out[key] = top
+        else:
+            out[key] = top   # default value or None
+    # Allow callers to set unknown future params via nested — we don't strip
+    # them. The DB layer JSON-stringifies, so forward-compat is free.
+    for key, val in nested.items():
+        if key not in _PARAM_KEYS:
+            out[key] = val
+    return out
 
 
 class AvatarUpdate(BaseModel):
@@ -233,6 +312,53 @@ class ConversationChatRequest(BaseModel):
     # to keep replies to 1-2 sentences so TTS starts speaking sooner and the
     # user doesn't sit through a wall of audio.
     voice_mode: bool = False
+    # Set True ONLY when the caller is reconnecting to a generation that's
+    # already in flight (page refresh, new tab on the same conv, SSE drop).
+    # Without this flag the server returns 409 if a generation is already
+    # running on the conv — protecting parallel API callers from silently
+    # interleaving turns on a shared conversation.  GUI sets this on its
+    # background reconnect path.  See `_is_reattach` below for the legacy
+    # X-Reattach header fallback.
+    reattach: bool = False
+
+
+class BackendAutoRegister(BaseModel):
+    """Body for POST /api/backends/auto-register — pulls the base_url directly
+    from a running miniclosedai-llm manager (the `mc` CLI's dashboard at
+    :8099). No copy/paste from `mc url` required.
+
+    Field semantics:
+      manager_url      — the manager's root URL (e.g. http://localhost:8099)
+      model_id         — what `mc ls` shows in the "id" column (the served
+                         model name, not the HF id)
+      name             — display name in Settings; defaults to model_id
+      prefer_docker_host — use the manager's `alt_base_url` (the host.docker.internal
+                         flavour). Set true when MiniClosedAI is itself
+                         running inside Docker on the same host.
+      api_key          — optional Bearer token; vLLM defaults to any-string
+                         when not configured, so most setups can omit this.
+    """
+    model_config = ConfigDict(extra="forbid")
+    manager_url: str = Field(..., min_length=1)
+    model_id: str = Field(..., min_length=1)
+    name: str | None = Field(None, max_length=80)
+    prefer_docker_host: bool = False
+    api_key: str | None = None
+
+
+class ConversationClone(BaseModel):
+    """Body for POST /api/conversations/{id}/clone. Every field is optional —
+    by default the new conversation is an exact copy of the source's config
+    (model, system_prompt, params, backend) with empty messages."""
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = Field(None, min_length=1, max_length=200)
+    backend_id: int | None = None
+    model: str | None = None
+    system_prompt: str | None = None
+    # Params overrides — merged into the source's params. E.g. {"temperature": 0}
+    # to force deterministic output in a benchmark clone while keeping the
+    # source bot's other settings.
+    params: dict | None = None
 
 
 class BackendCreate(BaseModel):
@@ -414,6 +540,99 @@ def api_create_backend(data: BackendCreate):
         conn.commit()
         row = conn.execute("SELECT * FROM backends WHERE id = ?", (cur.lastrowid,)).fetchone()
     return _scrub_backend(db.row_to_dict(row))
+
+
+@app.post("/api/backends/auto-register", status_code=201)
+async def api_auto_register_backend(data: BackendAutoRegister):
+    """Register a vLLM-served model as a backend by asking miniclosedai-llm
+    where it lives — instead of the user copy-pasting `mc url` output into
+    Settings.
+
+    Flow:
+      1. GET <manager_url>/api/models     — list everything the manager runs.
+      2. Find an entry where served_name == model_id (or hf_id matches).
+      3. Pick base_url (or alt_base_url if prefer_docker_host=true).
+      4. Refuse to register a model whose status != 'running'  — points the
+         user at `mc start <id>`.
+      5. INSERT a kind='openai' backend with that URL.
+
+    Errors:
+      404 — model_id not found on the manager; response lists known names.
+      422 — model found but not running.
+      502 — manager itself unreachable.
+    """
+    base = _normalize_base_url(data.manager_url)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{base}/api/models")
+            r.raise_for_status()
+            models = r.json()
+    except (httpx.ConnectError, httpx.TimeoutException) as e:
+        raise HTTPException(
+            502,
+            f"Could not reach miniclosedai-llm at {base}: {e}. "
+            "Is the manager running? Try `cd ~/Desktop/miniclosedai-llm && ./dev.sh up`.",
+        )
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            502,
+            f"miniclosedai-llm returned HTTP {e.response.status_code} on /api/models",
+        )
+
+    if not isinstance(models, list):
+        raise HTTPException(502, "miniclosedai-llm /api/models response was not a list")
+
+    # Match by served_name first (what users actually pass on the CLI), then
+    # fall back to hf_id (so `Qwen/Qwen3-VL-8B-Instruct` works without knowing
+    # the auto-generated served name).
+    match = next(
+        (m for m in models if m.get("served_name") == data.model_id or m.get("id") == data.model_id),
+        None,
+    )
+    if not match:
+        known = [m.get("served_name") or m.get("id") for m in models]
+        raise HTTPException(
+            404,
+            {
+                "code": "model_not_found",
+                "message": f"No model named {data.model_id!r} on this manager.",
+                "available": known,
+                "hint": "Use `mc ls` to list, or `mc run <hf_id> --wait` to start one.",
+            },
+        )
+    if (match.get("status") or "").lower() not in {"running", "ready", "healthy"}:
+        raise HTTPException(
+            422,
+            {
+                "code": "model_not_running",
+                "message": f"Model {data.model_id!r} exists but status is "
+                           f"{match.get('status')!r}, not running.",
+                "hint": f"Start it with `mc start {data.model_id}` "
+                        "(and `--wait` if you want to block until ready).",
+            },
+        )
+    url_key = "alt_base_url" if data.prefer_docker_host else "base_url"
+    base_url = match.get(url_key) or match.get("base_url")
+    if not base_url:
+        raise HTTPException(
+            502,
+            f"miniclosedai-llm did not advertise a base_url for {data.model_id!r}",
+        )
+    name = data.name or match.get("served_name") or data.model_id
+
+    # Now the same INSERT path the regular /api/backends route uses.
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO backends (name, kind, base_url, api_key, headers, enabled, is_builtin)
+               VALUES (?, 'openai', ?, ?, '{}', 1, 0)""",
+            (name, _normalize_base_url(base_url), data.api_key),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM backends WHERE id = ?", (cur.lastrowid,)).fetchone()
+    out = _scrub_backend(db.row_to_dict(row))
+    # Echo the served-model name so the caller can use it as the bot's `model`.
+    out["served_model"] = match.get("served_name") or data.model_id
+    return out
 
 
 @app.patch("/api/backends/{backend_id}")
@@ -931,7 +1150,10 @@ def api_create_conversation(data: ConversationCreate):
     # Validate the backend exists before inserting.
     _load_backend(data.backend_id)
 
-    params = {k: getattr(data, k) for k in _PARAM_KEYS}
+    # Merge any nested `params` into the top-level sampling fields, 400ing
+    # on conflict. Callers can use EITHER form — both is fine when they
+    # agree. See _merge_nested_params for the priority rules.
+    params = _merge_nested_params(data, fields_set=set(data.__fields_set__))
     with db.get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO conversations (title, model, system_prompt, params, backend_id)
@@ -997,8 +1219,31 @@ def api_update_conversation(conv_id: int, data: ConversationUpdate):
         values.append(json.dumps(vs))
 
     # Sampling params go into the JSON `params` column. null = clear the key.
+    # Callers can pass them either top-level OR nested under `params: {...}`.
+    # Mixing forms is allowed when they agree; conflicting values 400.
+    nested = supplied.get("params") if "params" in supplied else None
+    if nested is not None and not isinstance(nested, dict):
+        raise HTTPException(400, "`params` must be an object")
+    nested = nested or {}
+    param_updates: dict = {}
+    for k in _PARAM_KEYS:
+        top_set = k in supplied
+        nest_set = k in nested
+        if top_set and nest_set and supplied[k] != nested[k]:
+            raise HTTPException(
+                400,
+                f"`{k}` was supplied both top-level ({supplied[k]!r}) and under "
+                f"`params` ({nested[k]!r}); remove one — they must not disagree.",
+            )
+        if nest_set:
+            param_updates[k] = nested[k]
+        elif top_set:
+            param_updates[k] = supplied[k]
+    # Forward-compat for params we don't have a top-level field for yet.
+    for k, v in nested.items():
+        if k not in _PARAM_KEYS:
+            param_updates[k] = v
     with db.get_conn() as conn:
-        param_updates = {k: supplied[k] for k in _PARAM_KEYS if k in supplied}
         if param_updates:
             row = conn.execute(
                 "SELECT params FROM conversations WHERE id = ?", (conv_id,)
@@ -1074,6 +1319,53 @@ def api_delete_conversation(conv_id: int):
         conn.execute("DELETE FROM eval_cases WHERE conversation_id = ?", (conv_id,))
         conn.commit()
     return {"ok": True}
+
+
+@app.post("/api/conversations/{conv_id}/clone", status_code=201)
+def api_clone_conversation(conv_id: int, body: ConversationClone | None = None):
+    """Clone a conversation as a new bot — same config, empty message history.
+
+    Built for parallel benchmark harnesses ("each worker needs its own
+    conversation"). The new bot starts with the source's `model`,
+    `system_prompt`, `params`, and `backend_id`; any of those can be
+    overridden via the body. `params` is MERGED, so passing
+    `{"temperature": 0}` overrides only that one key.
+
+    Returns: `201 {id, title, from_id}`. To clean up later: DELETE the new id.
+    """
+    body = body or ConversationClone()
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, title, model, system_prompt, params, backend_id FROM conversations WHERE id = ?",
+            (conv_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, f"Conversation {conv_id} not found")
+
+    # Resolve final fields — overrides win, source fills the rest.
+    title       = body.title       or f"{row['title']} (clone)"
+    model       = body.model       or row["model"]
+    system_prompt = body.system_prompt or row["system_prompt"]
+    backend_id  = body.backend_id  if body.backend_id is not None else row["backend_id"]
+    src_params  = json.loads(row["params"] or "{}")
+    if body.params:
+        src_params.update(body.params)
+    # Title-collision suffix so the bot list stays scannable. Uses the same
+    # `_unique_title` helper the import path uses.
+    with db.get_conn() as conn:
+        existing_titles = {
+            r["title"] for r in conn.execute("SELECT title FROM conversations").fetchall()
+        }
+    title = _unique_title(title, existing_titles)
+    # Validate backend if explicitly overridden — gives a clean 400 instead of
+    # a downstream FK / load error.
+    if body.backend_id is not None:
+        _load_backend(backend_id)
+    new_id = _insert_bot_row(
+        title=title, model=model, system_prompt=system_prompt,
+        params=src_params, sample_messages=[], backend_id=backend_id,
+    )
+    return {"id": new_id, "title": title, "from_id": conv_id}
 
 
 @app.post("/api/conversations/{conv_id}/clear")
@@ -2829,6 +3121,23 @@ async def _run_conv_message(conv_id: int, message: str) -> str:
 @app.post("/api/conversations/{conv_id}/chat")
 async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
     """Call the saved conversation as a configured function (non-streaming)."""
+    # Reject if a streaming generation is already in flight on this conv —
+    # same protection as the streaming sibling so parallel callers without
+    # cloning hit a loud 409 instead of corrupting message history.
+    if req.persist and req.message is not None and not _is_reattach(req):
+        existing = _generations.get(conv_id)
+        if existing and existing["status"] == "running":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "generation_in_flight",
+                    "message": (
+                        f"A reply is already streaming on conversation {conv_id}. "
+                        f"Clone it (POST /api/conversations/{conv_id}/clone) "
+                        "for parallel work — each parallel caller needs its own conversation."
+                    ),
+                },
+            )
     conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
     mcp_servers = _enabled_mcp_servers(conv) if req.message is not None else []
     if req.message is not None:
@@ -3043,7 +3352,29 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
         user_msgs = [_build_user_message(req.message, attachments_raw)]
         snapshot = _chat_snapshot(eff, backend)
         existing = _generations.get(conv_id)
-        if not existing or existing["status"] != "running":
+        if existing and existing["status"] == "running":
+            # A SECOND new turn (different user message, X-Reattach absent) hit
+            # this conversation while the previous turn was still streaming. The
+            # GUI's "click Stop or wait" UX never produces this case — only an
+            # API caller running parallel work without cloning does. Silently
+            # reattaching here would either drop the new user message
+            # (corruption) or interleave two generations on one buffer (race).
+            # Loud 409 with a pointer to the clone route instead.
+            if not _is_reattach(req):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "generation_in_flight",
+                        "message": (
+                            f"A reply is already streaming on conversation {conv_id}. "
+                            "Wait for it to finish, click Stop, or clone the conversation "
+                            f"(POST /api/conversations/{conv_id}/clone) for parallel work — "
+                            "each parallel caller needs its own conversation."
+                        ),
+                    },
+                )
+            # Reattach to the existing in-flight buffer (page refresh / new tab).
+        else:
             _append_conv_messages(conv_id, _user_entries(user_msgs, snapshot))
             gen = _new_generation()
             _generations[conv_id] = gen

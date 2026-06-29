@@ -45,7 +45,8 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 20. [Self-upgrade](#self-upgrade)
 20. [Prompt generator](#prompt-generator)
 21. [Activity logs](#activity-logs)
-22. [Database](#database)
+22. [Benchmarking with miniclosedai-llm](#benchmarking-with-miniclosedai-llm)
+23. [Database](#database)
 23. [Configuration](#configuration)
 24. [File layout](#file-layout)
 25. [Security](#security)
@@ -967,6 +968,7 @@ DELETE /api/backends/{id}?force=true              → cascade-delete: removes ba
 GET    /api/backends/{id}/models                  → list that backend's models only
 GET    /api/backends/{id}/status                  → reachability probe (running, kind, model count)
 POST   /api/backends/test                         → probe a draft config without saving
+POST   /api/backends/auto-register                → pull base_url from a miniclosedai-llm manager + insert
 POST   /api/backends/{id}/pull                    → start a streaming model pull on Ollama backends
 GET    /api/pulls                                 → poll progress for all in-flight pulls
 DELETE /api/backends/{id}/pulls/{name:path}       → cancel an in-flight pull
@@ -989,6 +991,7 @@ GET    /api/conversations/{id}                    → get full conversation (inc
 PATCH  /api/conversations/{id}                    → update any subset of fields
 DELETE /api/conversations/{id}                    → delete
 POST   /api/conversations/{id}/clear              → wipe messages, keep config
+POST   /api/conversations/{id}/clone              → duplicate as a new bot (parallel-worker pattern)
 PATCH  /api/conversations/{id}/messages/{index}   → edit one stored message in place
 GET    /api/conversations/{id}/export.csv             → text-only SFT CSV (input,output)
 GET    /api/conversations/{id}/export.zip             → multimodal SFT bundle (JSONL + images)
@@ -2262,6 +2265,122 @@ Subsequent ticks:  GET /api/logs?since_id=<max>     → only new entries
 - **No authentication on the read.** Same security model as the rest of the app — local-only / trusted-LAN by default. Don't expose `/api/logs` to a hostile network; the previews can contain user input.
 - **No filtering by backend or endpoint server-side.** The GUI does in-memory substring search across the buffer it already has. At 500 entries this is cheap; if the buffer ever grows server-side filtering becomes worthwhile.
 - **No webhook / SSE push.** Polling is simpler and the latency cost (2 seconds) doesn't matter for a debugging view. SSE would also require keeping connections open per tab; the polling approach gracefully handles tab close, page navigate, and laptop sleep.
+
+---
+
+## Benchmarking with miniclosedai-llm
+
+A focused workflow that this gateway supports first-class as of the
+`benchmark-methodology` branch: pair MiniClosedAI with **miniclosedai-llm**
+(a sibling vLLM control plane at `:8099`) to register CUDA-served models,
+benchmark them on a fixed test set with proper parallelism, and pick the
+best base before fine-tuning.
+
+The methodology — long-form in the repo's top-level instruction file — uses
+four endpoints. All four were added explicitly to make the harness a thin
+script instead of a workaround over the GUI's defaults:
+
+### 1. Auto-register a vLLM model — `POST /api/backends/auto-register`
+
+Replaces the manual "run `mc url <id>`, copy the base_url, open Settings,
+paste, save" loop. Body:
+
+```json
+{
+  "manager_url": "http://localhost:8099",
+  "model_id": "qwen3-vl-8b",
+  "name": "Qwen3-VL-8B (vLLM)",
+  "prefer_docker_host": false,
+  "api_key": null
+}
+```
+
+`prefer_docker_host=true` picks the manager's `alt_base_url` (the
+`host.docker.internal` flavour) — set it when this gateway runs in Docker
+on the same host. On success returns the new backend row plus
+`served_model` (use that as your bot's `model` field). Error map:
+
+| Status | Cause | Hint surfaced in detail |
+|---|---|---|
+| 502 | manager URL unreachable | "Is the manager running? `cd ~/Desktop/miniclosedai-llm && ./dev.sh up`" |
+| 404 | model_id not on the manager | response includes `available` (every known served-name) |
+| 422 | model exists but status != "running" | "Start it with `mc start <id>` (and `--wait` if you want to block until ready)" |
+
+### 2. Clone a bot per parallel worker — `POST /api/conversations/{id}/clone`
+
+Concurrent `/chat` calls on a single conversation race on the messages
+array — the gateway returns a 409 (see #3) to make that loud, but the
+*correct* answer is one conversation per worker. The clone route takes the
+source bot's `model`, `system_prompt`, `params`, and `backend_id`, with any
+field optionally overridable. Body:
+
+```json
+{
+  "title": "worker-0",
+  "params": {"temperature": 0.0}
+}
+```
+
+Returns `201 {"id": <new>, "title": <resolved>, "from_id": <source>}`.
+Cleanup is one DELETE.
+
+### 3. Nested-`params` form on conversation create + PATCH
+
+Historical footgun: `POST /api/conversations` accepted `temperature` at the
+top level only — passing it nested under `params` was silently ignored and
+0.7 was used instead. After the fix:
+
+- Both forms are accepted. `{"temperature": 0}` or `{"params": {"temperature": 0}}` — server-side they produce identical rows.
+- Mixing forms is OK when they agree: `{"temperature": 0, "params": {"temperature": 0}}` → 200.
+- Conflicting values raise 400 with `'<field>' was supplied both top-level (…) and under 'params' (…)`.
+- Unknown keys under `params` are stored verbatim (forward-compat for future params we don't have a top-level field for yet).
+
+### 4. In-flight 409 guard on chat endpoints
+
+A safety net for parallel API callers who forget to clone. When a previous
+generation is still streaming on a conversation, a second `persist + message`
+POST to `/chat` or `/chat/stream` returns `409 {code: "generation_in_flight"}`
+with the exact remediation in `message`: clone the bot.
+
+GUI behaviour is unchanged — the resume-on-refresh path uses the separate
+`GET /api/conversations/{id}/generation/stream` endpoint which is not guarded.
+API callers reconnecting via `POST /chat/stream` can opt in by passing
+`reattach: true` in the body, but the harness convention is to clone instead.
+
+### Python client (`clients/xbench_client.py`)
+
+Ships in the repo as a reference. ~20 lines of usage covers the whole
+methodology:
+
+```python
+from clients.xbench_client import XBenchClient
+
+mc = XBenchClient("https://192.168.0.110:8095", verify=False)
+backend = mc.auto_register_backend(
+    manager_url="http://localhost:8099", model_id="qwen3-vl-8b",
+)
+base = mc.create_conversation(
+    model=backend["served_model"], backend_id=backend["id"],
+    system_prompt="...", params={"temperature": 0.0},
+)
+with mc.clone(base["id"], title="worker-0") as worker:
+    reply = mc.chat(worker.id, message=document_text, persist=False)
+```
+
+The client raises `GenerationInFlight`, `ModelNotRunning`, and
+`ManagerUnreachable` as discrete exceptions so a harness can taxonomy
+errors cleanly. See `clients/example_parallel_extraction.py` for the
+4-worker fan-out shape.
+
+### What this gateway is NOT responsible for
+
+The full `xbench` toolkit (`xbench init` / `verify` / `bench` / `taxonomy` /
+`compare`) is a SEPARATE Python package — kept out of MiniClosedAI core by
+design. The four endpoints above are the only contact surface; everything
+else (rendering PDFs, LLM-assisted ground-truth verification, field-type-
+aware scoring, per-doc taxonomy) lives in the `xbench` repo. The
+methodology specifies which scoring strategy each field type uses; this
+gateway only serves model calls.
 
 ---
 

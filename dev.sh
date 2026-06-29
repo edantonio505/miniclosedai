@@ -42,8 +42,25 @@ app_pid()    { pgrep -f "uvicorn app:app.*${PORT_APP}" | head -1; }
 app_alive()  { [[ -n "$(app_pid)" ]]; }
 app_health() { curl -fsSk --max-time 2 "https://localhost:${PORT_APP}/" >/dev/null 2>&1; }
 
-voice_running() { docker compose -f $VOICE_DIR/docker-compose.yml ps --status=running --quiet voice 2>/dev/null | grep -q .; }
-voice_health()  { curl -fsS --max-time 2 "http://localhost:${PORT_VOICE}/health" >/dev/null 2>&1; }
+# Voice service state probes — work for BOTH the bare-metal HTTPS path
+# (preferred on this box; the sibling repo's ./dev.sh runs it via start.sh)
+# AND the legacy Docker path (kept as fallback). We always check HTTPS first
+# since that's the new default — bare-metal start.sh auto-generates a
+# self-signed cert covering localhost + the LAN IP.
+voice_pid()          { pgrep -f "uvicorn server:app.*${PORT_VOICE}" | head -1; }
+voice_proc_alive()   { [[ -n "$(voice_pid)" ]]; }
+voice_docker_alive() { docker compose -f "$VOICE_DIR/docker-compose.yml" ps --status=running --quiet voice 2>/dev/null | grep -q .; }
+voice_running()      { voice_proc_alive || voice_docker_alive; }
+voice_health() {
+  curl -fsSk --max-time 2 "https://localhost:${PORT_VOICE}/health" >/dev/null 2>&1 ||
+  curl -fsS  --max-time 2 "http://localhost:${PORT_VOICE}/health"  >/dev/null 2>&1
+}
+voice_health_body() {
+  # Echo the /health JSON so the "ready" line can show what loaded. Tries
+  # HTTPS first, falls back to HTTP.
+  curl -fsSk --max-time 2 "https://localhost:${PORT_VOICE}/health" 2>/dev/null ||
+  curl -fsS  --max-time 2 "http://localhost:${PORT_VOICE}/health"  2>/dev/null
+}
 
 ensure_cert() {
   [[ -f "$CERT" && -f "$KEY" ]] && return
@@ -83,16 +100,50 @@ start_app() {
 }
 
 start_voice() {
+  # Fast path: already up and healthy.
   if voice_running && voice_health; then
-    ok "Voice service already running   ${c_dim}$(curl -fsS http://localhost:${PORT_VOICE}/health)${c_off}"
+    ok "Voice service already running   ${c_dim}$(voice_health_body)${c_off}"
     return
   fi
-  step "Starting voice service (docker compose)"
+
+  # If a Docker container is up but bare-metal sibling exists, the container
+  # is silently squatting on port 8090 — the bare-metal start.sh will then
+  # fail with EADDRINUSE. Take the container down first so bare-metal can
+  # claim the port. (This is the failure mode we hit repeatedly: an old
+  # Docker session held the port even after `docker compose down voice`
+  # because restart=unless-stopped kept respawning it.)
+  if voice_docker_alive && [[ -x "$VOICE_DIR/dev.sh" ]]; then
+    step "Stopping stale Docker voice container so bare-metal can bind :$PORT_VOICE"
+    ( cd "$VOICE_DIR" && docker compose down voice ) > /dev/null 2>&1
+    sleep 1
+  fi
+
+  # Preferred path: bare-metal HTTPS via the sibling repo's dev.sh.
+  # This is the proven-working path on the Blackwell GB10 host (Docker hits
+  # CUDA sm_121 JIT issues that bare-metal's warmed-up venv avoids).
+  if [[ -x "$VOICE_DIR/dev.sh" ]]; then
+    step "Starting voice service (bare-metal HTTPS via $VOICE_DIR/dev.sh up)"
+    ( cd "$VOICE_DIR" && ./dev.sh up > /dev/null 2>&1 ) || true
+    # /health may take ~20s on first launch (model warmup).
+    for _ in $(seq 1 60); do
+      if voice_health; then
+        ok "Voice service ready   ${c_dim}$(voice_health_body)${c_off}"
+        return
+      fi
+      sleep 1
+    done
+    warn "Voice didn't respond in 60s. Last 30 lines of /tmp/voice.log:"
+    tail -30 /tmp/voice.log 2>/dev/null || warn "(no log file)"
+    die "Voice bring-up failed"
+  fi
+
+  # Fallback path: legacy Docker compose (kept for environments where
+  # bare-metal setup isn't done — most non-Blackwell boxes work fine here).
+  step "Starting voice service (docker compose — sibling dev.sh not found)"
   ( cd "$VOICE_DIR" && docker compose up -d --build voice > /dev/null )
-  # /health may take ~20s the first time after a fresh build (model warmup)
   for _ in $(seq 1 60); do
     if voice_health; then
-      ok "Voice service ready   ${c_dim}$(curl -fsS http://localhost:${PORT_VOICE}/health)${c_off}"
+      ok "Voice service ready   ${c_dim}$(voice_health_body)${c_off}"
       return
     fi
     sleep 1
@@ -118,21 +169,32 @@ stop_app() {
 }
 
 stop_voice() {
-  # `docker compose stop` (not `down`) — leaves the container defined so the
-  # next `start` doesn't recreate it. Models stay on disk; restart is fast.
-  if voice_running; then
-    step "Stopping voice service"
-    ( cd "$VOICE_DIR" && docker compose stop voice ) > /dev/null
-    ok "Voice service stopped (use '$0 voice-purge' to fully remove)"
-  else
+  # Stop whichever path is currently up. Bare-metal first (most common
+  # nowadays), then any leftover Docker container.
+  local stopped=0
+  if voice_proc_alive && [[ -x "$VOICE_DIR/dev.sh" ]]; then
+    step "Stopping bare-metal voice service"
+    ( cd "$VOICE_DIR" && ./dev.sh down > /dev/null 2>&1 ) || true
+    stopped=1
+  fi
+  if voice_docker_alive; then
+    step "Stopping voice service container"
+    ( cd "$VOICE_DIR" && docker compose stop voice ) > /dev/null 2>&1 || true
+    stopped=1
+  fi
+  if [[ $stopped -eq 0 ]]; then
     ok "Voice service not running"
+  else
+    ok "Voice service stopped"
   fi
 }
 
 cmd_voice_purge() {
-  # Explicit teardown — removes the container so the next start rebuilds.
-  step "Tearing down voice container (will rebuild on next start)"
-  ( cd "$VOICE_DIR" && docker compose down ) > /dev/null
+  # Explicit teardown — stop bare-metal AND remove the Docker container so
+  # the next start rebuilds cleanly. Use after a Dockerfile or venv change.
+  step "Tearing down all voice service paths"
+  ( cd "$VOICE_DIR" && ./dev.sh down > /dev/null 2>&1 ) || true
+  ( cd "$VOICE_DIR" && docker compose down ) > /dev/null 2>&1 || true
   ok "Voice service removed"
 }
 
@@ -157,9 +219,13 @@ cmd_status() {
   step "Voice service"
   if voice_running; then
     if voice_health; then
-      ok "$(curl -fsS http://localhost:${PORT_VOICE}/health)"
+      # Show scheme + body so it's obvious whether bare-metal HTTPS or
+      # Docker HTTP is active.
+      local scheme=""
+      curl -fsSk --max-time 2 "https://localhost:${PORT_VOICE}/health" >/dev/null 2>&1 && scheme="https" || scheme="http"
+      ok "${scheme}://localhost:${PORT_VOICE}/   $(voice_health_body)"
     else
-      warn "container running but /health not responding"
+      warn "running but /health not responding"
     fi
   else
     warn "not running"

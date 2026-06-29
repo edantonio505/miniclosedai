@@ -38,15 +38,16 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 15. [Automated image labeling — hot dog / not hot dog](#automated-image-labeling--hot-dog--not-hot-dog)
 16. [Building a chatbot against a saved bot](#building-a-chatbot-against-a-saved-bot)
 17. [Python client SDK](#python-client-sdk--compose-bots-in-your-own-code)
-18. [Sharing bots between instances](#sharing-bots-between-instances)
-19. [Sharing an application between instances](#sharing-an-application-between-instances)
-20. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
-21. [LAN access](#lan-access)
-22. [Troubleshooting](#troubleshooting)
-23. [Testing](#testing)
-24. [Project layout](#project-layout)
-25. [Security](#security)
-26. [License](#license)
+18. [Benchmarking with miniclosedai-llm](#benchmarking-with-miniclosedai-llm)
+19. [Sharing bots between instances](#sharing-bots-between-instances)
+20. [Sharing an application between instances](#sharing-an-application-between-instances)
+21. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
+22. [LAN access](#lan-access)
+23. [Troubleshooting](#troubleshooting)
+24. [Testing](#testing)
+25. [Project layout](#project-layout)
+26. [Security](#security)
+27. [License](#license)
 
 ---
 
@@ -2308,6 +2309,36 @@ This is the **multi-LLM pattern**: MiniClosedAI hosts each bot (its model, syste
 4. **Clean up** — `python router_example.py --cleanup` deletes the four demo bots via `Bot.delete()`.
 
 Why it matters: each specialist is an independent self-hosted expert, so you can give any of them its own model, knowledge base, or MCP tools **without touching the orchestration code**. Swap the three demo specialists for your real bots and you have a production support router; the same classify-then-dispatch shape generalizes to any routing system.
+
+---
+
+## Benchmarking with miniclosedai-llm
+
+There's a focused sister flow for **model selection** — pair this gateway with a CUDA-served vLLM control plane (`miniclosedai-llm`, sibling repo) and benchmark a frozen test set across candidate base models before fine-tuning. Four MiniClosedAI endpoints make the harness a thin script instead of a workaround:
+
+| Endpoint | Why it's needed |
+|---|---|
+| `POST /api/backends/auto-register` | Pulls a vLLM model's `base_url` from the manager at `:8099` — no copy/paste from `mc url` |
+| `POST /api/conversations/{id}/clone` | One conversation per parallel worker (concurrent calls on the same bot race) |
+| `POST /api/conversations` accepts `params: {...}` nested form | Eliminates the historical footgun where `params.temperature` was silently ignored and 0.7 was used |
+| 409 `generation_in_flight` on `/chat` + `/chat/stream` | Loud error instead of silent message-history corruption when parallel callers forget to clone |
+
+A reference Python client lives at `clients/xbench_client.py` (~270 LOC, one `XBenchClient` class + `cloned_bots` context manager). Full prose + endpoint reference in [DOCUMENTATION.md → Benchmarking with miniclosedai-llm](./DOCUMENTATION.md#benchmarking-with-miniclosedai-llm).
+
+```python
+from clients.xbench_client import XBenchClient
+
+mc = XBenchClient("https://192.168.0.110:8095", verify=False)
+backend = mc.auto_register_backend(
+    manager_url="http://localhost:8099", model_id="qwen3-vl-8b",
+)
+base = mc.create_conversation(
+    model=backend["served_model"], backend_id=backend["id"],
+    system_prompt="...", params={"temperature": 0.0},
+)
+with mc.clone(base["id"], title="worker-0") as worker:
+    reply = mc.chat(worker.id, message=doc_text, persist=False)
+```
 
 ---
 
