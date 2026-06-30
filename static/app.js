@@ -428,6 +428,18 @@ const _voicesState = {
 
 async function loadVoices() {
   if (!els.voicePicker || !els.voiceSelect) return;
+  // Don't probe /api/voices unless a voice backend is actually registered.
+  // Otherwise no-voice setups log a confusing (but harmless) 404 on every
+  // boot. Visibility is gated on the same predicate, so skipping the fetch
+  // here changes nothing the user sees — the picker stays hidden either way.
+  // (Relies on loadBackends() having populated backendCache first — see init.)
+  if (!_hasVoiceBackend()) {
+    _voicesState.cache = [];
+    _voicesState.byId.clear();
+    _voicesState.loaded = true;
+    _renderVoicePicker();
+    return;
+  }
   try {
     const r = await fetch("/api/voices");
     if (!r.ok) {
@@ -6824,14 +6836,17 @@ async function init() {
   initUpgradeUI();
   initImportBotUI();
   els.input.addEventListener("input", autoGrowInput);
-  await loadModels();
-  // Warm the backend cache at boot so the dashboard's push-to-talk affordance
+  // Warm the backend cache FIRST so the dashboard's push-to-talk affordance
   // (which checks for a kind='voice' row) shows up without first opening
-  // Settings. loadBackends() also re-runs every time Settings renders, so
-  // adding / removing a voice endpoint there propagates here on the next save.
+  // Settings — and so loadModels()'s internal loadVoices() call can tell
+  // whether a voice backend exists before deciding to probe /api/voices.
+  // loadBackends() also re-runs every time Settings renders, so adding /
+  // removing a voice endpoint there propagates here on the next save.
   await loadBackends();
-  // Populate the TTS voice picker. Returns silently when no voice backend is
-  // registered (the picker stays hidden until one is added in Settings).
+  await loadModels();
+  // Populate the TTS voice picker. Returns silently (no /api/voices probe)
+  // when no voice backend is registered — the picker stays hidden until one
+  // is added in Settings.
   await loadVoices();
   await loadConversations();
   initPromptGenUI();
