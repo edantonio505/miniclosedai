@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,9 +33,11 @@ import pypdf
 import db
 import evals
 import knowledge
+import voice
 import llm
 import logs as chat_logs
 import mcp_host
+import sdkgen
 
 # Embedding model used for the per-bot knowledge base. Defaults to a small,
 # widely-available Ollama embedding model; override via env. Embeddings are
@@ -66,6 +68,28 @@ def _new_generation() -> dict:
         "task": None,          # the background asyncio.Task, so Stop can cancel it
         "cond": asyncio.Condition(),
     }
+
+
+def _is_reattach(req) -> bool:
+    """True iff this request is asking to re-bind to an existing in-flight
+    generation rather than start a new turn. Two signals:
+
+      - `reattach: true` on the body (the explicit API form), OR
+      - `X-Reattach: 1` HTTP header (legacy — emitted by the GUI's resume path).
+
+    Used by the chat endpoints to distinguish a legitimate refresh-reconnect
+    from an accidental parallel call. The latter gets a 409 with a pointer to
+    POST /api/conversations/{id}/clone."""
+    if getattr(req, "reattach", False):
+        return True
+    # Pydantic BaseModel doesn't carry HTTP headers; the route handler passes
+    # the raw Request when it wants header support. Best-effort fallback.
+    headers = getattr(req, "_headers", None)
+    if headers:
+        v = headers.get("x-reattach") or headers.get("X-Reattach")
+        if v and v.strip() not in ("0", "false", "False", ""):
+            return True
+    return False
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -164,6 +188,12 @@ class ConversationCreate(BaseModel):
     think: ThinkValue = None
     max_thinking_tokens: int | None = Field(None, ge=1, le=100000)
     backend_id: int = 1   # default: built-in Ollama
+    # Optional nested form of the sampling-param fields above. Lets API
+    # callers say `{"params": {"temperature": 0}}` — the historical
+    # methodology footgun where putting temperature here silently used 0.7.
+    # See `_merge_nested_params()` for how this is reconciled with the
+    # top-level fields (silent agreement OK, conflict → 400).
+    params: dict | None = None
 
 
 class ConversationUpdate(BaseModel):
@@ -177,10 +207,80 @@ class ConversationUpdate(BaseModel):
     think: ThinkValue = None
     max_thinking_tokens: int | None = Field(None, ge=1, le=100000)
     backend_id: int | None = None
+    # Voice settings (TTS voice id + language). Persisted into the
+    # `voice_settings` JSON column. Pass {} to clear back to defaults.
+    voice_settings: dict | None = None
+    # See ConversationCreate.params — same semantics on PATCH.
+    params: dict | None = None
+
+
+def _merge_nested_params(data, *, fields_set: set[str]) -> dict:
+    """Reconcile the legacy top-level sampling fields with a nested `params`.
+
+    For a model with both top-level fields (temperature, max_tokens, ...)
+    AND an optional `params: dict | None`, this returns the FINAL value for
+    each `_PARAM_KEYS` entry, merging in this priority:
+
+      1. If the caller explicitly set BOTH the top-level field and the
+         nested key AND they disagree → 400 (loud, unambiguous).
+      2. If both are set AND agree → use the value (idempotent).
+      3. If only the nested key is set → use it.
+      4. If only the top-level field is set → use it.
+      5. If neither is set → use whatever Pydantic populated (default or None).
+
+    `fields_set` is the set of top-level field names the caller explicitly
+    supplied (from `data.__fields_set__` or `model_dump(exclude_unset=True)`
+    keys), so we can distinguish "0.7 because they set it" from "0.7 because
+    that's the default".  Returns a dict of {key: value} for all _PARAM_KEYS,
+    where value may be None (means "not specified" on the PATCH side).
+    """
+    nested = getattr(data, "params", None) or {}
+    if not isinstance(nested, dict):
+        raise HTTPException(400, "`params` must be an object")
+    out: dict = {}
+    for key in _PARAM_KEYS:
+        top = getattr(data, key, None)
+        top_set = key in fields_set
+        nest = nested.get(key, None) if key in nested else None
+        nest_set = key in nested
+        if top_set and nest_set and top != nest:
+            raise HTTPException(
+                400,
+                f"`{key}` was supplied both top-level ({top!r}) and under "
+                f"`params` ({nest!r}); remove one — they must not disagree.",
+            )
+        if nest_set:
+            out[key] = nest
+        elif top_set:
+            out[key] = top
+        else:
+            out[key] = top   # default value or None
+    # Allow callers to set unknown future params via nested — we don't strip
+    # them. The DB layer JSON-stringifies, so forward-compat is free.
+    for key, val in nested.items():
+        if key not in _PARAM_KEYS:
+            out[key] = val
+    return out
 
 
 class AvatarUpdate(BaseModel):
     avatar: str   # a `data:image/*;base64,...` URL (downscaled client-side)
+
+
+class AppCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str = ""
+    link: str = ""
+
+
+class AppUpdate(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=120)
+    description: str | None = None
+    link: str | None = None
+
+
+class AppBotAdd(BaseModel):
+    conversation_id: int
 
 
 class ConversationChatRequest(BaseModel):
@@ -207,11 +307,66 @@ class ConversationChatRequest(BaseModel):
     # single-`message` form; the `messages=[…]` form must include any
     # multimodal content arrays in-line itself.
     attachments: list[AttachmentSpec] | None = None
+    # Hint that this turn is part of a live spoken conversation (📞 call mode).
+    # The server appends a short addendum to the system prompt asking the model
+    # to keep replies to 1-2 sentences so TTS starts speaking sooner and the
+    # user doesn't sit through a wall of audio.
+    voice_mode: bool = False
+    # Set True ONLY when the caller is reconnecting to a generation that's
+    # already in flight (page refresh, new tab on the same conv, SSE drop).
+    # Without this flag the server returns 409 if a generation is already
+    # running on the conv — protecting parallel API callers from silently
+    # interleaving turns on a shared conversation.  GUI sets this on its
+    # background reconnect path.  See `_is_reattach` below for the legacy
+    # X-Reattach header fallback.
+    reattach: bool = False
+
+
+class BackendAutoRegister(BaseModel):
+    """Body for POST /api/backends/auto-register — pulls the base_url directly
+    from a running miniclosedai-llm manager (the `mc` CLI's dashboard at
+    :8099). No copy/paste from `mc url` required.
+
+    Field semantics:
+      manager_url      — the manager's root URL (e.g. http://localhost:8099)
+      model_id         — what `mc ls` shows in the "id" column (the served
+                         model name, not the HF id)
+      name             — display name in Settings; defaults to model_id
+      prefer_docker_host — use the manager's `alt_base_url` (the host.docker.internal
+                         flavour). Set true when MiniClosedAI is itself
+                         running inside Docker on the same host.
+      api_key          — optional Bearer token; vLLM defaults to any-string
+                         when not configured, so most setups can omit this.
+    """
+    model_config = ConfigDict(extra="forbid")
+    manager_url: str = Field(..., min_length=1)
+    model_id: str = Field(..., min_length=1)
+    name: str | None = Field(None, max_length=80)
+    prefer_docker_host: bool = False
+    api_key: str | None = None
+
+
+class ConversationClone(BaseModel):
+    """Body for POST /api/conversations/{id}/clone. Every field is optional —
+    by default the new conversation is an exact copy of the source's config
+    (model, system_prompt, params, backend) with empty messages."""
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = Field(None, min_length=1, max_length=200)
+    backend_id: int | None = None
+    model: str | None = None
+    system_prompt: str | None = None
+    # Params overrides — merged into the source's params. E.g. {"temperature": 0}
+    # to force deterministic output in a benchmark clone while keeping the
+    # source bot's other settings.
+    params: dict | None = None
 
 
 class BackendCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=80)
-    kind: Literal["ollama", "openai"]
+    # 'voice' is a dockerized ASR + TTS service registered via Settings → Add
+    # endpoint, same flow as Ollama / OpenAI-compat. See voice.py + the new
+    # voice-branch in /status, /test, /models.
+    kind: Literal["ollama", "openai", "voice"]
     base_url: str = Field(..., min_length=1)
     api_key: str | None = None
     headers: dict[str, str] = {}
@@ -387,6 +542,99 @@ def api_create_backend(data: BackendCreate):
     return _scrub_backend(db.row_to_dict(row))
 
 
+@app.post("/api/backends/auto-register", status_code=201)
+async def api_auto_register_backend(data: BackendAutoRegister):
+    """Register a vLLM-served model as a backend by asking miniclosedai-llm
+    where it lives — instead of the user copy-pasting `mc url` output into
+    Settings.
+
+    Flow:
+      1. GET <manager_url>/api/models     — list everything the manager runs.
+      2. Find an entry where served_name == model_id (or hf_id matches).
+      3. Pick base_url (or alt_base_url if prefer_docker_host=true).
+      4. Refuse to register a model whose status != 'running'  — points the
+         user at `mc start <id>`.
+      5. INSERT a kind='openai' backend with that URL.
+
+    Errors:
+      404 — model_id not found on the manager; response lists known names.
+      422 — model found but not running.
+      502 — manager itself unreachable.
+    """
+    base = _normalize_base_url(data.manager_url)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{base}/api/models")
+            r.raise_for_status()
+            models = r.json()
+    except (httpx.ConnectError, httpx.TimeoutException) as e:
+        raise HTTPException(
+            502,
+            f"Could not reach miniclosedai-llm at {base}: {e}. "
+            "Is the manager running? Try `cd ~/Desktop/miniclosedai-llm && ./dev.sh up`.",
+        )
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            502,
+            f"miniclosedai-llm returned HTTP {e.response.status_code} on /api/models",
+        )
+
+    if not isinstance(models, list):
+        raise HTTPException(502, "miniclosedai-llm /api/models response was not a list")
+
+    # Match by served_name first (what users actually pass on the CLI), then
+    # fall back to hf_id (so `Qwen/Qwen3-VL-8B-Instruct` works without knowing
+    # the auto-generated served name).
+    match = next(
+        (m for m in models if m.get("served_name") == data.model_id or m.get("id") == data.model_id),
+        None,
+    )
+    if not match:
+        known = [m.get("served_name") or m.get("id") for m in models]
+        raise HTTPException(
+            404,
+            {
+                "code": "model_not_found",
+                "message": f"No model named {data.model_id!r} on this manager.",
+                "available": known,
+                "hint": "Use `mc ls` to list, or `mc run <hf_id> --wait` to start one.",
+            },
+        )
+    if (match.get("status") or "").lower() not in {"running", "ready", "healthy"}:
+        raise HTTPException(
+            422,
+            {
+                "code": "model_not_running",
+                "message": f"Model {data.model_id!r} exists but status is "
+                           f"{match.get('status')!r}, not running.",
+                "hint": f"Start it with `mc start {data.model_id}` "
+                        "(and `--wait` if you want to block until ready).",
+            },
+        )
+    url_key = "alt_base_url" if data.prefer_docker_host else "base_url"
+    base_url = match.get(url_key) or match.get("base_url")
+    if not base_url:
+        raise HTTPException(
+            502,
+            f"miniclosedai-llm did not advertise a base_url for {data.model_id!r}",
+        )
+    name = data.name or match.get("served_name") or data.model_id
+
+    # Now the same INSERT path the regular /api/backends route uses.
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO backends (name, kind, base_url, api_key, headers, enabled, is_builtin)
+               VALUES (?, 'openai', ?, ?, '{}', 1, 0)""",
+            (name, _normalize_base_url(base_url), data.api_key),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM backends WHERE id = ?", (cur.lastrowid,)).fetchone()
+    out = _scrub_backend(db.row_to_dict(row))
+    # Echo the served-model name so the caller can use it as the bot's `model`.
+    out["served_model"] = match.get("served_name") or data.model_id
+    return out
+
+
 @app.patch("/api/backends/{backend_id}")
 def api_update_backend(backend_id: int, data: BackendUpdate):
     supplied = data.model_dump(exclude_none=True)
@@ -539,15 +787,21 @@ async def api_backend_test(data: BackendTestRequest):
     try:
         models = await llm.list_models(probe)
     except Exception as e:
-        return {"running": True, "models_count": 0, "message": f"Reachable but /models failed: {e}"}
+        unit = "voices catalog" if probe["kind"] == "voice" else "/models"
+        return {"running": True, "models_count": 0, "message": f"Reachable but {unit} failed: {e}"}
     count = len(models)
+    # Voice backends serve voices, not LLM models — the reshape into the
+    # Ollama-style list is internal plumbing; the human-facing label should
+    # match the user's mental model.
+    unit = "voice" if probe["kind"] == "voice" else "model"
     if count == 0:
-        return {
-            "running": True,
-            "models_count": 0,
-            "message": f"Reachable, but 0 models available. (If this is LM Studio, is a model loaded? Also confirm the URL ends with '/v1'.)",
-        }
-    return {"running": True, "models_count": count, "message": f"Reachable · {count} model(s)"}
+        if probe["kind"] == "voice":
+            empty = "Reachable, but the voices catalog is empty. (Add voices to tts.py's VOICE_CATALOG.)"
+        else:
+            empty = ("Reachable, but 0 models available. "
+                     "(If this is LM Studio, is a model loaded? Also confirm the URL ends with '/v1'.)")
+        return {"running": True, "models_count": 0, "message": empty}
+    return {"running": True, "models_count": count, "message": f"Reachable · {count} {unit}(s)"}
 
 
 @app.get("/api/backends/{backend_id}/models")
@@ -697,6 +951,37 @@ def api_clear_logs():
     return {"ok": True}
 
 
+@app.get("/api/logs/export")
+def api_export_logs():
+    """Paired request/response CSV — two columns, the entire LLM input as text
+    and the entire LLM output as text. Messages are JSON-stringified so the
+    full system prompt + history + user turn is preserved in one cell. Used by
+    the Logs page Export button. QUOTE_ALL keeps Excel/Sheets happy when the
+    content contains commas, newlines, or quotes."""
+    import csv
+    import io as _io
+    items = chat_logs.get_all_full()
+    buf = _io.StringIO()
+    w = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    w.writerow(["request", "response"])
+    for e in items:
+        request_text = json.dumps(
+            e.get("request_messages") or [], ensure_ascii=False
+        )
+        response_text = e.get("response_text") or ""
+        w.writerow([request_text, response_text])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="miniclosedai-logs-'
+                f'{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")}.csv"'
+            )
+        },
+    )
+
+
 @app.delete("/api/backends/{backend_id}/pulls/{name:path}")
 async def api_cancel_pull(backend_id: int, name: str):
     key = _pull_key(backend_id, name)
@@ -801,13 +1086,21 @@ async def api_extract_pdf(file: UploadFile = File(...), full: bool = False):
 async def api_models():
     """Aggregated view for the Dashboard model dropdown.
 
-    Returns one entry per backend with its model list. Disabled backends are
-    included with `running=False` + empty models so the UI can still show them
-    greyed out. Preserves `ollama_running` for older front-end code until the
-    frontend is updated.
+    Returns one entry per LLM backend with its model list. Disabled backends
+    are included with `running=False` + empty models so the UI can still
+    show them greyed out. Preserves `ollama_running` for older front-end
+    code until the frontend is updated.
+
+    Voice backends (kind='voice') are excluded — they advertise a TTS voice
+    catalog, not LLM models, and were leaking into the chat-topbar model
+    picker. Voice selection has its own surface (`backendCache` on the
+    client filters by `kind='voice'` for the voice features that need it);
+    this endpoint is explicitly for the LLM picker.
     """
     with db.get_conn() as conn:
-        rows = conn.execute("SELECT * FROM backends ORDER BY id").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM backends WHERE kind != 'voice' ORDER BY id"
+        ).fetchall()
     backends = [db.row_to_dict(r) for r in rows]
 
     result = []
@@ -847,7 +1140,7 @@ async def api_models():
 def api_list_conversations():
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, title, model, backend_id, avatar, updated_at FROM conversations ORDER BY updated_at DESC"
+            "SELECT id, title, model, backend_id, avatar, app_id, updated_at FROM conversations ORDER BY updated_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -857,7 +1150,10 @@ def api_create_conversation(data: ConversationCreate):
     # Validate the backend exists before inserting.
     _load_backend(data.backend_id)
 
-    params = {k: getattr(data, k) for k in _PARAM_KEYS}
+    # Merge any nested `params` into the top-level sampling fields, 400ing
+    # on conflict. Callers can use EITHER form — both is fine when they
+    # agree. See _merge_nested_params for the priority rules.
+    params = _merge_nested_params(data, fields_set=set(data.__fields_set__))
     with db.get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO conversations (title, model, system_prompt, params, backend_id)
@@ -910,9 +1206,44 @@ def api_update_conversation(conv_id: int, data: ConversationUpdate):
             fields.append(f"{col} = ?")
             values.append(supplied[col])
 
+    # Voice settings (JSON column). Whole-object replace — caller sends the
+    # full desired voice_settings dict. Passing {} clears the column back to
+    # defaults (resolver falls back to first English voice on the backend).
+    if "voice_settings" in supplied:
+        vs = supplied["voice_settings"]
+        if vs is None:
+            vs = {}
+        if not isinstance(vs, dict):
+            raise HTTPException(400, "voice_settings must be an object")
+        fields.append("voice_settings = ?")
+        values.append(json.dumps(vs))
+
     # Sampling params go into the JSON `params` column. null = clear the key.
+    # Callers can pass them either top-level OR nested under `params: {...}`.
+    # Mixing forms is allowed when they agree; conflicting values 400.
+    nested = supplied.get("params") if "params" in supplied else None
+    if nested is not None and not isinstance(nested, dict):
+        raise HTTPException(400, "`params` must be an object")
+    nested = nested or {}
+    param_updates: dict = {}
+    for k in _PARAM_KEYS:
+        top_set = k in supplied
+        nest_set = k in nested
+        if top_set and nest_set and supplied[k] != nested[k]:
+            raise HTTPException(
+                400,
+                f"`{k}` was supplied both top-level ({supplied[k]!r}) and under "
+                f"`params` ({nested[k]!r}); remove one — they must not disagree.",
+            )
+        if nest_set:
+            param_updates[k] = nested[k]
+        elif top_set:
+            param_updates[k] = supplied[k]
+    # Forward-compat for params we don't have a top-level field for yet.
+    for k, v in nested.items():
+        if k not in _PARAM_KEYS:
+            param_updates[k] = v
     with db.get_conn() as conn:
-        param_updates = {k: supplied[k] for k in _PARAM_KEYS if k in supplied}
         if param_updates:
             row = conn.execute(
                 "SELECT params FROM conversations WHERE id = ?", (conv_id,)
@@ -990,6 +1321,53 @@ def api_delete_conversation(conv_id: int):
     return {"ok": True}
 
 
+@app.post("/api/conversations/{conv_id}/clone", status_code=201)
+def api_clone_conversation(conv_id: int, body: ConversationClone | None = None):
+    """Clone a conversation as a new bot — same config, empty message history.
+
+    Built for parallel benchmark harnesses ("each worker needs its own
+    conversation"). The new bot starts with the source's `model`,
+    `system_prompt`, `params`, and `backend_id`; any of those can be
+    overridden via the body. `params` is MERGED, so passing
+    `{"temperature": 0}` overrides only that one key.
+
+    Returns: `201 {id, title, from_id}`. To clean up later: DELETE the new id.
+    """
+    body = body or ConversationClone()
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, title, model, system_prompt, params, backend_id FROM conversations WHERE id = ?",
+            (conv_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, f"Conversation {conv_id} not found")
+
+    # Resolve final fields — overrides win, source fills the rest.
+    title       = body.title       or f"{row['title']} (clone)"
+    model       = body.model       or row["model"]
+    system_prompt = body.system_prompt or row["system_prompt"]
+    backend_id  = body.backend_id  if body.backend_id is not None else row["backend_id"]
+    src_params  = json.loads(row["params"] or "{}")
+    if body.params:
+        src_params.update(body.params)
+    # Title-collision suffix so the bot list stays scannable. Uses the same
+    # `_unique_title` helper the import path uses.
+    with db.get_conn() as conn:
+        existing_titles = {
+            r["title"] for r in conn.execute("SELECT title FROM conversations").fetchall()
+        }
+    title = _unique_title(title, existing_titles)
+    # Validate backend if explicitly overridden — gives a clean 400 instead of
+    # a downstream FK / load error.
+    if body.backend_id is not None:
+        _load_backend(backend_id)
+    new_id = _insert_bot_row(
+        title=title, model=model, system_prompt=system_prompt,
+        params=src_params, sample_messages=[], backend_id=backend_id,
+    )
+    return {"id": new_id, "title": title, "from_id": conv_id}
+
+
 @app.post("/api/conversations/{conv_id}/clear")
 def api_clear_conversation(conv_id: int):
     """Wipe messages for this conversation, keep its config."""
@@ -1002,6 +1380,204 @@ def api_clear_conversation(conv_id: int):
         if cur.rowcount == 0:
             raise HTTPException(404, "Conversation not found")
     return {"ok": True}
+
+
+# ---------- Applications (groups of bots) ----------
+
+def _app_row(conn, app_id: int):
+    row = conn.execute("SELECT * FROM apps WHERE id = ?", (app_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Application not found")
+    return row
+
+
+@app.get("/api/apps")
+def api_list_apps():
+    """Every application with its bot count, newest-first."""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT a.id, a.name, a.description, a.link, a.avatar,
+                      a.created_at, a.updated_at, COUNT(c.id) AS bot_count
+               FROM apps a
+               LEFT JOIN conversations c ON c.app_id = a.id
+               GROUP BY a.id
+               ORDER BY a.updated_at DESC"""
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/apps", status_code=201)
+def api_create_app(data: AppCreate):
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO apps (name, description, link) VALUES (?, ?, ?)",
+            (data.name.strip(), data.description or "", data.link or ""),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM apps WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+@app.get("/api/apps/{app_id}")
+def api_get_app(app_id: int):
+    """An application plus the bots in it."""
+    with db.get_conn() as conn:
+        row = _app_row(conn, app_id)
+        bots = conn.execute(
+            """SELECT id, title, model, backend_id, avatar, updated_at
+               FROM conversations WHERE app_id = ? ORDER BY updated_at DESC""",
+            (app_id,),
+        ).fetchall()
+    out = dict(row)
+    out["bots"] = [dict(b) for b in bots]
+    return out
+
+
+@app.patch("/api/apps/{app_id}")
+def api_update_app(app_id: int, data: AppUpdate):
+    supplied = data.model_dump(exclude_unset=True)
+    fields, values = [], []
+    for col in ("name", "description", "link"):
+        if col in supplied and supplied[col] is not None:
+            val = supplied[col]
+            if col == "name":
+                val = val.strip()
+                if not val:
+                    raise HTTPException(400, "name cannot be empty")
+            fields.append(f"{col} = ?")
+            values.append(val)
+    if not fields:
+        return {"ok": True}
+    values.append(app_id)
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            f"UPDATE apps SET {', '.join(fields)}, updated_at = datetime('now') WHERE id = ?",
+            values,
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Application not found")
+    return {"ok": True}
+
+
+@app.delete("/api/apps/{app_id}")
+def api_delete_app(app_id: int):
+    """Delete an application. Its bots are UNLINKED (app_id → NULL), never deleted."""
+    with db.get_conn() as conn:
+        conn.execute("UPDATE conversations SET app_id = NULL WHERE app_id = ?", (app_id,))
+        cur = conn.execute("DELETE FROM apps WHERE id = ?", (app_id,))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Application not found")
+    return {"ok": True}
+
+
+@app.put("/api/apps/{app_id}/avatar")
+def api_set_app_avatar(app_id: int, data: AvatarUpdate):
+    """Set the application's logo (a base64 image data URL)."""
+    url = (data.avatar or "").strip()
+    if not url.startswith("data:image/"):
+        raise HTTPException(400, "avatar must be a data:image/* URL")
+    if len(url) > AVATAR_MAX_CHARS:
+        raise HTTPException(413, "avatar image too large")
+    with db.get_conn() as conn:
+        cur = conn.execute("UPDATE apps SET avatar = ? WHERE id = ?", (url, app_id))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Application not found")
+    return {"ok": True}
+
+
+@app.delete("/api/apps/{app_id}/avatar")
+def api_clear_app_avatar(app_id: int):
+    with db.get_conn() as conn:
+        cur = conn.execute("UPDATE apps SET avatar = NULL WHERE id = ?", (app_id,))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Application not found")
+    return {"ok": True}
+
+
+@app.post("/api/apps/{app_id}/bots", status_code=201)
+def api_add_bot_to_app(app_id: int, data: AppBotAdd):
+    """Move a bot into this application. One app per bot, so this reassigns it
+    from any previous application."""
+    with db.get_conn() as conn:
+        _app_row(conn, app_id)
+        cur = conn.execute(
+            "UPDATE conversations SET app_id = ? WHERE id = ?",
+            (app_id, data.conversation_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Conversation not found")
+    return {"ok": True}
+
+
+@app.delete("/api/apps/{app_id}/bots/{conv_id}")
+def api_remove_bot_from_app(app_id: int, conv_id: int):
+    """Remove a bot from this application (back to the ungrouped Bots list)."""
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE conversations SET app_id = NULL WHERE id = ? AND app_id = ?",
+            (conv_id, app_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Bot not in this application")
+    return {"ok": True}
+
+
+def _sdk_base_url(request: Request, override: str | None) -> str:
+    """Base URL baked into a generated SDK: an explicit override, else the
+    origin this request came in on (so the SDK points back at this server)."""
+    if override:
+        return override.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+def _app_sdk_files(app_id: int, base_url: str, lang: str = "ts"):
+    if lang not in sdkgen.SDK_LANGS:
+        raise HTTPException(
+            400, f"unknown SDK language: {lang!r}. Valid: {', '.join(sdkgen.SDK_LANGS)}.")
+    with db.get_conn() as conn:
+        row = _app_row(conn, app_id)
+        bots = conn.execute(
+            "SELECT id, title, model FROM conversations WHERE app_id = ? ORDER BY id",
+            (app_id,),
+        ).fetchall()
+    app_dict = dict(row)
+    return app_dict, sdkgen.generate_sdk(lang, app_dict, [dict(b) for b in bots], base_url)
+
+
+@app.get("/api/apps/{app_id}/sdk")
+def api_app_sdk(app_id: int, request: Request, base_url: str | None = None, lang: str = "ts"):
+    """Generated SDK files for this application (for preview).
+
+    `lang` selects the language: `ts` (default, TypeScript), `js` (JavaScript),
+    or `py` (Python). Defaults to `ts` so older clients keep working unchanged.
+    """
+    app_dict, files = _app_sdk_files(app_id, _sdk_base_url(request, base_url), lang)
+    return {"app": {"id": app_dict["id"], "name": app_dict["name"]}, "lang": lang, "files": files}
+
+
+@app.get("/api/apps/{app_id}/sdk.zip")
+def api_app_sdk_zip(app_id: int, request: Request, base_url: str | None = None, lang: str = "ts"):
+    """Download the generated SDK for this application as a .zip. See /sdk for `lang`."""
+    app_dict, files = _app_sdk_files(app_id, _sdk_base_url(request, base_url), lang)
+    slug = sdkgen.slugify(app_dict["name"])
+    # Encode language in the filename so users can keep all three side-by-side
+    # in a downloads folder without overwriting each other.
+    filename = f"{slug}-sdk.zip" if lang == "ts" else f"{slug}-{lang}-sdk.zip"
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.writestr(f["path"], f["content"])
+    return Response(
+        content=zip_buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---------- Per-bot knowledge base (RAG) ----------
@@ -1843,6 +2419,8 @@ def _persist_turn(req: ChatRequest, assistant_text: str, backend: dict) -> None:
 
 _BOT_EXPORT_FORMAT = "miniclosed-bot"
 _BOT_EXPORT_FORMAT_VERSION = 1
+_APP_EXPORT_FORMAT = "miniclosed-app"
+_APP_EXPORT_FORMAT_VERSION = 1
 
 
 class BotImportRequest(BaseModel):
@@ -1852,6 +2430,85 @@ class BotImportRequest(BaseModel):
     # When set, skip the auto-match probe and use this backend. The GUI sends
     # this on the second pass after the user picks from `available_backends`.
     backend_id: int | None = None
+
+
+class AppImportRequest(BaseModel):
+    """POST /api/apps/import body. Same shape as BotImportRequest — `backend_id`,
+    if set, is applied to every bot in the imported app."""
+    model_config = ConfigDict(extra="forbid")
+    data: dict
+    backend_id: int | None = None
+
+
+def _build_bot_export(row, include_history: bool) -> dict:
+    """The `bot`-shaped block that both the bot export and the app export emit.
+
+    `row` is a sqlite Row with title, model, system_prompt, params, messages.
+    Returns just the bot dict (no format envelope) — the caller wraps it.
+    """
+    return {
+        "title": row["title"],
+        "model": row["model"],
+        "system_prompt": row["system_prompt"],
+        "params": json.loads(row["params"] or "{}"),
+        "sample_messages": json.loads(row["messages"] or "[]") if include_history else [],
+    }
+
+
+def _validate_bot_payload(bot: dict) -> tuple[str, str, str, dict, list]:
+    """Validate a single bot block from an import file.
+
+    Returns (title, model, system_prompt, params, sample_messages). Raises
+    HTTPException(400) on malformed input. `sample_messages` may be absent
+    in the source dict (defaults to []); if present but not a list we drop
+    it and the caller can record a warning.
+    """
+    if not isinstance(bot, dict):
+        raise HTTPException(400, "Each entry in 'bots' must be an object")
+    title = (bot.get("title") or "Imported bot").strip() or "Imported bot"
+    model = bot.get("model")
+    system_prompt = bot.get("system_prompt") or "You are a helpful AI assistant."
+    params = bot.get("params") or {}
+    if not isinstance(model, str) or not model:
+        raise HTTPException(400, "Missing 'bot.model' (string)")
+    if not isinstance(params, dict):
+        raise HTTPException(400, "'bot.params' must be an object")
+    sample_messages = bot.get("sample_messages")
+    if sample_messages is not None and not isinstance(sample_messages, list):
+        sample_messages = None  # caller will record a warning
+    return title, model, system_prompt, params, sample_messages or []
+
+
+def _unique_title(title: str, taken: set[str]) -> str:
+    """Suffix `(2)`, `(3)`, ... onto `title` until it's not in `taken`.
+    Returns the resolved title AND mutates `taken` to include it — callers
+    importing multiple bots in one transaction pass the same set across calls
+    so titles created earlier in the loop don't collide with later ones."""
+    out = title
+    if out in taken:
+        suffix = 2
+        while f"{title} ({suffix})" in taken:
+            suffix += 1
+        out = f"{title} ({suffix})"
+    taken.add(out)
+    return out
+
+
+def _insert_bot_row(
+    title: str, model: str, system_prompt: str, params: dict,
+    sample_messages: list, backend_id: int, app_id: int | None = None,
+) -> int:
+    """Insert a conversation row and return its new id. Shared by both
+    `/api/conversations/import` and the per-bot loop in `/api/apps/import`."""
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO conversations (title, model, system_prompt, params, messages, backend_id, app_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (title, model, system_prompt, json.dumps(params),
+             json.dumps(sample_messages), backend_id, app_id),
+        )
+        conn.commit()
+        return cur.lastrowid
 
 
 def _slugify_filename(s: str, fallback: str = "bot") -> str:
@@ -1912,19 +2569,18 @@ def api_export_conversation_bot(conv_id: int, include_history: bool = False):
     if not row:
         raise HTTPException(404, "Conversation not found")
 
-    params = json.loads(row["params"] or "{}")
-    bot_payload = {
-        "title": row["title"],
-        "model": row["model"],
-        "system_prompt": row["system_prompt"],
-        "params": params,
-    }
+    bot_block = _build_bot_export(row, include_history)
+    # Legacy on-disk shape: top-level `bot` and `sample_messages` siblings.
+    # _build_bot_export folds sample_messages into the bot block for the
+    # app export's per-bot entries; pop it back out here to keep the old
+    # file layout unchanged for cross-version compatibility.
+    sample_messages = bot_block.pop("sample_messages", [])
     export = {
         "format": _BOT_EXPORT_FORMAT,
         "format_version": _BOT_EXPORT_FORMAT_VERSION,
         "exported_at": datetime.now(timezone.utc).isoformat(),
-        "bot": bot_payload,
-        "sample_messages": json.loads(row["messages"] or "[]") if include_history else [],
+        "bot": bot_block,
+        "sample_messages": sample_messages,
     }
     fname = f"{_slugify_filename(row['title'])}.miniclosed-bot.json"
     return Response(
@@ -1957,14 +2613,7 @@ async def api_import_conversation_bot(req: BotImportRequest):
     bot = data.get("bot")
     if not isinstance(bot, dict):
         raise HTTPException(400, "Missing 'bot' object")
-    title = (bot.get("title") or "Imported bot").strip() or "Imported bot"
-    model = bot.get("model")
-    system_prompt = bot.get("system_prompt") or "You are a helpful AI assistant."
-    params = bot.get("params") or {}
-    if not isinstance(model, str) or not model:
-        raise HTTPException(400, "Missing 'bot.model' (string)")
-    if not isinstance(params, dict):
-        raise HTTPException(400, "'bot.params' must be an object")
+    title, model, system_prompt, params, _ = _validate_bot_payload(bot)
 
     warnings: list[str] = []
 
@@ -1999,25 +2648,16 @@ async def api_import_conversation_bot(req: BotImportRequest):
         existing_titles = {
             r["title"] for r in conn.execute("SELECT title FROM conversations").fetchall()
         }
-    if title in existing_titles:
-        suffix = 2
-        while f"{title} ({suffix})" in existing_titles:
-            suffix += 1
-        title = f"{title} ({suffix})"
+    title = _unique_title(title, existing_titles)
 
-    # 3. Insert -------------------------------------------------------------
+    # 3. Insert. The legacy bot file carries `sample_messages` at the top
+    # level (sibling of `bot`); validate it separately from the bot block.
     sample_messages = data.get("sample_messages") or []
     if not isinstance(sample_messages, list):
         warnings.append("'sample_messages' was not a list — dropped")
         sample_messages = []
-    with db.get_conn() as conn:
-        cur = conn.execute(
-            """INSERT INTO conversations (title, model, system_prompt, params, messages, backend_id)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (title, model, system_prompt, json.dumps(params), json.dumps(sample_messages), backend_id),
-        )
-        conn.commit()
-        new_id = cur.lastrowid
+    new_id = _insert_bot_row(title, model, system_prompt, params,
+                             sample_messages, backend_id)
 
     return {
         "id": new_id,
@@ -2025,6 +2665,209 @@ async def api_import_conversation_bot(req: BotImportRequest):
         "matched_backend_id": backend_id,
         "warnings": warnings,
     }
+
+
+# ---------------------------------------------------------------------------
+# Application export / import — same shape one level up: an app envelope
+# wrapping N bot blocks. One backend is resolved for the whole app and
+# applied to every bot, matching the user's chosen UX (single picker, not
+# per-bot picker). The bot block format inside `bots[]` is exactly the
+# `bot` object the per-bot export emits (minus the file-level envelope).
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/apps/{app_id}/export")
+def api_export_app(app_id: int, include_history: bool = False):
+    """Export an application (metadata + every bot in it) as portable JSON."""
+    with db.get_conn() as conn:
+        app_row = _app_row(conn, app_id)
+        bot_rows = conn.execute(
+            """SELECT title, model, system_prompt, params, messages
+               FROM conversations WHERE app_id = ? ORDER BY id""",
+            (app_id,),
+        ).fetchall()
+
+    export = {
+        "format": _APP_EXPORT_FORMAT,
+        "format_version": _APP_EXPORT_FORMAT_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "application": {
+            "name": app_row["name"],
+            "description": app_row["description"] or "",
+            "link": app_row["link"] or "",
+            "avatar": app_row["avatar"],
+        },
+        "bots": [_build_bot_export(r, include_history) for r in bot_rows],
+    }
+    fname = f"{_slugify_filename(app_row['name'], fallback='app')}.miniclosed-app.json"
+    return Response(
+        content=json.dumps(export, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.post("/api/apps/import", status_code=201)
+async def api_import_app(req: AppImportRequest):
+    """Import an application from a .miniclosed-app.json file.
+
+    Always creates a NEW app + N new conversation rows. Backend resolution:
+    caller-supplied `backend_id` wins; otherwise we look for a single enabled
+    backend that advertises EVERY unique `model` mentioned in `bots[]`. If no
+    such backend exists, return 409 with the candidate list so the GUI can
+    prompt — same shape as the bot import 409, with `models` (plural) instead
+    of `model`.
+    """
+    data = req.data
+    if not isinstance(data, dict) or data.get("format") != _APP_EXPORT_FORMAT:
+        raise HTTPException(400, f"Not a {_APP_EXPORT_FORMAT} file")
+    fmt_ver = data.get("format_version")
+    if not isinstance(fmt_ver, int) or fmt_ver > _APP_EXPORT_FORMAT_VERSION:
+        raise HTTPException(
+            400,
+            f"Unsupported format_version {fmt_ver!r}; this server understands up to {_APP_EXPORT_FORMAT_VERSION}",
+        )
+
+    application = data.get("application")
+    if not isinstance(application, dict):
+        raise HTTPException(400, "Missing 'application' object")
+    app_name = (application.get("name") or "").strip()
+    if not app_name:
+        raise HTTPException(400, "Missing 'application.name'")
+    app_description = application.get("description") or ""
+    app_link = application.get("link") or ""
+    app_avatar = application.get("avatar")
+    if app_avatar is not None and (
+        not isinstance(app_avatar, str) or not app_avatar.startswith("data:image/")
+    ):
+        # Don't fail the import over a malformed avatar — just drop it.
+        app_avatar = None
+
+    bots = data.get("bots")
+    if not isinstance(bots, list):
+        raise HTTPException(400, "Missing 'bots' array")
+
+    warnings: list[str] = []
+    # Pre-validate every bot up front so a bad bot at index 7 doesn't half-
+    # commit the app. Each tuple: (title, model, system_prompt, params,
+    # sample_messages, sample_messages_was_invalid).
+    parsed_bots: list[tuple[str, str, str, dict, list, bool]] = []
+    for i, b in enumerate(bots):
+        try:
+            t, m, sp, p, sm = _validate_bot_payload(b)
+        except HTTPException as e:
+            raise HTTPException(400, f"bots[{i}]: {e.detail}")
+        sm_invalid = b.get("sample_messages") is not None and not isinstance(
+            b.get("sample_messages"), list
+        )
+        if sm_invalid:
+            warnings.append(f"bots[{i}].sample_messages was not a list — dropped")
+        parsed_bots.append((t, m, sp, p, sm, sm_invalid))
+
+    # 1. Resolve backend — one for ALL bots ---------------------------------
+    if req.backend_id is not None:
+        try:
+            _load_backend(req.backend_id)
+        except HTTPException:
+            raise HTTPException(400, f"backend_id {req.backend_id} not found")
+        backend_id = req.backend_id
+    else:
+        backend_id = await _resolve_backend_for_app(parsed_bots, warnings)
+        if isinstance(backend_id, JSONResponse):
+            return backend_id  # 409 with the picker payload
+
+    # 2. App-name uniqueness (suffix scheme) --------------------------------
+    with db.get_conn() as conn:
+        existing_app_names = {
+            r["name"] for r in conn.execute("SELECT name FROM apps").fetchall()
+        }
+    app_name = _unique_title(app_name, existing_app_names)
+
+    # 3. Insert app row -----------------------------------------------------
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO apps (name, description, link, avatar) VALUES (?, ?, ?, ?)",
+            (app_name, app_description, app_link, app_avatar),
+        )
+        conn.commit()
+        new_app_id = cur.lastrowid
+
+    # 4. Insert each bot ----------------------------------------------------
+    with db.get_conn() as conn:
+        existing_titles = {
+            r["title"] for r in conn.execute("SELECT title FROM conversations").fetchall()
+        }
+    bot_ids: list[int] = []
+    for (title, model, system_prompt, params, sample_messages, _) in parsed_bots:
+        title = _unique_title(title, existing_titles)
+        new_id = _insert_bot_row(title, model, system_prompt, params,
+                                 sample_messages, backend_id, app_id=new_app_id)
+        bot_ids.append(new_id)
+
+    return {
+        "id": new_app_id,
+        "name": app_name,
+        "matched_backend_id": backend_id,
+        "bot_ids": bot_ids,
+        "warnings": warnings,
+    }
+
+
+async def _resolve_backend_for_app(
+    parsed_bots: list[tuple], warnings: list[str]
+) -> int | JSONResponse:
+    """For app import: pick one backend whose model list covers EVERY unique
+    `model` referenced by `parsed_bots`. Returns the backend id on success,
+    or a 409 JSONResponse (with the candidate list) on failure."""
+    unique_models = sorted({m for (_, m, *_rest) in parsed_bots})
+    if not unique_models:
+        raise HTTPException(400, "App has no bots to import")
+
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM backends WHERE enabled = 1 ORDER BY id"
+        ).fetchall()
+    backends = [db.row_to_dict(r) for r in rows]
+
+    summary: list[dict] = []
+    matched_id: int | None = None
+    for b in backends:
+        models: list[dict] = []
+        try:
+            if await llm.is_running(b):
+                models = await llm.list_models(b)
+        except Exception as e:
+            warnings.append(f"backend '{b['name']}' probe failed: {e}")
+        names = [m.get("name") or m.get("id") or "" for m in models]
+        present_count = sum(1 for m in unique_models if m in names)
+        all_present = present_count == len(unique_models)
+        if matched_id is None and all_present:
+            matched_id = b["id"]
+        summary.append({
+            "id": b["id"],
+            "name": b["name"],
+            "kind": b["kind"],
+            "model_present": all_present,
+            "model_count": len(names),
+            "matched_count": present_count,
+            "needed_count": len(unique_models),
+        })
+    if matched_id is not None:
+        return matched_id
+    return JSONResponse(
+        status_code=409,
+        content={
+            "needs_backend": True,
+            "models": unique_models,
+            "available_backends": summary,
+            "warnings": warnings,
+            "detail": (
+                "No enabled backend serves every model in this application "
+                f"({', '.join(unique_models)}). Pick a backend and every bot "
+                "will run against it."
+            ),
+        },
+    )
 
 
 @app.post("/api/chat")
@@ -2177,7 +3020,14 @@ def _resolve_conversation_chat(
     # form, prepend the conversation's saved turns so conversational bots have
     # memory. Not applied when the caller already supplies `messages=[...]`,
     # since they're already in control of the history.
-    ollama_messages = [{"role": "system", "content": effective["system_prompt"]}]
+    system_prompt = effective["system_prompt"]
+    if req.voice_mode:
+        system_prompt = (
+            (system_prompt or "").rstrip()
+            + "\n\nYou are speaking aloud over a phone call. Reply in 1-2 short "
+            "sentences, no markdown, no lists, no code blocks."
+        )
+    ollama_messages = [{"role": "system", "content": system_prompt}]
     if req.include_history and req.message is not None:
         for m in (conv.get("messages") or []):
             role = m.get("role")
@@ -2271,6 +3121,23 @@ async def _run_conv_message(conv_id: int, message: str) -> str:
 @app.post("/api/conversations/{conv_id}/chat")
 async def api_conv_chat(conv_id: int, req: ConversationChatRequest):
     """Call the saved conversation as a configured function (non-streaming)."""
+    # Reject if a streaming generation is already in flight on this conv —
+    # same protection as the streaming sibling so parallel callers without
+    # cloning hit a loud 409 instead of corrupting message history.
+    if req.persist and req.message is not None and not _is_reattach(req):
+        existing = _generations.get(conv_id)
+        if existing and existing["status"] == "running":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "generation_in_flight",
+                    "message": (
+                        f"A reply is already streaming on conversation {conv_id}. "
+                        f"Clone it (POST /api/conversations/{conv_id}/clone) "
+                        "for parallel work — each parallel caller needs its own conversation."
+                    ),
+                },
+            )
     conv, messages, eff, backend = _resolve_conversation_chat(conv_id, req)
     mcp_servers = _enabled_mcp_servers(conv) if req.message is not None else []
     if req.message is not None:
@@ -2485,7 +3352,29 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
         user_msgs = [_build_user_message(req.message, attachments_raw)]
         snapshot = _chat_snapshot(eff, backend)
         existing = _generations.get(conv_id)
-        if not existing or existing["status"] != "running":
+        if existing and existing["status"] == "running":
+            # A SECOND new turn (different user message, X-Reattach absent) hit
+            # this conversation while the previous turn was still streaming. The
+            # GUI's "click Stop or wait" UX never produces this case — only an
+            # API caller running parallel work without cloning does. Silently
+            # reattaching here would either drop the new user message
+            # (corruption) or interleave two generations on one buffer (race).
+            # Loud 409 with a pointer to the clone route instead.
+            if not _is_reattach(req):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "generation_in_flight",
+                        "message": (
+                            f"A reply is already streaming on conversation {conv_id}. "
+                            "Wait for it to finish, click Stop, or clone the conversation "
+                            f"(POST /api/conversations/{conv_id}/clone) for parallel work — "
+                            "each parallel caller needs its own conversation."
+                        ),
+                    },
+                )
+            # Reattach to the existing in-flight buffer (page refresh / new tab).
+        else:
             _append_conv_messages(conv_id, _user_entries(user_msgs, snapshot))
             gen = _new_generation()
             _generations[conv_id] = gen
@@ -2603,6 +3492,778 @@ async def api_conv_chat_stream(conv_id: int, req: ConversationChatRequest):
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# =====================================================================
+# Voice (per-conversation) — push-to-talk pipeline
+# =====================================================================
+#
+# Three endpoints, all scoped to a conversation so each bot can have its own
+# voice + language prefs (stored in conversations.voice_settings) and so the
+# turn is persisted exactly like a normal chat turn:
+#
+#   POST /voice/transcribe — multipart audio → JSON {text, language}
+#   POST /voice/speak      — JSON {text} → SSE audio chunks
+#   POST /voice/turn       — multipart audio → SSE merging {transcript},
+#                            {chunk} × N (assistant tokens), {audio_chunk_b64}
+#                            × M, {end}; the user + assistant messages persist
+#                            to the conv just like /chat/stream with persist=True.
+#
+# The voice backend is resolved per-conv via voice_settings.voice_backend_id,
+# falling back to the first enabled kind='voice' row in `backends`. Users
+# register that backend through Settings → Add endpoint (kind=Voice); there's
+# no built-in or env-var seeding — the voice service is an independent box
+# the user manages on their own (locally or on RunPod).
+
+class VoiceSpeakRequest(BaseModel):
+    """Body for POST /voice/speak."""
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(..., min_length=1, max_length=4000)
+    voice: str | None = None
+    language: str | None = None
+    speed: float | None = Field(None, ge=0.5, le=2.0)
+
+
+class VoiceSayRequest(BaseModel):
+    """Body for POST /voice/say. Caller already has the transcript (e.g. from
+    the browser's SpeechRecognition API while the user was holding the mic) so
+    we skip server-side Whisper entirely and go straight to LLM + TTS."""
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(..., min_length=1, max_length=8000)
+    # Optional override of the bot's saved voice/language for this one turn.
+    voice: str | None = None
+    language: str | None = None
+
+
+class CallTurnPersistRequest(BaseModel):
+    """Body for POST /api/conversations/{id}/voice/persist-call-turn.
+
+    Call mode uses persist=False on its /chat/stream POST for the latency
+    win (skips the resilient-background-task path). This separate endpoint
+    lets the voice service fire-and-forget the completed (user, assistant)
+    pair into the conversation history AFTER the audio is delivered to the
+    browser — same persistence shape as a normal /chat/stream turn, just
+    decoupled from the LLM call's hot path."""
+    model_config = ConfigDict(extra="forbid")
+    user: str = Field(..., min_length=1, max_length=8000)
+    assistant: str = Field(..., min_length=1, max_length=64000)
+
+
+# ---------------------------------------------------------------------------
+# Voice text-processing helpers — kept local to the voice section so the
+# main chat path stays free of TTS-specific cleanup.
+# ---------------------------------------------------------------------------
+# Sentence terminator followed by whitespace + a likely next-sentence cue
+# (uppercase letter / opening quote / paren / digit). Lookahead so we don't
+# consume the next sentence's first character.
+_VOICE_SPLIT_PAT = re.compile(r"[.!?][\"')\]]?(\s+)(?=[A-Z\"'(0-9])")
+# Soft boundary: terminator + newline (paragraph end).
+_VOICE_NEWLINE_PAT = re.compile(r"[.!?][\"')\]]?\n+")
+# Abbreviations whose trailing dot must NOT be treated as a sentence boundary.
+_VOICE_ABBREVIATIONS = frozenset({
+    "mr.", "mrs.", "ms.", "dr.", "sr.", "jr.", "st.", "vs.", "etc.",
+    "e.g.", "i.e.", "u.s.", "u.k.", "u.n.", "inc.", "ltd.", "co.", "no.",
+    "fig.", "vol.", "ed.", "ch.", "pg.", "p.", "pp.", "approx.", "min.",
+    "max.", "avg.", "incl.", "excl.", "rev.", "est.",
+})
+_VOICE_LAST_WORD_PAT = re.compile(r"\S+$")
+
+
+def _next_voice_sentence(buf: str, *, min_len: int = 20, force_max: int = 240) -> tuple[str | None, str]:
+    """Pop the next complete sentence off `buf`. Returns (sentence, remaining)."""
+    if len(buf) >= force_max:
+        # Hard cap so a runaway no-punctuation reply still flushes to TTS.
+        for i in range(force_max, max(force_max - 60, 1), -1):
+            if i < len(buf) and buf[i].isspace():
+                return buf[:i].strip(), buf[i:].lstrip()
+        return buf[:force_max].strip(), buf[force_max:]
+
+    candidates: list[int] = []
+    for m in _VOICE_NEWLINE_PAT.finditer(buf):
+        candidates.append(m.end())
+    for m in _VOICE_SPLIT_PAT.finditer(buf):
+        # Skip if the word just before the terminator looks like an abbreviation.
+        before = buf[:m.start() + 1]
+        wmatch = _VOICE_LAST_WORD_PAT.search(before)
+        if wmatch and wmatch.group(0).lower() in _VOICE_ABBREVIATIONS:
+            continue
+        candidates.append(m.end())
+    if not candidates:
+        return None, buf
+    cut = min(candidates)
+    sentence = buf[:cut].strip()
+    if len(sentence) < min_len:
+        return None, buf
+    return sentence, buf[cut:].lstrip()
+
+
+# Patterns for clean_for_tts — same set call.py uses, kept in sync manually.
+_TTS_BOLD_ITALIC   = re.compile(r"\*{1,3}([^*]+?)\*{1,3}")
+_TTS_HEADER        = re.compile(r"^#{1,6}\s*", re.MULTILINE)
+_TTS_BULLET        = re.compile(r"^\s*[-*•·]\s+", re.MULTILINE)
+_TTS_LETTER_BULLET = re.compile(r"^\s*[A-Za-z]\)\s+", re.MULTILINE)
+_TTS_DIGIT_BULLET  = re.compile(r"^\s*\d+[.)]\s+", re.MULTILINE)
+_TTS_BACKTICKS     = re.compile(r"`+")
+_TTS_PIPES         = re.compile(r"\|")
+_TTS_BRACKETS      = re.compile(r"[\[\]]")
+_TTS_LINK_URL      = re.compile(r"\(https?://[^\s)]+\)")
+_TTS_TILDE_HEAVY   = re.compile(r"~{1,3}([^~]+?)~{1,3}")
+_TTS_ANGLE_TAGS    = re.compile(r"<[^>]+>")
+_TTS_NON_ASCII     = re.compile(r"[^\x00-\x7F]+")
+_TTS_MANY_BLANKS   = re.compile(r"\n{2,}")
+_TTS_WS            = re.compile(r"\s+")
+
+
+def _clean_for_tts(text: str) -> str:
+    """Strip markdown / emojis / list bullets that the TTS would read literally.
+
+    Mirrors `clean_for_tts` in miniclosedai-voice/call.py so the call path AND
+    push-to-talk path produce identical, TTS-safe input.
+    """
+    if not text:
+        return ""
+    t = text
+    t = re.sub(r"```[\s\S]*?```", " ", t)
+    t = _TTS_BOLD_ITALIC.sub(r"\1", t)
+    t = _TTS_TILDE_HEAVY.sub(r"\1", t)
+    t = _TTS_HEADER.sub("", t)
+    t = _TTS_BULLET.sub("", t)
+    t = _TTS_LETTER_BULLET.sub("", t)
+    t = _TTS_DIGIT_BULLET.sub("", t)
+    t = _TTS_BACKTICKS.sub("", t)
+    t = _TTS_LINK_URL.sub("", t)
+    t = _TTS_BRACKETS.sub("", t)
+    t = _TTS_PIPES.sub(" ", t)
+    t = _TTS_ANGLE_TAGS.sub("", t)
+    t = _TTS_NON_ASCII.sub("", t)
+    t = _TTS_MANY_BLANKS.sub(" ", t)
+    t = _TTS_WS.sub(" ", t)
+    return t.strip()
+
+
+async def _stream_llm_and_tts(
+    *,
+    llm_backend: dict, model: str, messages: list[dict], eff: dict,
+    voice_backend: dict, voice_id: str, lang: str,
+):
+    """Stream LLM tokens AND TTS audio with FULL concurrency.
+
+    Yields SSE-bound dict events:
+        {"chunk": "<assistant token>"}                  × N — verbatim LLM tokens
+        {"audio_chunk_b64": "...", "sample_rate": int}  × M — TTS audio per sentence
+        {"_full_reply": "<complete reply text>"}              — terminal, for persistence
+
+    Earlier serial version awaited voice.speak_stream inside the LLM read
+    loop. While the audio chunks for sentence 1 were being yielded (~1 s of
+    Chatterbox synthesis), the LLM SSE socket was suspended — tokens 6, 7, 8
+    piled up in the network buffer, then drained as a burst, and you'd see
+    "complete paragraph then all audio at once". This concurrent version
+    splits the work into two tasks sharing one output queue, exactly the
+    same pattern call.py uses:
+
+      _llm_reader  ──reads SSE non-stop──►  text events to out_q
+                                            sentence_q for the TTS worker
+      _tts_worker  ──pops sentence──►  await voice.speak_stream  ──►  audio to out_q
+
+    The LLM SSE socket is read continuously regardless of TTS state, so
+    text events forward at LLM cadence. Audio chunks flow back the moment
+    Chatterbox emits each one.
+    """
+    collected: list[str] = []
+    buffer = ""
+    out_q: asyncio.Queue = asyncio.Queue()
+    sentence_q: asyncio.Queue = asyncio.Queue()
+    SENTINEL = object()
+
+    async def _llm_reader():
+        nonlocal buffer
+        try:
+            async for ev in llm.chat_stream(
+                llm_backend, model, messages,
+                temperature=eff["temperature"], max_tokens=eff["max_tokens"],
+                top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
+            ):
+                if "content" not in ev:
+                    continue
+                piece = ev["content"]
+                collected.append(piece)
+                buffer += piece
+                # Forward the text IMMEDIATELY — the bubble streams at the LLM's
+                # actual token cadence regardless of what TTS is doing.
+                await out_q.put({"chunk": piece})
+                # Pump complete sentences onto sentence_q for the TTS worker.
+                while True:
+                    sentence, buffer = _next_voice_sentence(buffer)
+                    if not sentence:
+                        break
+                    await sentence_q.put(sentence)
+            # Trailing fragment that didn't end with a sentence terminator.
+            tail = buffer.strip()
+            if tail:
+                await sentence_q.put(tail)
+        except Exception as e:
+            await out_q.put({"error": f"LLM stream: {e}"})
+        finally:
+            await sentence_q.put(None)  # signal end-of-sentences to tts worker
+
+    async def _tts_worker():
+        try:
+            while True:
+                sentence = await sentence_q.get()
+                if sentence is None:
+                    break
+                cleaned = _clean_for_tts(sentence)
+                if not cleaned:
+                    continue
+                try:
+                    async for audio_ev in voice.speak_stream(
+                        voice_backend, cleaned, voice_id, lang,
+                    ):
+                        if "chunk_b64" in audio_ev:
+                            await out_q.put({
+                                "audio_chunk_b64": audio_ev["chunk_b64"],
+                                "sample_rate": audio_ev.get("sample_rate"),
+                            })
+                except Exception as e:
+                    await out_q.put({"error": f"TTS: {e}"})
+        finally:
+            await out_q.put(SENTINEL)
+
+    llm_task = asyncio.create_task(_llm_reader())
+    tts_task = asyncio.create_task(_tts_worker())
+    try:
+        while True:
+            ev = await out_q.get()
+            if ev is SENTINEL:
+                break
+            yield ev
+    finally:
+        for t in (llm_task, tts_task):
+            if not t.done():
+                t.cancel()
+
+    yield {"_full_reply": "".join(collected).strip()}
+
+
+def _load_conv_for_voice(conv_id: int) -> dict:
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conv_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Conversation not found")
+    return db.row_to_dict(row)
+
+
+def _resolve_voice_backend(conv: dict) -> dict:
+    """Return the voice backend for this conv, or 404 if none is configured."""
+    settings = conv.get("voice_settings") or {}
+    explicit_id = settings.get("voice_backend_id")
+    if explicit_id is not None:
+        b = _load_backend(explicit_id)
+        if b.get("kind") != "voice":
+            raise HTTPException(
+                400, f"Backend #{explicit_id} is not a voice backend (kind={b.get('kind')!r}).",
+            )
+        if not b.get("enabled"):
+            raise HTTPException(400, f"Voice backend #{explicit_id} is disabled.")
+        return b
+    # Fallback: first enabled voice backend.
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM backends WHERE kind = 'voice' AND enabled = 1 ORDER BY id LIMIT 1"
+        ).fetchone()
+    if not row:
+        raise HTTPException(
+            404,
+            "No voice backend configured. In Settings → LLM Endpoints, click "
+            "'+ Add endpoint' and choose 'Voice (ASR + TTS)' with the URL of "
+            "your running voice service (e.g. http://localhost:8090).",
+        )
+    return db.row_to_dict(row)
+
+
+async def _resolve_voice_choice(
+    conv: dict,
+    backend: dict,
+    override_voice: str | None = None,
+    override_lang: str | None = None,
+) -> tuple[str, str]:
+    """(voice_id, language) — explicit override > conv voice_settings > first
+    English voice from the backend > first available voice."""
+    s = conv.get("voice_settings") or {}
+    voice_id = override_voice or s.get("voice_id")
+    language = override_lang or s.get("language")
+    if voice_id and language:
+        return voice_id, language
+    try:
+        cat = await voice.list_voices(backend)
+    except Exception as e:
+        raise HTTPException(502, f"Could not query voices catalog: {e}")
+    if not isinstance(cat, dict):
+        raise HTTPException(502, "Voice backend returned a malformed /voices catalog.")
+    # English first, then any other language with voices.
+    for lang in ("en", *sorted(k for k in cat.keys() if k != "en")):
+        voices_list = cat.get(lang) or []
+        if voices_list and isinstance(voices_list[0], dict):
+            vid = voices_list[0].get("id")
+            if vid:
+                return vid, lang
+    raise HTTPException(503, "Voice backend has no voices available.")
+
+
+@app.get("/api/voices")
+async def api_list_voices():
+    """Flat catalog of every voice the registered voice backend can produce.
+
+    Powers the chat-topbar voice picker (mirrors the LLM model picker but
+    only TTS voices, so the two pickers stay strictly separate). Returns
+    404 with a Settings hint when no voice backend is registered — the
+    frontend hides the voice picker in that case.
+
+    Response: {"voices": [{"id", "name", "language", "gender"?}, ...]}.
+    Voices are flattened across all languages so the picker is a single
+    flat dropdown (we don't ask the user to first pick a language then a
+    voice — `id` + `language` together fully identify a voice).
+    """
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM backends WHERE kind = 'voice' AND enabled = 1 ORDER BY id LIMIT 1"
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "No voice backend configured.")
+    backend = db.row_to_dict(row)
+    try:
+        cat = await voice.list_voices(backend)
+    except Exception as e:
+        raise HTTPException(502, f"Could not query voices catalog: {e}")
+    if not isinstance(cat, dict):
+        raise HTTPException(502, "Voice backend returned a malformed /voices catalog.")
+    out: list[dict] = []
+    for lang in sorted(cat.keys()):
+        voices_list = cat.get(lang) or []
+        if not isinstance(voices_list, list):
+            continue
+        for v in voices_list:
+            if not isinstance(v, dict):
+                continue
+            vid = v.get("id") or v.get("name")
+            if not vid:
+                continue
+            out.append({
+                "id": vid,
+                "name": v.get("name") or vid,
+                "language": lang,
+                "gender": v.get("gender"),
+            })
+    return {"voices": out, "backend_id": backend["id"], "backend_name": backend["name"]}
+
+
+@app.post("/api/conversations/{conv_id}/voice/transcribe")
+async def api_conv_voice_transcribe(
+    conv_id: int,
+    audio: UploadFile = File(...),
+    language: str | None = Form(None),
+):
+    """Proxy: audio in → text out. Uses the conv's voice backend."""
+    conv = _load_conv_for_voice(conv_id)
+    backend = _resolve_voice_backend(conv)
+    audio_bytes = await audio.read()
+    try:
+        return await voice.transcribe(
+            backend, audio_bytes,
+            filename=audio.filename or "audio.wav",
+            content_type=audio.content_type or "audio/wav",
+            language=language,
+        )
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Voice backend /transcribe failed: {e}")
+
+
+@app.post("/api/conversations/{conv_id}/voice/speak")
+async def api_conv_voice_speak(conv_id: int, req: VoiceSpeakRequest):
+    """Proxy: text in → SSE audio chunks out. Uses the conv's voice + language
+    (req fields override the saved voice_settings)."""
+    conv = _load_conv_for_voice(conv_id)
+    backend = _resolve_voice_backend(conv)
+    voice_id, language = await _resolve_voice_choice(
+        conv, backend, override_voice=req.voice, override_lang=req.language,
+    )
+
+    async def gen():
+        try:
+            async for ev in voice.speak_stream(
+                backend, req.text, voice_id, language, speed=req.speed,
+            ):
+                yield f"data: {json.dumps(ev)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/conversations/{conv_id}/voice/turn")
+async def api_conv_voice_turn(
+    conv_id: int,
+    audio: UploadFile = File(...),
+    language: str | None = Form(None),
+):
+    """The push-to-talk turn: ASR → bot reply → TTS, merged into one SSE.
+
+    Emits, in order:
+      data: {transcript: "<text>", asr_language: "en"}
+      data: {chunk: "<assistant token>"}           × N
+      data: {audio_chunk_b64: "...", sample_rate: 22050}   × M
+      data: {end: true}
+
+    Persists the (user, assistant) pair to the conv exactly like
+    `/chat/stream` with `persist=true`. Errors at any stage are surfaced as a
+    `{error: "..."}` event before the `{end}`.
+    """
+    conv = _load_conv_for_voice(conv_id)
+    voice_backend = _resolve_voice_backend(conv)
+    audio_bytes = await audio.read()
+    audio_name = audio.filename or "audio.wav"
+    audio_ct = audio.content_type or "audio/wav"
+
+    async def gen():
+        # 1. ASR
+        try:
+            asr = await voice.transcribe(
+                voice_backend, audio_bytes,
+                filename=audio_name, content_type=audio_ct, language=language,
+            )
+        except Exception as e:
+            yield f"data: {json.dumps({'error': f'ASR failed: {e}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+        transcript = (asr.get("text") or "").strip()
+        yield f"data: {json.dumps({'transcript': transcript, 'asr_language': asr.get('language')})}\n\n"
+        if not transcript:
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        # 2. LLM — reuse the same path /chat/stream uses, so RAG + relay-route
+        #    still work, and the messages list is identical. The client renders
+        #    each {status} event as a "thinking" pill in the assistant bubble
+        #    so the user knows what's happening between transcript and reply.
+        try:
+            chat_req = ConversationChatRequest(
+                message=transcript, include_history=True, persist=False,
+            )
+            _, messages, eff, llm_backend = _resolve_conversation_chat(conv_id, chat_req)
+            # Tell the UI we're hitting the knowledge base BEFORE we start —
+            # the search itself can take 200ms-2s depending on chunk count +
+            # embed-backend latency. Skip the event when there's no KB so the
+            # status stays accurate.
+            has_kb = False
+            with db.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM kb_chunks WHERE conversation_id = ? LIMIT 1",
+                    (conv_id,),
+                ).fetchone()
+                has_kb = row is not None
+            if has_kb:
+                yield f"data: {json.dumps({'status': 'searching_knowledge'})}\n\n"
+            await _augment_messages_with_knowledge(conv_id, messages, transcript, llm_backend)
+            llm_backend = await _maybe_override_to_relay(llm_backend, eff["model"])
+            # Setup done — LLM call about to start. First-token latency depends
+            # on the model and whether it's warm; this status covers that gap.
+            yield f"data: {json.dumps({'status': 'thinking'})}\n\n"
+        except HTTPException as e:
+            yield f"data: {json.dumps({'error': f'LLM setup: {e.detail}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        # 3. Resolve TTS voice up front so we can stream sentence-by-sentence.
+        try:
+            voice_id, lang = await _resolve_voice_choice(conv, voice_backend)
+        except HTTPException as e:
+            yield f"data: {json.dumps({'error': f'voice choice: {e.detail}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        # 4. Stream LLM tokens AND TTS audio interleaved — each completed
+        #    sentence is cleaned and fed to the voice backend's /speak/stream
+        #    immediately, so the first audio chunk lands while the model is
+        #    still producing later sentences.
+        full_reply = ""
+        try:
+            async for ev in _stream_llm_and_tts(
+                llm_backend=llm_backend, model=eff["model"],
+                messages=messages, eff=eff,
+                voice_backend=voice_backend, voice_id=voice_id, lang=lang,
+            ):
+                if "_full_reply" in ev:
+                    full_reply = ev["_full_reply"]
+                    continue
+                yield f"data: {json.dumps(ev)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': f'LLM/TTS stream: {e}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        # Persist the turn (best-effort — UI surfaces the audio playback even
+        # if the DB write hits a transient error).
+        try:
+            user_msg = {"role": "user", "content": transcript}
+            _persist_conv_chat_turn(conv_id, [user_msg], full_reply, eff, llm_backend)
+        except Exception:
+            pass
+
+        yield f"data: {json.dumps({'end': True})}\n\n"
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/conversations/{conv_id}/voice/say")
+async def api_conv_voice_say(conv_id: int, req: VoiceSayRequest):
+    """Push-to-talk fast path: caller already has the transcript (from the
+    browser's SpeechRecognition API). Skip server-side Whisper entirely; run
+    LLM + TTS and return the merged SSE just like /voice/turn.
+
+    Emits, in order:
+      data: {transcript: "<echo>"}                    # client already has it,
+                                                      # but echoing keeps the
+                                                      # event shape identical
+                                                      # to /voice/turn
+      data: {status: "searching_knowledge" | "thinking"}
+      data: {chunk: "<assistant token>"}              × N
+      data: {audio_chunk_b64: "...", sample_rate: …}  × M
+      data: {end: true}
+    """
+    conv = _load_conv_for_voice(conv_id)
+    voice_backend = _resolve_voice_backend(conv)
+    transcript = req.text.strip()
+    if not transcript:
+        raise HTTPException(400, "Empty text.")
+
+    async def gen():
+        # 1. Echo the transcript so the client SSE consumer can keep one
+        #    code path for both /voice/turn (server ASR) and /voice/say
+        #    (browser ASR).
+        yield f"data: {json.dumps({'transcript': transcript, 'asr_source': 'browser'})}\n\n"
+
+        # 2. LLM setup — same code path the normal chat /chat/stream uses, so
+        #    RAG + relay-route + history all work identically.
+        try:
+            chat_req = ConversationChatRequest(
+                message=transcript, include_history=True, persist=False,
+            )
+            _, messages, eff, llm_backend = _resolve_conversation_chat(conv_id, chat_req)
+            has_kb = False
+            with db.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM kb_chunks WHERE conversation_id = ? LIMIT 1",
+                    (conv_id,),
+                ).fetchone()
+                has_kb = row is not None
+            if has_kb:
+                yield f"data: {json.dumps({'status': 'searching_knowledge'})}\n\n"
+            await _augment_messages_with_knowledge(conv_id, messages, transcript, llm_backend)
+            llm_backend = await _maybe_override_to_relay(llm_backend, eff["model"])
+            yield f"data: {json.dumps({'status': 'thinking'})}\n\n"
+        except HTTPException as e:
+            yield f"data: {json.dumps({'error': f'LLM setup: {e.detail}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        # 3. Resolve TTS voice up front so we can stream sentence-by-sentence.
+        try:
+            voice_id, lang = await _resolve_voice_choice(
+                conv, voice_backend,
+                override_voice=req.voice, override_lang=req.language,
+            )
+        except HTTPException as e:
+            yield f"data: {json.dumps({'error': f'voice choice: {e.detail}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        # 4. Stream LLM tokens AND TTS audio interleaved. Each completed
+        #    sentence is cleaned (strip markdown / emojis / bullets) and
+        #    handed to the voice backend's /speak/stream as soon as it
+        #    closes, so the first audio chunk lands while the LLM is still
+        #    generating later sentences — same pattern as call.py.
+        full_reply = ""
+        try:
+            async for ev in _stream_llm_and_tts(
+                llm_backend=llm_backend, model=eff["model"],
+                messages=messages, eff=eff,
+                voice_backend=voice_backend, voice_id=voice_id, lang=lang,
+            ):
+                if "_full_reply" in ev:
+                    full_reply = ev["_full_reply"]
+                    continue
+                yield f"data: {json.dumps(ev)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': f'LLM/TTS stream: {e}'})}\n\n"
+            yield f"data: {json.dumps({'end': True})}\n\n"
+            return
+
+        try:
+            user_msg = {"role": "user", "content": transcript}
+            _persist_conv_chat_turn(conv_id, [user_msg], full_reply, eff, llm_backend)
+        except Exception:
+            pass
+
+        yield f"data: {json.dumps({'end': True})}\n\n"
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/conversations/{conv_id}/voice/persist-call-turn")
+async def api_conv_voice_persist_call_turn(conv_id: int, req: CallTurnPersistRequest):
+    """Append a (user, assistant) pair from a completed call-mode turn.
+
+    Call mode hits /chat/stream with persist=False so the LLM hot path stays
+    fast. After the turn finishes streaming audio to the browser, the voice
+    service fires-and-forgets a POST here to write the turn into the
+    conversation's history — same shape as a normal /chat/stream persist,
+    just decoupled from the response-time-critical loop.
+
+    Returns 404 if the conversation doesn't exist, 200 on persist. Errors
+    in persistence are swallowed by the caller (fire-and-forget) so a
+    transient DB hiccup doesn't surface as a user-visible call failure.
+    """
+    conv = _load_conv_for_voice(conv_id)
+    # Reuse the chat resolver to produce the same `eff` + `backend` snapshot
+    # a normal turn would carry, so the persisted message has the same
+    # `params` dict the GUI renders alongside text-chat history.
+    chat_req = ConversationChatRequest(
+        message=req.user, include_history=False, persist=False,
+    )
+    _, _, eff, llm_backend = _resolve_conversation_chat(conv_id, chat_req)
+    user_msg = {"role": "user", "content": req.user.strip()}
+    _persist_conv_chat_turn(conv_id, [user_msg], req.assistant.strip(), eff, llm_backend)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Call signaling proxy (HTTPS browser ↔ HTTP voice container)
+# ---------------------------------------------------------------------------
+# Browsers refuse cross-origin HTTP fetches from an HTTPS page (mixed content).
+# These three endpoints proxy the small JSON / SSE signaling traffic through
+# MiniClosedAI's own origin so the browser stays on HTTPS the whole way. The
+# actual WebRTC audio (RTP/UDP) flows direct browser ↔ voice container after
+# the SDP exchange — it never goes through this proxy and doesn't pay the
+# bandwidth cost.
+
+class CallConfigureRequest(BaseModel):
+    """Body for /call/configure proxy. The browser only supplies voice prefs;
+    conv_id and miniclosedai_url are filled in server-side so a tampered
+    client can't make the voice container call an arbitrary URL."""
+    model_config = ConfigDict(extra="forbid")
+    voice: str | None = None
+    language: str | None = None
+
+
+class CallOfferRequest(BaseModel):
+    """Body for /call/offer proxy — passes the SDP through unchanged."""
+    model_config = ConfigDict(extra="allow")
+    sdp: str | None = None
+    type: str
+    webrtc_id: str
+
+
+def _self_url_for_voice(request: Request) -> str:
+    """The base URL the voice container should use to call back into
+    MiniClosedAI for /chat/stream. We trust the incoming `Host` header: from
+    inside a Docker network the LAN IP works, and from a same-machine setup
+    the localhost form does. Strip a trailing slash so concatenation is clean."""
+    return str(request.base_url).rstrip("/")
+
+
+@app.post("/api/conversations/{conv_id}/call/configure")
+async def api_conv_call_configure(
+    conv_id: int, req: CallConfigureRequest, request: Request,
+):
+    """Proxy POST /call/configure — same-origin so the browser can stay on HTTPS."""
+    conv = _load_conv_for_voice(conv_id)
+    backend = _resolve_voice_backend(conv)
+    voice_id, language = await _resolve_voice_choice(
+        conv, backend, override_voice=req.voice, override_lang=req.language,
+    )
+    payload = {
+        "conv_id": conv_id,
+        "miniclosedai_url": _self_url_for_voice(request),
+        "voice": voice_id,
+        "language": language,
+    }
+    # Pre-warm the bot's LLM in the background — first-turn latency in call
+    # mode is dominated by the model load (Ollama's default keep_alive expires
+    # in 5 min). Fire-and-forget, never blocks the call setup.
+    asyncio.create_task(_warmup_conv_model(conv_id))
+    try:
+        return await voice.call_configure(backend, payload)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Voice backend /call/configure failed: {e}")
+
+
+async def _warmup_conv_model(conv_id: int) -> None:
+    """Force the bot's LLM into memory so the first call-mode turn isn't slow.
+
+    Sends a 1-token prompt through the same chat path real turns use, so
+    whichever backend the bot points at (Ollama, OpenAI-compat, relay) gets
+    warmed correctly. Errors are swallowed — warmup is best-effort.
+    """
+    try:
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT model, backend_id, params FROM conversations WHERE id = ?",
+                (conv_id,),
+            ).fetchone()
+        if not row:
+            return
+        backend = _load_backend(row["backend_id"] or 1)
+        backend = await _maybe_override_to_relay(backend, row["model"])
+        messages = [{"role": "user", "content": "."}]
+        async for ev in llm.chat_stream(
+            backend, row["model"], messages,
+            temperature=0.0, max_tokens=1, top_p=1.0, top_k=1, think=False,
+        ):
+            # Bail after first event — the model is loaded once anything streams.
+            break
+    except Exception:
+        pass
+
+
+@app.post("/api/conversations/{conv_id}/call/offer")
+async def api_conv_call_offer(conv_id: int, req: CallOfferRequest):
+    """Proxy POST /webrtc/offer — returns the SDP answer JSON from FastRTC."""
+    conv = _load_conv_for_voice(conv_id)
+    backend = _resolve_voice_backend(conv)
+    try:
+        return await voice.call_offer(backend, req.model_dump(exclude_none=True))
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Voice backend /webrtc/offer failed: {e}")
+
+
+@app.get("/api/conversations/{conv_id}/call/events/{webrtc_id}")
+async def api_conv_call_events(conv_id: int, webrtc_id: str):
+    """Proxy GET /call/events/{id} — forwards the SSE stream to the browser."""
+    conv = _load_conv_for_voice(conv_id)
+    backend = _resolve_voice_backend(conv)
+
+    async def gen():
+        try:
+            async for ev in voice.call_events(backend, webrtc_id):
+                yield f"data: {json.dumps(ev)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 

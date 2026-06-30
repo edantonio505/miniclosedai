@@ -504,6 +504,62 @@ async def _openai_chat_stream(
 # Dispatch
 # =====================================================================
 
+async def _voice_is_running(backend: dict) -> bool:
+    """Voice backends expose /health instead of an LLM-style endpoint."""
+    import voice as _voice
+    return await _voice.is_running(backend)
+
+
+async def _voice_list_models(backend: dict) -> list[dict]:
+    """Reshape the voice service's /voices response to the Ollama-style list
+    the frontend already knows how to render.
+
+    Voice payload: {"en": [{id,name,gender}, ...], "es": [...]}
+    Returned shape: [{"name": "en/voice_id", "size": 0, "details": {...}}, ...]
+
+    The per-bot Voice/Language dropdowns in the sidebar Parameters panel parse
+    `details.language` and `details.voice_id` directly off of this list.
+    """
+    import voice as _voice
+    try:
+        cat = await _voice.list_voices(backend)
+    except Exception:
+        return []
+    out: list[dict] = []
+    if not isinstance(cat, dict):
+        return out
+    for lang, voices in cat.items():
+        if not isinstance(voices, list):
+            continue
+        for v in voices:
+            if not isinstance(v, dict):
+                continue
+            vid = v.get("id") or v.get("name") or ""
+            if not vid:
+                continue
+            out.append({
+                "name": f"{lang}/{vid}",
+                "size": 0,
+                "details": {
+                    "family": "voice",
+                    "language": lang,
+                    "voice_id": vid,
+                    "display": v.get("name") or vid,
+                    "gender": v.get("gender"),
+                },
+            })
+    return out
+
+
+async def _voice_chat_stream(*args, **kwargs):
+    """Voice backends don't do chat completions. Raise a clear error so the
+    caller surfaces it as 'pick a non-voice backend for chat', not a KeyError."""
+    raise RuntimeError(
+        "This backend is a voice service (ASR + TTS), not a chat LLM. "
+        "Pick a chat-capable backend (kind=ollama or kind=openai) for the bot."
+    )
+
+
 _IMPLS = {
     "ollama": {
         "is_running": _ollama_is_running,
@@ -514,6 +570,11 @@ _IMPLS = {
         "is_running": _openai_is_running,
         "list_models": _openai_list_models,
         "chat_stream": _openai_chat_stream,
+    },
+    "voice": {
+        "is_running": _voice_is_running,
+        "list_models": _voice_list_models,
+        "chat_stream": _voice_chat_stream,
     },
 }
 

@@ -26,7 +26,9 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 3. [Running](#running)
 4. [Docker deployment](#docker-deployment)
 5. [UI features](#ui-features)
-6. [Knowledge base (RAG)](#knowledge-base-rag)
+6. [Voice — push-to-talk + call mode (separate microservice repo)](#voice-push-to-talk--call-mode-via-a-separate-microservice)
+7. [Apps + per-app SDK generation (TypeScript / JavaScript / Python)](#apps-groups-of-bots-and-per-app-sdk-generation)
+8. [Knowledge base (RAG)](#knowledge-base-rag)
 7. [Extensibility — MCP plugins](#extensibility--mcp-plugins)
 8. [Evaluation & auto-improve](#evaluation--auto-improve-scoring)
 9. [Worked example — connecting Bonsai (1-bit 8B)](#worked-example--connecting-bonsai-1-bit-8b)
@@ -39,10 +41,12 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 16. [Worked example — chatbot frontends (Python CLI + HTML widget)](#worked-example--chatbot-frontends-python-cli--html-widget)
 17. [Client SDK — composing bots from your code](#client-sdk--composing-bots-from-your-code)
 18. [Bot import / export](#bot-import--export)
-19. [Self-upgrade](#self-upgrade)
+19. [Application import / export](#application-import--export)
+20. [Self-upgrade](#self-upgrade)
 20. [Prompt generator](#prompt-generator)
 21. [Activity logs](#activity-logs)
-22. [Database](#database)
+22. [Benchmarking with miniclosedai-llm](#benchmarking-with-miniclosedai-llm)
+23. [Database](#database)
 23. [Configuration](#configuration)
 24. [File layout](#file-layout)
 25. [Security](#security)
@@ -354,7 +358,26 @@ See [Security](#security) and the README's [LAN access](./README.md#lan-access) 
 
 ### Navigation (list → detail)
 
-The UI is a **list/detail** pattern, not flat tabs. The activity bar has three icons — **Bots** (home, message-square), **Logs** (terminal), **Settings** (gear). The "Dashboard" page still exists internally (it's the chat surface) but has no nav button; you reach it by drilling into a bot from the list.
+The UI is a **list/detail** pattern, not flat tabs. The activity bar has four page icons — **Bots** (home, message-square), **Apps** (layers — groups of bots), **Logs** (terminal), **Settings** (gear). The "Dashboard" page still exists internally (it's the chat surface) but has no nav button; you reach it by drilling into a bot from the list or from inside an app.
+
+#### Drill-in / drill-out animation (consistent across every list → detail step)
+
+Every navigation step that changes **depth** plays the same spatial slide animation — the destination page slides in from the right on a drill-in and from the left on a drill-out (or back-button climb). This is enforced by a single depth map in `static/app.js` (`_PAGE_DEPTH`) rather than per-route wiring, so adding a new page automatically inherits the behaviour by picking its depth:
+
+| Page | Depth |
+|---|---|
+| `bots`, `apps`, `logs`, `settings` | 0 (top-level peers) |
+| `app-detail` | 1 (one app, list of its bots) |
+| `dashboard` | 2 (one bot's chat) |
+
+`applyActivePage(page)` compares `_PAGE_DEPTH[from]` vs `_PAGE_DEPTH[to]`; if the depth goes up it sets `body[data-page-transition="forward"]`, down sets `"back"`, and same-depth peer hops (activity-bar clicks between top-level pages) set nothing. The CSS rule animates whichever `.page` is currently `display: flex` (one at a time — the others are `display: none` and CSS animations don't fire on hidden elements), so the rule is just `body[data-page-transition="forward"] .page { animation: drillIn ... }` with no per-page enumeration. Reduced motion preference disables both keyframes. The body attribute is auto-cleared 240 ms later so the next transition can re-fire it.
+
+Concretely this covers all the navigation steps below with the same feel:
+
+- `bots → dashboard` (forward) and `dashboard → bots` (back) — the original case.
+- `apps → app-detail` (forward) and `app-detail → apps` (back).
+- `app-detail → dashboard` (forward, clicking a bot inside an app) and `dashboard → app-detail` (back, the chat-topbar `<` returning to the app you came from — driven by `state.chatReturnTo`).
+- Any cross-area depth change (e.g. `bots → app-detail`, `dashboard → settings`) also animates in the correct direction.
 
 <p align="center">
   <img src="docs/images/bots_page_listview.png" alt="Bots page — list view" width="800"><br><em>Bots page — list view</em>
@@ -368,7 +391,7 @@ The UI is a **list/detail** pattern, not flat tabs. The activity bar has three i
 - **Bot card row actions** — appear on `:hover` / `:focus-within` only, in `.bot-card-actions` (an absolutely-positioned strip on the right edge with a gradient mask fade): `</>` API code, **📚 Manage knowledge**, **🧩 Manage extensions**, and 🗑 Delete. All call `e.stopPropagation()` and carry the card's `data-conv-id`.
   - **📚 → Manage Knowledge modal** (`openKnowledgeModal`): lists the bot's documents (filename · chunk count · size · date) with per-doc delete, plus **+ Add document** which routes the shared hidden file input (`#bots-kb-file`) via `_triggerKbUpload({convId, onStatus, onDone})` → `_uploadKnowledgeToConv`.
   - **🧩 → Manage Extensions modal** (`openMcpModal`): lists the bot's MCP servers with a per-server **enable toggle** + remove (each mutation PUTs the full list via `_saveMcpModal`), plus an add-by-URL row → `_addMcpToConv`.
-  - Both modals reuse the same endpoints as the sidebar panels; if the edited bot is the one currently open, the matching sidebar panel (`loadKnowledge` / `loadMcp`) refreshes so the two surfaces stay in sync. The card itself gets `z-index: 5` on hover so the actions and their tooltips can paint over the next card's border (`.bot-card-actions` uses `transform`, which creates a local stacking context, so the tooltip's `z-index: 9999` only competes within that subtree). Delete is wired to `deleteConvById(id, { title })`, which prunes the id from `_streaming` / `_unread` so stale dots don't linger, then falls back to opening the next-most-recent bot (or the Bots empty state if none remain). API code is wired to `openApiCodeForConv(id)` (see below) which scopes the modal to that id without disturbing `state.conversationId`.
+  - Both modals reuse the same endpoints as the sidebar panels; if the edited bot is the one currently open, the matching sidebar panel (`loadKnowledge` / `loadMcp`) refreshes so the two surfaces stay in sync. The card itself gets `z-index: 5` on hover so the actions paint over the next card's border. Tooltip painting is no longer affected by stacking contexts — every `[data-tooltip]` element is hijacked by the global tooltip system (`#global-tooltip` on `<body>`, see [Global tooltip](#global-tooltip) below) so even tooltips on elements nested inside `transform` / `overflow: hidden` ancestors render above everything. Delete is wired to `deleteConvById(id, { title })`, which prunes the id from `_streaming` / `_unread` so stale dots don't linger, then falls back to opening the next-most-recent bot (or the Bots empty state if none remain). API code is wired to `openApiCodeForConv(id)` (see below) which scopes the modal to that id without disturbing `state.conversationId`.
 - **Topbar `<` back button** — leftmost element of the chat topbar; returns to the Bots list with a reverse slide. `Esc` is the keyboard equivalent (skipped when a modal is open).
 - **Pulse dot** on the Bots icon AND on individual bot cards — driven by two sets:
   - `_streaming` — convs whose chat stream is currently in flight.
@@ -419,6 +442,14 @@ Two draggable dividers persist to `localStorage`:
 
 The sidebar's scrollbar is hidden across all browsers; scrolling still works via wheel / trackpad / keyboard.
 
+### Global tooltip
+
+Every `[data-tooltip]` element in the GUI shares **one** fixed-positioned bubble appended directly to `<body>` — `#global-tooltip` — instead of each trigger painting its own `::after` pseudo-element. Why: a pseudo on the trigger renders inside its parent's stacking + clipping contexts, so any ancestor with `overflow: hidden`, `transform`, `filter`, or its own stacking context (sidebar panels, sticky toolbars, scrollable cards, modal frames) would clip or layer-cover the bubble — a defect we hit on the sidebar tooltip behind the chat panel. A single body-mounted fixed element sits in the root stacking context with `z-index: 2147483647`, so it is GUARANTEED to render above every other element on the page regardless of where the trigger lives in the DOM.
+
+**Wiring** (`static/app.js:initGlobalTooltip`): one delegated `pointerover` + `pointerout` handler on `document` walks the target's ancestors via `closest("[data-tooltip]")`. On hit, `_showGlobalTooltip(trigger)` reads `data-tooltip`, measures the trigger's viewport rect with `getBoundingClientRect()`, places the bubble directly under it (or above when `data-tooltip-side="top"` is set), and clamps the position into the viewport so wide tooltips on edge-aligned buttons don't fall off-screen. If the requested side would clip, it auto-flips to the other side. The bubble hides on `pointerout` (unless `relatedTarget` is a descendant of the active trigger), on `focusout`, on `scroll`/`resize`, and on `Escape`. Pre-existing UX semantics survive: `aria-expanded="true"` suppresses the tooltip during an open menu/popover, and the global handler still respects the `data-tooltip-side` attribute used by composer-bottom buttons.
+
+**Implication for new UI work**: just add `data-tooltip="…"` (and optionally `data-tooltip-side="top"`) to any element — no CSS positioning, no z-index plumbing, no concern about which container it lives in. The global handler picks up dynamically-inserted elements (cards built by JS, modal contents) for free since the listeners are on `document`.
+
 ### Logs page
 
 Vertical-nav button (terminal icon, between Bots and Settings in the activity bar) opens the LLM activity viewer. Implementation detail in [Activity logs](#activity-logs) below; from a user's perspective it's a per-call row showing status / endpoint / model / latency / timestamp, click-to-expand for params + messages + response. The toolbar (filter input + entry count) is `position: sticky` at top of the scrolling container — same treatment as the Bots page — so the filter stays visible while rows scroll under it. Polling auto-pauses when the page isn't visible.
@@ -426,6 +457,177 @@ Vertical-nav button (terminal icon, between Bots and Settings in the activity ba
 <p align="center">
   <img src="docs/images/logs_page.png" alt="Logs page — per-call request/response viewer" width="800"><br><em>Logs page</em>
 </p>
+
+---
+
+## Voice (push-to-talk + call mode via a separate microservice)
+
+Self-hosted voice for any bot. **Push-to-talk** (🎤) for short turns, **call mode** (📞) for full-duplex WebRTC conversation. The voice service runs in its own process — and **its own GitHub repo**, [edantonio505/miniclosedai-voice](https://github.com/edantonio505/miniclosedai-voice) — so MiniClosedAI carries no GPU dependencies and the voice service can swap engines without touching MiniClosedAI's code.
+
+### Architecture
+
+**Push-to-talk turn:**
+
+```
+Browser                         MiniClosedAI                          Voice service                 Ollama / LLM
+─────────                       ─────────────                         ─────────────                 ────────────
+🎤 hold
+  ↓ MediaRecorder (WebM/Opus)
+  ↓ POST multipart
+  ─────────────────────────►   /api/conversations/{id}/voice/turn
+                                 │  (1) /transcribe ──────────────►   HF Whisper → text
+                                 │  (2) chat path streams ───────────────────────────────────►   bot reply (tokens)
+                                 │  (3) sentence-buffer + clean_for_tts → /speak/stream  ─►   Chatterbox Turbo → PCM
+                                 ◄────────────────────────────────
+  ◄── SSE: {transcript}, {chunk} × N, {audio_chunk_b64} × M, {end} ──
+  Web Audio playback queue
+```
+
+**Call mode turn:**
+
+```
+Browser                         MiniClosedAI                          Voice service                 Ollama / LLM
+─────────                       ─────────────                         ─────────────                 ────────────
+📞 click
+  ↓ getUserMedia + RTCPeerConnection.createOffer
+  ↓ POST /call/configure        (proxied as same-origin HTTPS)
+  ↓ POST /call/offer            (SDP exchange)
+  ◄── SDP answer
+  ───── WebRTC media flows browser ↔ voice service ─────►
+                                                                     Silero VAD waits for pause
+                                                                     HF Whisper → text
+                                ◄── POST /chat/stream ───────────────
+                                  bot reply tokens stream ──────────►   tokens
+                                                                     sentence-buffer + clean_for_tts
+                                                                     Chatterbox Turbo per sentence
+                                ─── SSE /call/events/{webrtc_id} ──►   browser updates bubble + status pill
+                                  {transcript}, {chunk}, {audio plays via WebRTC track}, {end}
+```
+
+### Voice service — separate repo
+
+A standalone FastAPI app. Clone it as a sibling directory; `dev.sh` and `tools/test_call.py` auto-discover it (or set `MINICLOSEDAI_VOICE_DIR`). Bash install — no Docker required.
+
+| Layer | Library | Notes |
+|---|---|---|
+| ASR | HuggingFace **Whisper** via `transformers` + PyTorch (cu118 / cu124 / cu128 / cu130 / cpu) | `small.en` default; switchable to `tiny.en` / `medium.en` / `large-v3` via `VOICE_ASR_MODEL`. p50 ASR ~350ms on GB10. |
+| TTS | **Chatterbox Turbo** (`chatterbox-tts` 0.1.6, installed `--no-deps` to bypass its torch==2.6 hard pin) | Token-streaming, fp16 transformer, **4** CFM diffusion steps (vs default 1000). ~700ms median first-chunk latency. Voice cloning via reference WAVs in `voices/<id>.wav`. |
+| VAD | Silero VAD via `fastrtc[vad]` | `min_silence_duration_ms=300`, `can_interrupt=False` (anti-echo). |
+| Denoise | DeepFilterNet (sed-patched for torchaudio≥2.10) | ONNX, single-digit ms on GPU. |
+| WebRTC | aiortc via FastRTC | mounts `/webrtc/offer`; `/call/events` SSE forwards `AdditionalOutputs` from the BotCallHandler. |
+| HTTP | FastAPI + uvicorn | Single worker (GPU serialized). Optional `VOICE_API_KEY` Bearer auth. |
+
+The endpoint contract (`miniclosedai-voice/server.py`):
+
+```
+GET  /health                      — {ok, asr_model, tts_model, device, voices_loaded}
+GET  /voices                      — {"en": [{id,name,gender}, ...], "es": [...]}
+POST /transcribe                  — multipart audio (+optional language) → {text, language, segments}
+POST /speak                       — JSON {text, voice, language, speed?} → audio/wav body
+POST /speak/stream                — same body → SSE: {chunk_b64, sample_rate} × N, then {done:true}
+POST /call/configure              — per-call config (conv_id, miniclosedai_url, voice, language)
+POST /webrtc/offer                — SDP offer → SDP answer (mounted by FastRTC)
+GET  /call/events/{webrtc_id}     — SSE: {status}, {transcript}, {chunk}, {audio frames over WebRTC}, {end}
+```
+
+The voice service ships its own **`./test.sh`** smoke harness (15 assertions covering imports, GPU, all HTTP endpoints, ASR round-trip, WebRTC handshake) — run it before every voice-side commit.
+
+### MiniClosedAI side
+
+**Backend integration** (`db.py`, `app.py`, `voice.py`):
+
+- The `backends.kind` CHECK now accepts `'voice'` (idempotent recreate-table migration in `db.py:_migrate_backends_kind_to_include_voice`). All existing backend lifecycle endpoints (`/api/backends`, `/status`, `/test`, `/models`) dispatch to voice via a new branch in `llm._IMPLS["voice"]`; `/models` returns the voices catalog reshaped to the Ollama-style `[{name, size, details}]` list the frontend already parses.
+- `voice.py` (new module) provides the four async httpx wrappers — `health`, `list_voices`, `transcribe`, `speak_stream` — same style as `llm._ollama_*` / `llm._openai_*`.
+- New per-conversation endpoints (`app.py`):
+  - `POST /api/conversations/{id}/voice/transcribe` — multipart audio → JSON transcript.
+  - `POST /api/conversations/{id}/voice/speak` — JSON `{text}` → SSE audio chunks.
+  - `POST /api/conversations/{id}/voice/turn` — multipart audio → one merged SSE: ASR transcript, chat reply (text), TTS audio. Reuses `_resolve_conversation_chat`, `_augment_messages_with_knowledge`, `_maybe_override_to_relay`, and `_persist_conv_chat_turn` so RAG, relay-routing, and conversation persistence all behave identically to a normal `/chat/stream` turn.
+- Per-conversation `voice_settings` JSON column (`{voice_backend_id?, voice_id?, language?, autoplay?}`) — the resolver picks the explicit backend id, else the first enabled voice backend; the voice/language resolve from `voice_settings` else the backend's first English voice.
+
+**Frontend** (`static/app.js`, `index.html`, `style.css`):
+
+- `<option value="voice">Voice (ASR + TTS)</option>` joins the `#backend-kind` dropdown; the URL hint mentions the voice URL.
+- `#mic-btn` on the composer is hidden by default; `_refreshMicAffordance()` unhides it when `backendCache` contains any enabled `kind='voice'` backend.
+- Press-and-hold or click-toggle: `_startRecording()` → `navigator.mediaDevices.getUserMedia({audio:true})` + `MediaRecorder`; on release `_stopRecordingAndSend()` posts the blob to `/voice/turn`.
+- `_consumeVoiceTurn()` reads the merged SSE: `transcript` renders a user bubble + opens an assistant bubble, `chunk` streams text into it, `audio_chunk_b64` decodes (atob → Int16 → Float32) and `_enqueueAudioChunk()` schedules it on a sliding `AudioContext.currentTime` cursor for gapless playback.
+- CSS pulse animation on `#mic-btn.recording`; `.busy` while the turn is in flight.
+
+### Deploying the voice service
+
+The image is identical between local and RunPod; only the URL you paste into Settings differs.
+
+```bash
+# Local CPU (default)
+docker run --rm -p 8090:8090 \
+    -v voice_models:/root/.cache/huggingface -v voice_pipers:/voices \
+    miniclosedai-voice:latest
+
+# GPU
+docker run --rm --gpus all -p 8090:8090 \
+    -e VOICE_ASR_MODEL=large-v3 -e VOICE_DEVICE=cuda \
+    -v voice_models:/root/.cache/huggingface -v voice_pipers:/voices \
+    miniclosedai-voice:latest
+```
+
+Then in MiniClosedAI: **Settings → LLM Endpoints → + Add endpoint** → kind `Voice (ASR + TTS)` → paste URL → **Test** → Save.
+
+### Testing
+
+`test_e2e.py` ships a `FakeVoice` (mirrors `FakeOllama` / `FakeOpenAI`) serving canned `/health`, `/voices`, `/transcribe`, and `/speak/stream`. Nine voice-related tests cover: `kind='voice'` CRUD round-trip; `/status` reachable/unreachable; `/models` reshape into `<lang>/<voice_id>` entries; `/test` draft probe; `voice_settings` column round-trip; `/voice/transcribe` proxy; `/voice/speak` SSE + default-voice resolution; `/voice/turn` full ASR→Ollama→TTS chain with persistence; 404 when no voice backend is configured. Run via `.venv/bin/python test_e2e.py`.
+
+---
+
+## Apps (groups of bots) and per-app SDK generation
+
+A second top-level surface beside Bots: an **application** is a named group of bots (e.g. *"GA Probate"*) that can also emit a ready-to-use client SDK in TypeScript, JavaScript, or Python with each member bot wired in as a named function.
+
+### Data model
+
+A single **`apps`** table (`db.py:111-119`): `id`, `name`, `description`, `link`, `avatar` (data URL), `created_at`, `updated_at`. Bots belong to an app via a `conversations.app_id` column (additive migration in `init_db`), with `idx_conversations_app` for the per-app lookup. Assignment is one-to-many — a bot is in zero or one apps. Removing a bot from an app sets `app_id = NULL`; deleting the app does the same to its bots (the bots are not deleted).
+
+### Endpoints (`app.py:1033-1252`)
+
+CRUD on apps:
+- `GET  /api/apps` — list apps with `bot_count`.
+- `POST /api/apps` — create (`AppCreate`: name, description, link).
+- `GET  /api/apps/{id}` — single app + its bots.
+- `PATCH /api/apps/{id}` — update name / description / link.
+- `DELETE /api/apps/{id}` — delete app; bots' `app_id` is set to NULL.
+- `PUT/DELETE /api/apps/{id}/avatar` — same shape as the per-bot avatar endpoints.
+
+Bot assignment:
+- `POST /api/apps/{id}/bots` body `{conversation_id}` — assign a bot (reassigns from any previous app).
+- `DELETE /api/apps/{id}/bots/{conv_id}` — clear `app_id` (404 if the bot wasn't in this app).
+
+SDK generation:
+- `GET /api/apps/{id}/sdk?lang=ts|js|py` — JSON preview: `{app, lang, files: [{path, content}]}`. `lang` defaults to `ts` (backwards-compat); unknown lang → 400.
+- `GET /api/apps/{id}/sdk.zip?lang=…` — download as a zip. Filename keeps `<slug>-sdk.zip` for `ts` (no breakage); `js` / `py` use `<slug>-<lang>-sdk.zip` so all three can coexist in a downloads folder.
+
+Portable export / import (same shape as the per-bot file, one level up — see [Application import / export](#application-import--export)):
+- `GET /api/apps/{id}/export?include_history=false` → `.miniclosed-app.json` carrying app metadata + every bot's config block.
+- `POST /api/apps/import` body `{data, backend_id?}` → creates a NEW app + N new conversation rows, all bound to one backend. 409 with a picker list when no enabled backend covers every model.
+
+### `sdkgen.py` — the generator
+
+Stdlib-only, with three parallel emitters dispatched by `generate_sdk(lang, app, bots, base_url)` (`SDK_LANGS = ("ts", "js", "py")`):
+
+- **`generate_ts_sdk`** — typed TypeScript; per-bot `bots/<fn>.ts`, `client.ts`, `index.ts` barrel, `package.json`, `README.md`. Imports use the explicit `.js` extension (NodeNext/bundler-style).
+- **`generate_js_sdk`** — same shape with types stripped; ESM `.js`. Runs in Node 18+ (native `fetch`) and modern browsers.
+- **`generate_python_sdk`** — a stdlib-only Python package. Folder is `<py_slug>_sdk/` (underscores, so it's directly importable). Lays out `client.py`, `__init__.py` (re-exports + a `<bag>` dict of all bots), and `bots/<fn>.py` per bot. Snake-case function names via `function_names_python` (camelCase `function_names` is reused for TS/JS).
+
+Identifiers are deduplicated on collision by appending the bot id, and reserved words are rejected (per-language `_RESERVED` / `_PY_RESERVED` sets). The server URL is baked into `client.{ts,js,py}` via a `__BASE_URL__` placeholder substituted at generation time.
+
+### UI (`static/index.html`, `static/app.js`, `static/style.css`)
+
+- **Apps page** (`body[data-page="apps"]`, `renderAppsPage`): list of app cards (`_appsState.cache`) with a filter, an **Import** button (upload-cloud) + hidden `#apps-import-file`, a **+ New application** button, and per-card actions: **Generate SDK**, **Export** (download-cloud — Shift-click to also include each bot's message history), **Edit**, **Delete**. The toolbar carries a **list ↔ grid view toggle** (`#apps-view-list` / `#apps-view-grid`), persisted to `localStorage` under `miniclosedai:appsView`, that flips the `#apps-list` container between the default vertical stack and the responsive auto-fill `.bots-list.grid-view` grid — exact mirror of the Bots-page toggle. View state is restored on boot and re-applied on every `renderAppsPage()` redraw.
+- **App detail** (`body[data-page="app-detail"]`, `renderAppDetail`): back-to-Apps button, the app's bot grid, plus a top-level row of buttons: **+ Add bot**, **Edit**, **Export** (Shift-click for history), **Generate SDK**. `_appsState.current` holds the open app.
+- **SDK modal** (`#sdk-modal-backdrop`, `openSdkModal`): three-language tab strip (`.sdk-lang-tab[data-lang="ts|js|py"]`); each tab refetches `/sdk?lang=…` via `_loadSdkFiles()` and re-renders the file tree + preview. Download button targets `/sdk.zip?lang=…`. State carries `{ files, active, appId, appName, lang }`.
+- **Backend-picker modal** — the same `#import-modal-backdrop` used by bot import is reused for app import. The modal title swaps to *"Import application — pick a backend for all bots"*, and the body lists each backend with `<matched>/<needed>` model coverage. One backend is applied to every bot in the imported app; per-bot pickers were deliberately skipped for simplicity.
+- **Context-aware back** (`enterChat()` / `exitChatToReturn()` in `app.js`): the chat view remembers which surface launched it (`state.chatReturnTo`), so back from a bot opened *inside* an app returns to that app's detail view — not the global Bots page. On Esc the same restore runs.
+
+### Drop-in usage caveats
+
+The generated SDKs are thin HTTP clients: they need a **reachable MiniClosedAI server**. The base URL is baked at generation time but overridable via `MINICLOSEDAI_BASE_URL` (Node `process.env` for JS/TS, `os.environ` for Python) or per-call `baseUrl` / `base_url`. Bot ids are pinned in the generated files — recreate a bot and you'll need to regenerate. The API ships with `allow_origins=["*"]` (in `app.py`) and no auth, so put a reverse proxy + auth in front before exposing port `8095` to the public internet.
 
 ---
 
@@ -766,6 +968,7 @@ DELETE /api/backends/{id}?force=true              → cascade-delete: removes ba
 GET    /api/backends/{id}/models                  → list that backend's models only
 GET    /api/backends/{id}/status                  → reachability probe (running, kind, model count)
 POST   /api/backends/test                         → probe a draft config without saving
+POST   /api/backends/auto-register                → pull base_url from a miniclosedai-llm manager + insert
 POST   /api/backends/{id}/pull                    → start a streaming model pull on Ollama backends
 GET    /api/pulls                                 → poll progress for all in-flight pulls
 DELETE /api/backends/{id}/pulls/{name:path}       → cancel an in-flight pull
@@ -788,12 +991,15 @@ GET    /api/conversations/{id}                    → get full conversation (inc
 PATCH  /api/conversations/{id}                    → update any subset of fields
 DELETE /api/conversations/{id}                    → delete
 POST   /api/conversations/{id}/clear              → wipe messages, keep config
+POST   /api/conversations/{id}/clone              → duplicate as a new bot (parallel-worker pattern)
 PATCH  /api/conversations/{id}/messages/{index}   → edit one stored message in place
 GET    /api/conversations/{id}/export.csv             → text-only SFT CSV (input,output)
 GET    /api/conversations/{id}/export.zip             → multimodal SFT bundle (JSONL + images)
 GET    /api/conversations/{id}/export.classify.zip    → image-classification dataset (image,label CSV + images/)
 GET    /api/conversations/{id}/export                 → portable bot config (.miniclosed-bot.json)
 POST   /api/conversations/import                      → import a .miniclosed-bot.json file
+GET    /api/apps/{id}/export                          → portable app + every bot in it (.miniclosed-app.json)
+POST   /api/apps/import                               → import a .miniclosed-app.json file
 ```
 
 **Create body**:
@@ -1689,6 +1895,145 @@ If you need to *also* share an endpoint (e.g. a hosted Bonsai relay you want a t
 
 ---
 
+## Application import / export
+
+The bot file is for moving *one* bot between instances. The **application file** is the same idea one level up: an envelope wrapping every bot in an application plus the app's own metadata, so a whole grouped surface (sales pipeline, intake triage, support stack, …) round-trips in one JSON.
+
+### Endpoints
+
+```
+GET  /api/apps/{id}/export?include_history=false
+       → 200 application/json
+       → Content-Disposition: attachment; filename="<app-slug>.miniclosed-app.json"
+
+POST /api/apps/import
+       → 201 (auto-matched a backend that covers every bot's model)
+       → 409 (no enabled backend covers every model — payload lists candidates)
+       → 400 (malformed file, missing application.name, bad bots[i], unknown format_version)
+```
+
+### File schema (`format_version: 1`)
+
+```json
+{
+  "format": "miniclosed-app",
+  "format_version": 1,
+  "exported_at": "2026-06-25T...",
+  "application": {
+    "name": "GA Probate",
+    "description": "Intake triage + drafter for Georgia probate.",
+    "link": "https://example.com/ga-probate",
+    "avatar": "data:image/png;base64,..." | null
+  },
+  "bots": [
+    {
+      "title": "Triage",
+      "model": "qwen3:8b",
+      "system_prompt": "Classify the inbound message into one of...",
+      "params": {"temperature": 0.2, "max_tokens": 1024, "top_p": 0.9, "top_k": 40},
+      "sample_messages": []
+    },
+    {
+      "title": "Drafter",
+      "model": "qwen3:8b",
+      "system_prompt": "Draft a polite reply covering...",
+      "params": {"temperature": 0.6, "max_tokens": 2048, "top_p": 0.9, "top_k": 40},
+      "sample_messages": []
+    }
+  ]
+}
+```
+
+Each entry in `bots[]` is the **same shape** as the per-bot file's top-level `bot` block (minus the file-level envelope) — same backwards-compatibility guarantees, same forward-compat policy on unknown `params` keys, same exclusion of `backend_id` / API keys / DB ids. With `?include_history=true`, each bot's `sample_messages` carries that bot's `messages` column verbatim.
+
+### Import resolution (one backend for the whole app)
+
+```
+                ┌──────────────────────────────────────┐
+POST /import ─► │ Validate format + format_version ≤ 1 │
+                │ + application.name + bots is a list  │
+                │ + every bots[i] has model (string)   │
+                └──────────────┬───────────────────────┘
+                               │
+                  ┌────────────┴──────────────┐
+                  ▼                           ▼
+         backend_id given?            backend_id missing
+                  │                           │
+                  ▼                           ▼
+         Use it (validate           Collect the unique set of
+         it exists, 400              `bots[i].model` strings;
+         otherwise) — one             find the FIRST enabled
+         backend for every            backend whose model list
+         bot in the app               contains EVERY one.
+                  │                           │
+                  │              found? ──── no ──► 409 needs_backend
+                  │              yes                  (payload: models[],
+                  │                                    available_backends[].model_present)
+                  └─────────┬───────────────┘
+                            ▼
+                Insert NEW apps row (name suffixed
+                if it collides), then insert N NEW
+                conversation rows (titles suffixed
+                independently) — every row bound to
+                the chosen backend_id and linked to
+                the new app_id.
+                            ▼
+                201 { id, name, matched_backend_id,
+                      bot_ids: [...], warnings: [...] }
+```
+
+Important behaviours:
+
+1. **One backend for the whole app.** The 409 picker asks *one* question, not N. We deliberately skipped per-bot pickers — for a coherent application all bots usually run on the same backend, and forcing per-bot decisions adds clicks without adding power. If you genuinely need different backends per bot, import the app, then PATCH each bot's `backend_id` afterwards.
+2. **Auto-match requires FULL coverage.** A backend only auto-matches if its model list contains *every* unique model in `bots[]`. If you've got 5 bots needing `qwen3:8b` and one needing `llama3:70b`, and your local Ollama only has `qwen3:8b`, you get a 409. The picker payload carries `model_present` (boolean — does this backend have everything?) plus `matched_count`/`needed_count` so the UI can render "Backend X has 4/5 of the required models" hints.
+3. **Title collisions are independent.** The app's name collides only against `apps.name`; each bot's title collides only against `conversations.title`. Suffix scheme matches the bot import (`(2)`, `(3)`, …).
+4. **Validation is up-front.** Every bot in `bots[]` is validated *before* any DB write — a bad bot at index 7 fails the whole import with `bots[7]: Missing 'bot.model' (string)`. Half-committed apps are impossible.
+5. **Empty `bots[]` is rejected.** An app with zero bots gives the resolver nothing to match against; the importer rejects with 400.
+
+### GUI counterparts
+
+- **Export** — Applications page → per-app **Export** icon (or **Export** button on the app detail page). Default = config only. **Shift-click** to also include each bot's message history (bigger file).
+- **Import** — Applications page header → **Import** button → file picker. Auto-match → the new app opens. 409 → the shared backend-picker modal opens with title *"Import application — pick a backend for all bots"*.
+
+### Worked round-trip
+
+```bash
+# Instance A:
+curl -o ga_probate.miniclosed-app.json \
+  http://localhost:8095/api/apps/1/export
+
+# Carry the file to instance B.
+
+# Instance B, happy path (one backend serves every model):
+curl -X POST http://localhost:8095/api/apps/import \
+  -H "Content-Type: application/json" \
+  -d "{\"data\": $(cat ga_probate.miniclosed-app.json)}"
+# → 201 { "id": 5, "name": "GA Probate", "matched_backend_id": 1,
+#         "bot_ids": [42, 43, 44], "warnings": [] }
+
+# Instance B, no single backend covers every model:
+# → 409 { "needs_backend": true,
+#         "models": ["qwen3:8b", "llama3:70b"],
+#         "available_backends": [
+#           {"id": 1, "name": "Built-in Ollama", "model_present": false,
+#            "matched_count": 1, "needed_count": 2},
+#           {"id": 4, "name": "LM Studio", "model_present": false,
+#            "matched_count": 0, "needed_count": 2}
+#         ],
+#         "detail": "No enabled backend serves every model in this application..." }
+
+# Retry with explicit backend_id (every bot will run on it):
+curl -X POST http://localhost:8095/api/apps/import \
+  -H "Content-Type: application/json" \
+  -d "{\"data\": $(cat ga_probate.miniclosed-app.json), \"backend_id\": 4}"
+```
+
+### Security stance — same as the bot file
+
+No backend rows, no API keys, no DB ids, no upstream credentials. Sharable over Slack / email / git verbatim.
+
+---
+
 ## Self-upgrade
 
 Two surfaces for pulling the latest from GitHub: a CLI script (`upgrade.sh`) and a GUI button. The button is just a thin trigger over the script — the script is the source of truth, runs identically either way.
@@ -1923,6 +2268,122 @@ Subsequent ticks:  GET /api/logs?since_id=<max>     → only new entries
 
 ---
 
+## Benchmarking with miniclosedai-llm
+
+A focused workflow that this gateway supports first-class as of the
+`benchmark-methodology` branch: pair MiniClosedAI with **miniclosedai-llm**
+(a sibling vLLM control plane at `:8099`) to register CUDA-served models,
+benchmark them on a fixed test set with proper parallelism, and pick the
+best base before fine-tuning.
+
+The methodology — long-form in the repo's top-level instruction file — uses
+four endpoints. All four were added explicitly to make the harness a thin
+script instead of a workaround over the GUI's defaults:
+
+### 1. Auto-register a vLLM model — `POST /api/backends/auto-register`
+
+Replaces the manual "run `mc url <id>`, copy the base_url, open Settings,
+paste, save" loop. Body:
+
+```json
+{
+  "manager_url": "http://localhost:8099",
+  "model_id": "qwen3-vl-8b",
+  "name": "Qwen3-VL-8B (vLLM)",
+  "prefer_docker_host": false,
+  "api_key": null
+}
+```
+
+`prefer_docker_host=true` picks the manager's `alt_base_url` (the
+`host.docker.internal` flavour) — set it when this gateway runs in Docker
+on the same host. On success returns the new backend row plus
+`served_model` (use that as your bot's `model` field). Error map:
+
+| Status | Cause | Hint surfaced in detail |
+|---|---|---|
+| 502 | manager URL unreachable | "Is the manager running? `cd ~/Desktop/miniclosedai-llm && ./dev.sh up`" |
+| 404 | model_id not on the manager | response includes `available` (every known served-name) |
+| 422 | model exists but status != "running" | "Start it with `mc start <id>` (and `--wait` if you want to block until ready)" |
+
+### 2. Clone a bot per parallel worker — `POST /api/conversations/{id}/clone`
+
+Concurrent `/chat` calls on a single conversation race on the messages
+array — the gateway returns a 409 (see #3) to make that loud, but the
+*correct* answer is one conversation per worker. The clone route takes the
+source bot's `model`, `system_prompt`, `params`, and `backend_id`, with any
+field optionally overridable. Body:
+
+```json
+{
+  "title": "worker-0",
+  "params": {"temperature": 0.0}
+}
+```
+
+Returns `201 {"id": <new>, "title": <resolved>, "from_id": <source>}`.
+Cleanup is one DELETE.
+
+### 3. Nested-`params` form on conversation create + PATCH
+
+Historical footgun: `POST /api/conversations` accepted `temperature` at the
+top level only — passing it nested under `params` was silently ignored and
+0.7 was used instead. After the fix:
+
+- Both forms are accepted. `{"temperature": 0}` or `{"params": {"temperature": 0}}` — server-side they produce identical rows.
+- Mixing forms is OK when they agree: `{"temperature": 0, "params": {"temperature": 0}}` → 200.
+- Conflicting values raise 400 with `'<field>' was supplied both top-level (…) and under 'params' (…)`.
+- Unknown keys under `params` are stored verbatim (forward-compat for future params we don't have a top-level field for yet).
+
+### 4. In-flight 409 guard on chat endpoints
+
+A safety net for parallel API callers who forget to clone. When a previous
+generation is still streaming on a conversation, a second `persist + message`
+POST to `/chat` or `/chat/stream` returns `409 {code: "generation_in_flight"}`
+with the exact remediation in `message`: clone the bot.
+
+GUI behaviour is unchanged — the resume-on-refresh path uses the separate
+`GET /api/conversations/{id}/generation/stream` endpoint which is not guarded.
+API callers reconnecting via `POST /chat/stream` can opt in by passing
+`reattach: true` in the body, but the harness convention is to clone instead.
+
+### Python client (`clients/xbench_client.py`)
+
+Ships in the repo as a reference. ~20 lines of usage covers the whole
+methodology:
+
+```python
+from clients.xbench_client import XBenchClient
+
+mc = XBenchClient("https://192.168.0.110:8095", verify=False)
+backend = mc.auto_register_backend(
+    manager_url="http://localhost:8099", model_id="qwen3-vl-8b",
+)
+base = mc.create_conversation(
+    model=backend["served_model"], backend_id=backend["id"],
+    system_prompt="...", params={"temperature": 0.0},
+)
+with mc.clone(base["id"], title="worker-0") as worker:
+    reply = mc.chat(worker.id, message=document_text, persist=False)
+```
+
+The client raises `GenerationInFlight`, `ModelNotRunning`, and
+`ManagerUnreachable` as discrete exceptions so a harness can taxonomy
+errors cleanly. See `clients/example_parallel_extraction.py` for the
+4-worker fan-out shape.
+
+### What this gateway is NOT responsible for
+
+The full `xbench` toolkit (`xbench init` / `verify` / `bench` / `taxonomy` /
+`compare`) is a SEPARATE Python package — kept out of MiniClosedAI core by
+design. The four endpoints above are the only contact surface; everything
+else (rendering PDFs, LLM-assisted ground-truth verification, field-type-
+aware scoring, per-doc taxonomy) lives in the `xbench` repo. The
+methodology specifies which scoring strategy each field type uses; this
+gateway only serves model calls.
+
+---
+
 ## Database
 
 Single SQLite file `miniclosedai.db`, auto-created at startup. One table:
@@ -1988,7 +2449,7 @@ miniclosedai/
 ├── logs.py                    # In-memory ring buffer for the Logs page (chat req/resp records)
 ├── requirements.txt           # fastapi, uvicorn, httpx, pypdf, python-multipart
 ├── upgrade.sh                 # in-place upgrade with auto-rollback (CLI + GUI button trigger)
-├── test_e2e.py                # 39-test single-file suite, no pytest
+├── test_e2e.py                # 170-test single-file suite, no pytest
 ├── static/
 │   ├── index.html             # Single-page UI
 │   ├── style.css              # Dark-mode, responsive, no-cache headers served
@@ -2073,7 +2534,7 @@ Full end-to-end coverage lives in **`test_e2e.py`** at the repo root. Run:
 python test_e2e.py
 ```
 
-28 tests, ~1.5 seconds, no external dependencies (no pytest), no real Ollama or LM Studio required — upstream backends are simulated in-process via two tiny `http.server` instances. The test DB is a tempfile; your real `miniclosedai.db` is never touched. Exits 0 on all-pass, 1 on any failure.
+170 tests, ~16 seconds, no external dependencies (no pytest), no real Ollama or LM Studio required — upstream backends are simulated in-process via three tiny `http.server` instances (`FakeOllama`, `FakeOpenAI`, `FakeVoice`). The test DB is a tempfile; your real `miniclosedai.db` is never touched. Exits 0 on all-pass, 1 on any failure.
 
 For the full coverage matrix and hook-setup instructions, see **[README → Testing](./README.md#testing)**.
 
