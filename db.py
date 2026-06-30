@@ -39,21 +39,22 @@ def _no_ollama_mode() -> bool:
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    title        TEXT    NOT NULL DEFAULT 'New Chat',
-    model        TEXT    NOT NULL,
-    system_prompt TEXT   NOT NULL DEFAULT 'You are a helpful AI assistant.',
-    messages     TEXT    NOT NULL DEFAULT '[]',
-    params       TEXT    NOT NULL DEFAULT '{}',
-    backend_id   INTEGER NOT NULL DEFAULT 1,
-    created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    title         TEXT    NOT NULL DEFAULT 'New Chat',
+    model         TEXT    NOT NULL,
+    system_prompt TEXT    NOT NULL DEFAULT 'You are a helpful AI assistant.',
+    messages      TEXT    NOT NULL DEFAULT '[]',
+    params        TEXT    NOT NULL DEFAULT '{}',
+    backend_id    INTEGER NOT NULL DEFAULT 1,
+    voice_settings TEXT   NOT NULL DEFAULT '{}',
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS backends (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT    NOT NULL,
-    kind        TEXT    NOT NULL CHECK (kind IN ('ollama', 'openai')),
+    kind        TEXT    NOT NULL CHECK (kind IN ('ollama', 'openai', 'voice')),
     base_url    TEXT    NOT NULL,
     api_key     TEXT,
     headers     TEXT    NOT NULL DEFAULT '{}',
@@ -101,6 +102,22 @@ CREATE TABLE IF NOT EXISTS eval_cases (
 );
 
 CREATE INDEX IF NOT EXISTS idx_eval_cases_conv ON eval_cases(conversation_id);
+
+-- "Applications": a named group of bots that represents one app. A bot belongs
+-- to at most one application (logical FK `conversations.app_id → apps.id`, added
+-- via migration below). Deleting an application unlinks its bots (sets app_id
+-- NULL) rather than deleting them — see app.py's delete handler. `avatar` is a
+-- small base64 data URL (same convention as conversations.avatar); `link` is an
+-- optional URL pointing at the real application.
+CREATE TABLE IF NOT EXISTS apps (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    description TEXT    NOT NULL DEFAULT '',
+    link        TEXT    NOT NULL DEFAULT '',
+    avatar      TEXT,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -114,6 +131,52 @@ def get_conn() -> sqlite3.Connection:
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return any(r["name"] == column for r in rows)
+
+
+def _backend_kind_supports_voice(conn: sqlite3.Connection) -> bool:
+    """The current `backends` table's CHECK constraint includes 'voice'.
+
+    SQLite exposes the CREATE statement that established the constraint via
+    sqlite_master; if 'voice' is in there, the CHECK already accepts it.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='backends'"
+    ).fetchone()
+    return bool(row) and "'voice'" in (row["sql"] or "")
+
+
+def _migrate_backends_kind_to_include_voice(conn: sqlite3.Connection) -> None:
+    """Extend the `backends.kind` CHECK to include 'voice'.
+
+    SQLite can't `ALTER TABLE ... DROP CONSTRAINT` or rewrite a CHECK in place,
+    so the standard dance is: build a parallel table with the new CHECK, copy
+    rows over, drop the old, rename the new. Idempotent — if the new CHECK is
+    already present this is a no-op. No indexes / triggers exist on `backends`,
+    so there's nothing else to recreate.
+    """
+    if _backend_kind_supports_voice(conn):
+        return
+    conn.execute(
+        """CREATE TABLE backends_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT    NOT NULL,
+            kind        TEXT    NOT NULL CHECK (kind IN ('ollama', 'openai', 'voice')),
+            base_url    TEXT    NOT NULL,
+            api_key     TEXT,
+            headers     TEXT    NOT NULL DEFAULT '{}',
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            is_builtin  INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    conn.execute(
+        """INSERT INTO backends_new (id, name, kind, base_url, api_key, headers,
+                                     enabled, is_builtin, created_at)
+           SELECT id, name, kind, base_url, api_key, headers,
+                  enabled, is_builtin, created_at FROM backends"""
+    )
+    conn.execute("DROP TABLE backends")
+    conn.execute("ALTER TABLE backends_new RENAME TO backends")
 
 
 def init_db() -> None:
@@ -143,6 +206,32 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE conversations ADD COLUMN avatar TEXT"
             )
+
+        # Additive migration: a bot can belong to one "application" (a named
+        # group of bots). NULL = ungrouped (still shown in the flat Bots list).
+        # Logical FK → apps.id; cleanup on app delete unlinks (sets NULL) in
+        # app.py rather than cascading a delete of the bot.
+        if not _column_exists(conn, "conversations", "app_id"):
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN app_id INTEGER"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversations_app ON conversations(app_id)"
+        )
+
+        # Additive migration: per-bot voice prefs — which voice backend (a
+        # `kind='voice'` row in `backends`), which voice id, what language,
+        # whether to auto-play. Empty `{}` = use the global default (first
+        # enabled voice backend) and the backend's own default voice/language.
+        if not _column_exists(conn, "conversations", "voice_settings"):
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN voice_settings TEXT NOT NULL DEFAULT '{}'"
+            )
+
+        # Recreate-table migration: the `backends.kind` CHECK constraint must
+        # accept 'voice' so users can register the dockerized ASR + TTS service
+        # via Settings → Add endpoint, same flow as Ollama / OpenAI-compat.
+        _migrate_backends_kind_to_include_voice(conn)
 
         # Seed the built-in Ollama backend at id=1, but ONLY when the backends
         # table is completely empty. The looser `INSERT OR IGNORE` we used to
@@ -189,4 +278,6 @@ def row_to_dict(row: sqlite3.Row) -> dict:
         d["headers"] = json.loads(d["headers"] or "{}")
     if "mcp_servers" in d and isinstance(d["mcp_servers"], str):
         d["mcp_servers"] = json.loads(d["mcp_servers"] or "[]")
+    if "voice_settings" in d and isinstance(d["voice_settings"], str):
+        d["voice_settings"] = json.loads(d["voice_settings"] or "{}")
     return d

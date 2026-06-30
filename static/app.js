@@ -20,6 +20,10 @@ const els = {
   botsNewBtn: document.getElementById("bots-new-btn"),
   botsViewList: document.getElementById("bots-view-list"),
   botsViewGrid: document.getElementById("bots-view-grid"),
+  voicePicker: document.getElementById("voice-picker"),
+  voiceSelect: document.getElementById("voice-select"),
+  appsViewList: document.getElementById("apps-view-list"),
+  appsViewGrid: document.getElementById("apps-view-grid"),
   kbList: document.getElementById("kb-list"),
   kbEmpty: document.getElementById("kb-empty"),
   kbAddBtn: document.getElementById("kb-add-btn"),
@@ -83,6 +87,11 @@ const els = {
   input: document.getElementById("input"),
   sendBtn: document.getElementById("send-btn"),
   attachBtn: document.getElementById("attach-btn"),
+  micBtn: document.getElementById("mic-btn"),
+  voiceStopBtn: document.getElementById("voice-stop-btn"),
+  voicePreview: document.getElementById("voice-preview"),
+  callBtn: document.getElementById("call-btn"),
+  callStatus: document.getElementById("call-status"),
   attachInput: document.getElementById("attach-input"),
   attachmentList: document.getElementById("attachment-list"),
   attachmentWarning: document.getElementById("attachment-warning"),
@@ -135,6 +144,10 @@ const SMALL_MODEL_PREFIXES = [
 
 let state = {
   conversationId: null,
+  // Where to send the user when they leave the chat (back button / Esc). Set
+  // by enterChat() at the moment of entry, so opening a bot from inside an App
+  // returns to that App's detail view, not the global Bots page.
+  chatReturnTo: { page: "bots" },
   messages: [], // [{role, content, params?}]
   activeTab: "curl",       // "curl" | "python" | "js"
   activeMode: "stream",    // "stream" | "sync"
@@ -292,13 +305,28 @@ function syncParamDisplay() {
 // Debounced autosave of the current conversation's config.
 let saveTimer = null;
 
+function _buildVoiceSettingsPatch() {
+  // Only emit a voice_settings patch when the picker is actually present
+  // and visible — otherwise we'd overwrite an existing setting on every save.
+  if (!els.voiceSelect || !els.voicePicker || els.voicePicker.hidden) return undefined;
+  const opt = els.voiceSelect.selectedOptions[0];
+  const vid = (opt && opt.value) || "";
+  if (!vid) return {};   // "Default voice" → clear stored setting
+  const lang = opt.dataset.language || "";
+  const out = { voice_id: vid };
+  if (lang) out.language = lang;
+  return out;
+}
+
 function _buildConfigPatch() {
   const opt = els.modelSelect.selectedOptions[0];
   const backendId = opt && opt.dataset.backendId ? parseInt(opt.dataset.backendId, 10) : undefined;
+  const voice_settings = _buildVoiceSettingsPatch();
   return {
     ...getParams(),
     model: (opt && opt.value) || undefined,
     backend_id: Number.isFinite(backendId) ? backendId : undefined,
+    ...(voice_settings !== undefined ? { voice_settings } : {}),
     system_prompt: els.systemPrompt.value || undefined,
   };
 }
@@ -340,6 +368,9 @@ function bindParamDisplay() {
   els.think.addEventListener("change", () => { syncParamDisplay(); saveSettings(); scheduleSaveToConversation(); });
   els.systemPrompt.addEventListener("input", () => { saveSettings(); scheduleSaveToConversation(); });
   els.modelSelect.addEventListener("change", () => { saveSettings(); scheduleSaveToConversation(); });
+  if (els.voiceSelect) {
+    els.voiceSelect.addEventListener("change", () => { saveSettings(); scheduleSaveToConversation(); });
+  }
   els.resetParams.addEventListener("click", () => {
     els.temperature.value = DEFAULTS.temperature;
     els.maxTokens.value = DEFAULTS.max_tokens;
@@ -380,6 +411,129 @@ function _sortModels(models) {
     if (aRec !== bRec) return aRec ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
+}
+
+// =====================================================================
+// TTS voice picker. Strictly separate from the LLM model picker — voices
+// live on a different backend kind (`kind="voice"`) and are surfaced via
+// their own `/api/voices` endpoint. Hidden whenever no voice backend is
+// registered (mirrors the mic-button affordance rule). Persisted per-bot
+// in `voice_settings.voice_id` / `voice_settings.language`.
+// =====================================================================
+const _voicesState = {
+  cache: [],         // [{id, name, language, gender?}, ...]
+  byId: new Map(),   // id → {id, name, language, ...}
+  loaded: false,
+};
+
+async function loadVoices() {
+  if (!els.voicePicker || !els.voiceSelect) return;
+  try {
+    const r = await fetch("/api/voices");
+    if (!r.ok) {
+      // 404 (no voice backend) or 502 (registered but server unreachable).
+      // We just empty the cache here; VISIBILITY is decided separately by
+      // `_hasVoiceBackend()` against `backendCache`. So if a voice backend
+      // is registered but its server is down, the picker stays visible
+      // with only the "Default voice" placeholder — matches the mic and
+      // call buttons, which also stay visible in that case.
+      _voicesState.cache = [];
+      _voicesState.byId.clear();
+      _voicesState.loaded = true;
+      _renderVoicePicker();
+      return;
+    }
+    const j = await r.json();
+    _voicesState.cache = Array.isArray(j.voices) ? j.voices : [];
+    _voicesState.byId = new Map(_voicesState.cache.map(v => [v.id, v]));
+  } catch {
+    _voicesState.cache = [];
+    _voicesState.byId.clear();
+  }
+  _voicesState.loaded = true;
+  _renderVoicePicker();
+}
+
+// True when at least one enabled `kind='voice'` backend is registered. The
+// same predicate `_refreshMicAffordance()` uses to show the mic button, so
+// the three voice affordances (mic, call, TTS picker) stay perfectly in
+// sync: they all appear the instant a voice backend is registered in
+// Settings and vanish the instant it's removed/disabled. Read-only against
+// `backendCache` so there's no network round-trip — the visibility gate
+// updates immediately whenever `loadBackends()` runs.
+function _hasVoiceBackend() {
+  return (backendCache || []).some(b => b.kind === "voice" && b.enabled);
+}
+
+// Toggle just the picker's visibility based on the registered-voice-backend
+// predicate. Called from `loadBackends()` alongside the mic / call helpers,
+// so Settings edits propagate without waiting for a `/api/voices` round-trip.
+function _refreshVoicePickerAffordance() {
+  if (!els.voicePicker) return;
+  els.voicePicker.hidden = !_hasVoiceBackend();
+}
+
+function _renderVoicePicker() {
+  const sel = els.voiceSelect;
+  const wrap = els.voicePicker;
+  if (!sel || !wrap) return;
+  // Visibility tracks REGISTRATION (mirrors the mic button), NOT catalog
+  // availability. If the voice server is temporarily unreachable the picker
+  // still shows — populated only with the "Default voice" placeholder — so
+  // the UI doesn't flap when the voice backend flaps. TTS calls will 502
+  // at request time, same as the mic / call buttons.
+  const visible = _hasVoiceBackend();
+  wrap.hidden = !visible;
+  if (!visible) return;
+
+  // Preserve current selection across re-renders.
+  const prev = sel.value;
+  sel.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "Default voice";
+  sel.appendChild(placeholder);
+
+  // Group by language so the dropdown is browsable when there are many.
+  const byLang = new Map();
+  for (const v of _voicesState.cache) {
+    const lang = v.language || "?";
+    if (!byLang.has(lang)) byLang.set(lang, []);
+    byLang.get(lang).push(v);
+  }
+  // English first, then alphabetical.
+  const langs = [...byLang.keys()].sort((a, b) => {
+    if (a === "en") return -1;
+    if (b === "en") return 1;
+    return a.localeCompare(b);
+  });
+  for (const lang of langs) {
+    const grp = document.createElement("optgroup");
+    grp.label = lang.toUpperCase();
+    for (const v of byLang.get(lang)) {
+      const opt = document.createElement("option");
+      opt.value = v.id;
+      opt.dataset.language = v.language || "";
+      const gender = v.gender ? ` (${v.gender})` : "";
+      opt.textContent = `${v.name || v.id}${gender}`;
+      grp.appendChild(opt);
+    }
+    sel.appendChild(grp);
+  }
+  // Restore previous if still valid.
+  if (prev && _voicesState.byId.has(prev)) sel.value = prev;
+}
+
+function _setVoiceSelectFromConv(conv) {
+  if (!els.voiceSelect || !_voicesState.loaded) return;
+  const vs = (conv && conv.voice_settings) || {};
+  const vid = vs.voice_id || "";
+  // Only set if the option exists; otherwise fall back to "Default voice".
+  if (vid && _voicesState.byId.has(vid)) {
+    els.voiceSelect.value = vid;
+  } else {
+    els.voiceSelect.value = "";
+  }
 }
 
 async function loadModels() {
@@ -458,6 +612,9 @@ async function loadModels() {
     setStatus("ok", `${reachableCount}/${total} endpoint${total === 1 ? "" : "s"} reachable · ${totalModels} model${totalModels === 1 ? "" : "s"}`);
   }
   _rebuildModelPicker();
+  // Refresh the (separate) voice picker on the same trigger — backends were
+  // just reloaded, so the voice-backend rowset may have changed too.
+  loadVoices().catch(() => {});
   return backends;
 }
 
@@ -953,10 +1110,7 @@ function renderBotsPage() {
     actions.appendChild(delBtn);
     card.appendChild(actions);
 
-    const open = () => {
-      applyActivePage("dashboard");
-      openConversation(c.id);
-    };
+    const open = () => enterChat(c.id);
     card.addEventListener("click", open);
     card.addEventListener("keydown", e => {
       // Only the card itself navigates on Enter/Space. Without this guard a
@@ -1221,7 +1375,7 @@ function initBotsUI() {
     });
   }
   if (els.breadcrumbBack) {
-    els.breadcrumbBack.addEventListener("click", () => applyActivePage("bots"));
+    els.breadcrumbBack.addEventListener("click", () => exitChatToReturn());
   }
   if (els.breadcrumbCurrent) {
     els.breadcrumbCurrent.addEventListener("click", () => {
@@ -2140,7 +2294,7 @@ function _botsHotkeyHandler(e) {
     if (modalOpen) return;
     if (document.body.dataset.page === "dashboard") {
       e.preventDefault();
-      applyActivePage("bots");
+      exitChatToReturn();
     }
     return;
   }
@@ -2206,6 +2360,10 @@ async function openConversation(id) {
   // selection is cleared and the model dropdown shows no option — Send will
   // still attempt to call, and server will 404 on backend_load.
   if (c.model) _selectModelOption(c.model, c.backend_id);
+
+  // Restore this bot's TTS voice into the picker (no-op if no voice backend
+  // is registered — the picker is hidden in that case).
+  _setVoiceSelectFromConv(c);
 
   // Load saved per-conversation params into the sliders.
   const p = c.params || {};
@@ -2306,6 +2464,7 @@ function resetSidebarToDefaults() {
   els.topK.value        = DEFAULTS.top_k;
   els.think.value       = "";
   els.maxThinking.value = "";
+  if (els.voiceSelect) els.voiceSelect.value = "";  // "Default voice"
   syncParamDisplay();
   saveSettings();   // update localStorage; do NOT trigger scheduleSaveToConversation
                     // (the server already has these defaults from the just-created conv)
@@ -3159,6 +3318,1001 @@ async function _consumeAssistantStream({ fetchFn, assistantEl, body, model, para
   }
 }
 
+// =====================================================================
+// Push-to-talk (voice mode)
+// =====================================================================
+//
+// Hold the mic button, release to send. Audio is recorded via MediaRecorder
+// (browser default codec — usually webm/opus; the voice service auto-decodes
+// via PyAV), POSTed as multipart to /voice/turn, and the merged SSE stream
+// drives the same chat bubble + a Web-Audio playback queue.
+
+const _voice = {
+  rec: null,             // active MediaRecorder
+  chunks: [],            // collected blob parts for the current take
+  pressed: false,        // is the button currently held / toggled on?
+  abort: null,           // AbortController for the in-flight /voice/turn
+  audioCtx: null,        // shared AudioContext, created on first use
+  audioCursor: 0,        // currentTime to schedule the next chunk at
+  // Live-preview transcript (browser's SpeechRecognition while the user holds
+  // the mic). Cleared the moment the server returns the authoritative Whisper
+  // transcript, or on release if the API isn't available.
+  speechRec: null,       // active SpeechRecognition instance, or null
+  previewFinal: "",      // text the recognizer has marked `isFinal: true`
+  previewLatest: "",     // most recent text actually rendered in the chip
+                         // (final + current interim) — what the user SEES.
+                         // Critical for short utterances where Chrome never
+                         // finalizes anything before release.
+  // Active AudioBufferSourceNodes for the in-flight TTS. The stop button
+  // walks this list to .stop() each one, then aborts the SSE so the server
+  // doesn't keep sending audio chunks we don't want to play.
+  audioSources: [],
+  // True once the SSE response has finished. The stop button stays visible
+  // as long as either the stream is still active OR audio is still playing,
+  // so the user can interrupt at *any* point during the bot's reply.
+  streamEnded: false,
+  // Pre-created bubbles so the conversation feels instant on release. The
+  // user bubble uses the SpeechRecognition preview as a placeholder until the
+  // server's authoritative Whisper transcript replaces it.
+  pendingUserEl: null,
+  pendingUserMsg: null,
+  pendingAssistantEl: null,
+  pendingAssistantBody: null,
+  thinkingPill: null,
+};
+
+
+function _getAudioContext() {
+  // Lazy: browsers gate AudioContext creation behind a user gesture, which
+  // pressing the mic button counts as.
+  if (!_voice.audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    _voice.audioCtx = new Ctx();
+  }
+  return _voice.audioCtx;
+}
+
+
+// Hide the stop button only when (a) the SSE has finished AND (b) the audio
+// playback cursor has actually caught up to the AudioContext's current time
+// AND (c) no queued AudioBufferSourceNodes remain. If any of those are still
+// pending, we keep the button visible so the user can interrupt at any
+// moment, even after the SSE response has officially "ended."
+function _maybeHideVoiceStop() {
+  if (!els.voiceStopBtn) return;
+  if (!_voice.streamEnded) return;
+  if (_voice.audioSources.length > 0) return;
+  const ctx = _voice.audioCtx;
+  if (ctx && _voice.audioCursor > ctx.currentTime + 0.02) return;
+  els.voiceStopBtn.hidden = true;
+}
+
+
+// Decode + schedule one base64 PCM-16 chunk for seamless playback. The
+// voice-stop button was already made visible at the start of the turn (in
+// _consumeVoiceTurn) so we don't need to flip it here — audio playback is
+// just one of the things the same Stop button cancels.
+function _enqueueAudioChunk(b64, sampleRate) {
+  const ctx = _getAudioContext();
+  const binary = atob(b64);
+  // PCM 16-bit little-endian → Float32 in [-1, 1]
+  const len = binary.length / 2;
+  const pcm = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    const lo = binary.charCodeAt(i * 2);
+    const hi = binary.charCodeAt(i * 2 + 1);
+    let s = (hi << 8) | lo;
+    if (s >= 0x8000) s -= 0x10000;
+    pcm[i] = s / 0x8000;
+  }
+  const buffer = ctx.createBuffer(1, len, sampleRate);
+  buffer.getChannelData(0).set(pcm);
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
+  // Schedule on a sliding cursor so back-to-back chunks have no gap.
+  const startAt = Math.max(ctx.currentTime, _voice.audioCursor);
+  source.start(startAt);
+  _voice.audioCursor = startAt + buffer.duration;
+  // Track the source so a Stop click can interrupt it. Remove it on natural
+  // end so the list stays small.
+  _voice.audioSources.push(source);
+  source.onended = () => {
+    const i = _voice.audioSources.indexOf(source);
+    if (i >= 0) _voice.audioSources.splice(i, 1);
+    // If this was the last queued chunk AND the SSE has already finished,
+    // it's safe to take the stop button away now.
+    _maybeHideVoiceStop();
+  };
+}
+
+
+// Stop everything playing right now AND cancel the in-flight SSE so the
+// server doesn't keep producing audio we no longer want. The assistant's
+// text bubble (already rendered up to this point) stays in the chat —
+// only the spoken half is interrupted.
+function _stopVoicePlayback() {
+  // 1. Silence the queued buffers. Each call is idempotent so duplicate
+  //    stops on a source we already paused are harmless.
+  for (const s of _voice.audioSources.splice(0)) {
+    try { s.stop(); } catch (_) { /* already stopped */ }
+    try { s.disconnect(); } catch (_) {}
+  }
+  // 2. Cursor reset — next chunk (in a future turn) plays immediately.
+  if (_voice.audioCtx) _voice.audioCursor = _voice.audioCtx.currentTime;
+  // 3. Abort the SSE so the server's TTS pipeline stops emitting chunks.
+  if (_voice.abort) {
+    try { _voice.abort.abort(); } catch (_) {}
+  }
+  if (els.voiceStopBtn) els.voiceStopBtn.hidden = true;
+}
+
+
+// --- Live transcription preview ---------------------------------------
+//
+// While the user is holding the mic, the browser's built-in SpeechRecognition
+// API gives instant partial transcripts (sub-100ms) so they see their words
+// appear as they speak. The final word is whatever server-side Whisper says —
+// the preview gets cleared the moment the real transcript arrives.
+//
+// Chrome / Edge / Safari support this. Firefox doesn't — fail silently and
+// fall back to "release first, then see the transcript" behavior.
+
+function _hasSpeechRecognition() {
+  return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
+
+function _setVoicePreview(text) {
+  if (!els.voicePreview) return;
+  const t = (text || "").trim();
+  if (!t) {
+    els.voicePreview.hidden = true;
+    els.voicePreview.textContent = "";
+    return;
+  }
+  els.voicePreview.hidden = false;
+  els.voicePreview.textContent = t;
+}
+
+
+function _startSpeechPreview() {
+  if (!_hasSpeechRecognition()) return;
+  const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const rec = new Ctor();
+  rec.continuous = true;
+  rec.interimResults = true;
+  // No `lang` set ⇒ user's browser locale. Most natural default.
+  _voice.previewFinal = "";
+  _voice.previewLatest = "";
+  rec.addEventListener("result", e => {
+    // Late-firing safeguard: Chrome may fire one more `result` event after
+    // we already called .stop() while it flushes trailing audio. By that
+    // point _stopSpeechPreview has nulled the active reference, so we drop
+    // anything for a recognizer we no longer own — otherwise it would
+    // re-paint the chip after we already cleared it on release.
+    if (_voice.speechRec !== rec) return;
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) {
+        _voice.previewFinal += r[0].transcript;
+      } else {
+        interim += r[0].transcript;
+      }
+    }
+    const combined = _voice.previewFinal + interim;
+    _voice.previewLatest = combined;
+    _setVoicePreview(combined);
+  });
+  rec.addEventListener("error", () => { /* swallow — preview is best-effort */ });
+  rec.addEventListener("end", () => {
+    // If we're still recording, the recognizer auto-stopped (it does that
+    // after a few seconds of silence). Restart it.
+    if (_voice.pressed) {
+      try { rec.start(); } catch (_) {}
+    }
+  });
+  try { rec.start(); } catch (_) { return; }
+  _voice.speechRec = rec;
+}
+
+
+function _stopSpeechPreview({clearChip = false} = {}) {
+  if (_voice.speechRec) {
+    try {
+      // Detach the end handler so it doesn't auto-restart after we asked
+      // it to stop.
+      _voice.speechRec.onend = null;
+      _voice.speechRec.stop();
+    } catch (_) {}
+    _voice.speechRec = null;
+  }
+  if (clearChip) _setVoicePreview("");
+}
+
+
+async function _startRecording() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    // The microphone API is gated behind a "secure context": browsers expose
+    // it only on https:// or http://localhost / 127.0.0.1, never on a plain-
+    // HTTP LAN IP. Spell that out so the user knows what to fix.
+    const isSecure = window.isSecureContext;
+    const origin = location.origin;
+    const msg = isSecure
+      ? `Your browser does not expose a microphone API. Origin: ${origin}.`
+      : `Microphone access requires a secure context (https:// or localhost). ` +
+        `You're on ${origin}, which the browser treats as insecure. Options: ` +
+        `(1) reach MiniClosedAI via http://localhost:8095 from the same machine, ` +
+        `(2) put MiniClosedAI behind HTTPS, or ` +
+        `(3) Chrome flag: chrome://flags/#unsafely-treat-insecure-origin-as-secure → add ${origin} → relaunch.`;
+    alert(msg);
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio: true});
+  } catch (e) {
+    alert(`Could not access the microphone: ${e.message}`); return;
+  }
+  _voice.chunks = [];
+  // Default codec — Chrome gives webm/opus, Firefox ogg/opus, Safari mp4.
+  // The voice service decodes any of them via PyAV.
+  const rec = new MediaRecorder(stream);
+  rec.addEventListener("dataavailable", e => {
+    if (e.data && e.data.size > 0) _voice.chunks.push(e.data);
+  });
+  rec.addEventListener("stop", () => {
+    stream.getTracks().forEach(t => t.stop());
+  });
+  rec.start();
+  _voice.rec = rec;
+  els.micBtn?.classList.add("recording");
+  // Live preview is best-effort — if the browser doesn't have
+  // SpeechRecognition (Firefox), we just skip it and the user sees the
+  // transcript when the server returns.
+  _startSpeechPreview();
+}
+
+
+async function _stopRecordingAndSend() {
+  const rec = _voice.rec;
+  if (!rec || rec.state === "inactive") return;
+  // Stop the preview recognizer so it releases the mic.
+  _stopSpeechPreview();
+  // The instant the user releases, render the conversation bubbles. The user
+  // bubble uses the SpeechRecognition transcript (which is the same text
+  // they've been watching appear in the preview chip). The assistant bubble
+  // gets a "thinking" pill that flips to "Searching knowledge" / "Thinking"
+  // as the server emits {status} events before the first {chunk}.
+  //
+  // Prefer `previewLatest` (final + interim — what was on screen) over
+  // `previewFinal` (only the finalized parts). Otherwise short utterances
+  // that the recognizer never had time to mark final would silently fall
+  // back to the slow server-Whisper path.
+  const previewText = (_voice.previewLatest || _voice.previewFinal || "").trim();
+  _setVoicePreview("");
+  els.voicePreview?.classList.remove("sending");
+  const userMsg = {role: "user", content: previewText || "…"};
+  _voice.pendingUserMsg = userMsg;
+  state.messages.push(userMsg);
+  _voice.pendingUserEl = renderMessage(userMsg);
+  if (!previewText) _voice.pendingUserEl?.classList.add("voice-pending");
+  const assistantEl = renderMessage({role: "assistant", content: ""});
+  assistantEl.classList.add("cursor");
+  _voice.pendingAssistantEl = assistantEl;
+  _voice.pendingAssistantBody = assistantEl.querySelector(".msg-body");
+  const pill = document.createElement("div");
+  pill.className = "voice-thinking-pill";
+  // If we already have the transcript (browser recognition), the next step is
+  // straight to the LLM — no transcription happening on the server.
+  pill.textContent = previewText ? "💭 Thinking…" : "🎙 Transcribing…";
+  _voice.pendingAssistantBody.innerHTML = "";
+  _voice.pendingAssistantBody.appendChild(pill);
+  _voice.thinkingPill = pill;
+  scrollToBottom();
+  // Wait for MediaRecorder's stop event so the audio buffer is finalized.
+  // (We don't always upload it — see below — but stopping releases the mic.)
+  await new Promise(res => {
+    rec.addEventListener("stop", res, {once: true});
+    rec.stop();
+  });
+  els.micBtn?.classList.remove("recording");
+  els.micBtn?.classList.add("busy");
+  const blob = new Blob(_voice.chunks, {type: rec.mimeType || "audio/webm"});
+  _voice.rec = null;
+  if (!state.conversationId) {
+    await newConversation();
+    if (!state.conversationId) { els.micBtn?.classList.remove("busy"); return; }
+  }
+
+  // Decision: fast-path or fallback?
+  //   • Browser already has the transcript → POST text to /voice/say
+  //     (no Whisper, no audio upload — saves ~500ms–2s per turn).
+  //   • Browser had nothing (Firefox, mic permission issue, very quiet) →
+  //     POST the audio blob to /voice/turn so server Whisper can recover it.
+  if (previewText) {
+    await _consumeVoiceSay(previewText);
+  } else {
+    const filename = (blob.type || "").includes("webm") ? "voice.webm"
+                    : (blob.type || "").includes("ogg") ? "voice.ogg"
+                    : (blob.type || "").includes("mp4") ? "voice.mp4"
+                    : "voice.wav";
+    await _consumeVoiceTurn(blob, filename);
+  }
+  els.micBtn?.classList.remove("busy");
+}
+
+
+// Fast push-to-talk path: hand the LLM the browser's transcript verbatim, get
+// the merged SSE back (LLM chunks + TTS audio). Same event shape as
+// _consumeVoiceTurn so the UI handlers are identical — just a different URL
+// and a JSON body instead of multipart audio.
+async function _consumeVoiceSay(text) {
+  const convId = state.conversationId;
+  let assistantEl = _voice.pendingAssistantEl;
+  let body = _voice.pendingAssistantBody;
+  let contentEl = null;
+  let assistantText = "";
+  _voice.audioCursor = 0;
+  _voice.streamEnded = false;
+  const ac = new AbortController();
+  _voice.abort = ac;
+  if (els.voiceStopBtn) els.voiceStopBtn.hidden = false;
+  try {
+    const res = await fetch(`/api/conversations/${convId}/voice/say`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      signal: ac.signal,
+      body: JSON.stringify({text}),
+    });
+    if (!res.ok || !res.body) {
+      throw new Error(await res.text().catch(() => `HTTP ${res.status}`));
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream: true});
+      const parts = buf.split("\n\n");
+      buf = parts.pop() || "";
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data:")) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (ev.transcript != null) {
+          // The server echoed our transcript back — undim the user bubble
+          // (it was already rendered with the right text on release).
+          if (_voice.pendingUserEl) {
+            _voice.pendingUserEl.classList.remove("voice-pending");
+          }
+          _voice.pendingUserMsg = null;
+          _voice.pendingUserEl = null;
+        } else if (ev.status) {
+          if (_voice.thinkingPill) {
+            const labels = {
+              "transcribing":        "🎙 Transcribing…",
+              "searching_knowledge": "📚 Searching knowledge…",
+              "thinking":            "💭 Thinking…",
+            };
+            _voice.thinkingPill.textContent = labels[ev.status] || `· ${ev.status}…`;
+          }
+        } else if (ev.error) {
+          assistantText += `\n\n**Error:** ${ev.error}`;
+          if (assistantEl && body) {
+            if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
+            contentEl.innerHTML = render(assistantText);
+          } else {
+            alert(`Voice turn failed: ${ev.error}`);
+          }
+        } else if (ev.chunk != null && body) {
+          if (_voice.thinkingPill) {
+            _voice.thinkingPill.remove();
+            _voice.thinkingPill = null;
+          }
+          assistantText += ev.chunk;
+          if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
+          contentEl.innerHTML = render(assistantText);
+          scrollToBottom();
+        } else if (ev.audio_chunk_b64) {
+          _enqueueAudioChunk(ev.audio_chunk_b64, ev.sample_rate || 22050);
+        } else if (ev.end) {
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      alert(`Voice turn failed: ${e.message}`);
+    }
+  } finally {
+    _voice.abort = null;
+    // Mark the SSE done — the stop button stays visible until the audio
+    // queue actually drains. _enqueueAudioChunk's onended handler calls
+    // _maybeHideVoiceStop() each time a buffer source finishes.
+    _voice.streamEnded = true;
+    _maybeHideVoiceStop();
+    els.voicePreview?.classList.remove("sending");
+    _setVoicePreview("");
+    _voice.pendingUserEl = null;
+    _voice.pendingUserMsg = null;
+    _voice.pendingAssistantEl = null;
+    _voice.pendingAssistantBody = null;
+    if (_voice.thinkingPill) {
+      _voice.thinkingPill.remove();
+      _voice.thinkingPill = null;
+    }
+    if (assistantEl) {
+      assistantEl.classList.remove("cursor");
+      if (contentEl) { contentEl.innerHTML = render(assistantText); highlightCodeBlocks(contentEl); }
+      state.messages.push({role: "assistant", content: assistantText});
+      loadConversations();
+    }
+  }
+}
+
+
+// Render the merged SSE from /voice/turn — three event kinds:
+//   {transcript}        → render a user message bubble with that text
+//   {chunk}             → assistant text token (one chat bubble streams in)
+//   {audio_chunk_b64}   → push into the Web Audio playback queue
+async function _consumeVoiceTurn(blob, filename) {
+  const convId = state.conversationId;
+  // Reuse the bubbles _stopRecordingAndSend already rendered so the
+  // conversation feels instant. Fall back to creating them lazily for
+  // legacy callers (none right now).
+  let assistantEl = _voice.pendingAssistantEl;
+  let body = _voice.pendingAssistantBody;
+  let contentEl = null;
+  let assistantText = "";
+  _voice.audioCursor = 0;
+  _voice.streamEnded = false;
+  const ac = new AbortController();
+  _voice.abort = ac;
+  // Show the stop button up front — the user might want to cancel during
+  // ASR or LLM streaming, not just TTS playback. _stopVoicePlayback() calls
+  // ac.abort() which propagates through the fetch below.
+  if (els.voiceStopBtn) els.voiceStopBtn.hidden = false;
+  try {
+    const fd = new FormData();
+    fd.append("audio", blob, filename);
+    const res = await fetch(`/api/conversations/${convId}/voice/turn`, {
+      method: "POST", body: fd, signal: ac.signal,
+    });
+    if (!res.ok || !res.body) {
+      throw new Error(await res.text().catch(() => `HTTP ${res.status}`));
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream: true});
+      const parts = buf.split("\n\n");
+      buf = parts.pop() || "";
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data:")) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (ev.transcript != null) {
+          // Authoritative Whisper transcript arrived — replace whatever the
+          // browser's SpeechRecognition put in the user bubble.
+          const text = ev.transcript || "";
+          if (_voice.pendingUserMsg) {
+            _voice.pendingUserMsg.content = text;
+            if (_voice.pendingUserEl) {
+              _voice.pendingUserEl.classList.remove("voice-pending");
+              const ub = _voice.pendingUserEl.querySelector(".msg-body");
+              if (ub) ub.textContent = text;
+            }
+            _voice.pendingUserMsg = null;
+            _voice.pendingUserEl = null;
+          } else {
+            const userMsg = {role: "user", content: text};
+            state.messages.push(userMsg);
+            renderMessage(userMsg);
+          }
+          // Assistant bubble was pre-created with a "Transcribing…" pill.
+          // The transcript arriving means transcription is *done* — so move
+          // the pill to "Thinking" right now rather than waiting for the
+          // server's next {status} event. If the server later upgrades to
+          // {status: "searching_knowledge"}, that overrides this.
+          if (_voice.thinkingPill) {
+            _voice.thinkingPill.textContent = "💭 Thinking…";
+          }
+          scrollToBottom();
+        } else if (ev.status) {
+          if (_voice.thinkingPill) {
+            const labels = {
+              "transcribing":        "🎙 Transcribing…",
+              "searching_knowledge": "📚 Searching knowledge…",
+              "thinking":            "💭 Thinking…",
+            };
+            _voice.thinkingPill.textContent = labels[ev.status] || `· ${ev.status}…`;
+          }
+        } else if (ev.error) {
+          assistantText += `\n\n**Error:** ${ev.error}`;
+          if (assistantEl && body) {
+            if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
+            contentEl.innerHTML = render(assistantText);
+          } else {
+            alert(`Voice turn failed: ${ev.error}`);
+          }
+        } else if (ev.chunk != null && body) {
+          // First text chunk replaces the thinking pill with real content.
+          if (_voice.thinkingPill) {
+            _voice.thinkingPill.remove();
+            _voice.thinkingPill = null;
+          }
+          assistantText += ev.chunk;
+          if (!contentEl) { body.innerHTML = ""; contentEl = document.createElement("div"); body.appendChild(contentEl); }
+          contentEl.innerHTML = render(assistantText);
+          scrollToBottom();
+        } else if (ev.audio_chunk_b64) {
+          _enqueueAudioChunk(ev.audio_chunk_b64, ev.sample_rate || 22050);
+        } else if (ev.end) {
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      alert(`Voice turn failed: ${e.message}`);
+    }
+  } finally {
+    _voice.abort = null;
+    // SSE done — but audio playback may still be in flight. The stop button
+    // stays visible until the audio queue drains (see _maybeHideVoiceStop).
+    _voice.streamEnded = true;
+    _maybeHideVoiceStop();
+    els.voicePreview?.classList.remove("sending");
+    _setVoicePreview("");
+    // Clean up the pre-created refs — release ended, the bubbles are now
+    // either populated (assistantText present) or empty (turn cancelled).
+    _voice.pendingUserEl = null;
+    _voice.pendingUserMsg = null;
+    _voice.pendingAssistantEl = null;
+    _voice.pendingAssistantBody = null;
+    if (_voice.thinkingPill) {
+      _voice.thinkingPill.remove();
+      _voice.thinkingPill = null;
+    }
+    if (assistantEl) {
+      assistantEl.classList.remove("cursor");
+      if (contentEl) { contentEl.innerHTML = render(assistantText); highlightCodeBlocks(contentEl); }
+      // Stash the assistant message so a re-render keeps it.
+      state.messages.push({role: "assistant", content: assistantText});
+      loadConversations();   // refresh sidebar list + Bots-page card freshness
+    }
+  }
+}
+
+
+function initMicButton() {
+  // Wire the stop-audio button regardless of whether mic-btn is in the DOM —
+  // it stops playback for both push-to-talk and (future) call-mode audio.
+  if (els.voiceStopBtn) {
+    els.voiceStopBtn.addEventListener("click", e => {
+      e.preventDefault();
+      _stopVoicePlayback();
+    });
+  }
+  const btn = els.micBtn;
+  if (!btn) return;
+  // Press-and-hold gestures. Also tolerate click (toggle) for accessibility.
+  const onPress = e => {
+    if (btn.hidden || btn.disabled) return;
+    e.preventDefault();
+    if (_voice.pressed) return;   // already capturing
+    _voice.pressed = true;
+    _startRecording();
+  };
+  const onRelease = e => {
+    if (!_voice.pressed) return;
+    e?.preventDefault?.();
+    _voice.pressed = false;
+    _stopRecordingAndSend();
+  };
+  btn.addEventListener("mousedown", onPress);
+  btn.addEventListener("touchstart", onPress, {passive: false});
+  // Releasing anywhere counts — user may slide off the button.
+  document.addEventListener("mouseup", onRelease);
+  document.addEventListener("touchend", onRelease);
+  document.addEventListener("touchcancel", onRelease);
+  // Keyboard accessibility: Space toggles.
+  btn.addEventListener("keydown", e => {
+    if (e.key === " " || e.key === "Enter") {
+      e.preventDefault();
+      _voice.pressed ? onRelease() : onPress(e);
+    }
+  });
+}
+
+
+// =====================================================================
+// Call mode (continuous duplex audio over WebRTC)
+// =====================================================================
+//
+// Click 📞 → handshake with the voice service's FastRTC stream; the browser
+// pipes mic audio to it, plays its reply audio inline, and renders transcript
+// + assistant tokens as they arrive on the WebRTC DataChannel. Click again to
+// hang up. Interrupt-able mid-reply (FastRTC's ReplyOnPause handles barge-in
+// server-side; on our side, a fresh `{transcript}` event finalizes the
+// previous assistant bubble and opens a new one).
+
+const _call = {
+  pc: null,                // RTCPeerConnection
+  audioEl: null,           // <audio> playing the remote stream
+  events: null,            // EventSource — SSE stream of {transcript}/{chunk}/{end}
+  webrtcId: null,          // server-side session id we issued for this call
+  micStream: null,         // MediaStream from getUserMedia
+  state: "idle",           // idle | dialing | talking | hanging-up
+  // Current in-progress assistant bubble being streamed:
+  assistantEl: null,
+  assistantBody: null,
+  assistantContentEl: null,
+  assistantText: "",       // full text received so far (target)
+  assistantRendered: 0,    // characters actually painted into the DOM
+  renderRaf: 0,            // requestAnimationFrame handle (0 = not pumping)
+};
+
+
+// Cloud LLMs (deepseek, openai, etc.) batch multiple tokens per HTTP frame —
+// the SSE stream arrives in bursts: 5-10 chunks in a tight ms-scale window,
+// then 100-300ms of nothing, repeat. Re-rendering the bubble on every chunk
+// reproduces that rhythm visually as smooth-then-pause-then-smooth.
+//
+// This typewriter pump decouples the DOM update rate from the network arrival
+// rate. _call.assistantText is the "target" (everything we've received).
+// _call.assistantRendered is what's currently painted. A requestAnimationFrame
+// loop drips characters from one to the other; bursts queue, gaps drain.
+//
+// CATCH_UP_RATIO tunes how aggressively we catch up when we fall behind:
+// 1/12 means we'll paint roughly 1/12 of the gap each frame (~60fps), which
+// drains a 50-char burst in about 0.5s — fast enough to feel responsive,
+// slow enough that the burst doesn't visibly re-create the stutter.
+const _CALL_RENDER_CHARS_MIN  = 1;   // always paint at least 1 char/frame while pumping
+const _CALL_RENDER_CHARS_MAX  = 8;   // cap so we don't burst the whole queue in one frame
+const _CALL_RENDER_CATCH_UP   = 12;  // gap fraction painted per frame
+
+
+function _pumpCallTypewriter() {
+  _call.renderRaf = 0;
+  if (!_call.assistantContentEl) return;
+  const target = _call.assistantText.length;
+  const current = _call.assistantRendered;
+  if (current >= target) return;
+  const gap = target - current;
+  // The further behind we are, the larger the step — keeps text smooth
+  // during a slow stream while still draining big bursts in a half-second.
+  const step = Math.min(
+    _CALL_RENDER_CHARS_MAX,
+    Math.max(_CALL_RENDER_CHARS_MIN, Math.ceil(gap / _CALL_RENDER_CATCH_UP)),
+  );
+  _call.assistantRendered = current + step;
+  _call.assistantContentEl.innerHTML = render(
+    _call.assistantText.slice(0, _call.assistantRendered),
+  );
+  scrollToBottom();
+  if (_call.assistantRendered < _call.assistantText.length) {
+    _call.renderRaf = requestAnimationFrame(_pumpCallTypewriter);
+  }
+}
+
+
+function _finalizeCallAssistantBubble() {
+  if (!_call.assistantEl) return;
+  // Cancel any in-flight typewriter pump and flush the final text in one
+  // shot — the turn is over, no reason to keep dripping characters when
+  // the bubble is being finalized (the user might re-open the chat right
+  // after hanging up and we want the full reply there immediately).
+  if (_call.renderRaf) {
+    cancelAnimationFrame(_call.renderRaf);
+    _call.renderRaf = 0;
+  }
+  _call.assistantEl.classList.remove("cursor");
+  if (_call.assistantContentEl) {
+    _call.assistantContentEl.innerHTML = render(_call.assistantText);
+    highlightCodeBlocks(_call.assistantContentEl);
+  }
+  if (_call.assistantText.trim()) {
+    state.messages.push({role: "assistant", content: _call.assistantText});
+    const finalIndex = state.messages.length - 1;
+    _call.assistantEl.dataset.index = String(finalIndex);
+    _appendEditButton(_call.assistantEl, finalIndex);
+  } else {
+    // Empty bubble — never got any chunks. Remove it.
+    _call.assistantEl.remove();
+  }
+  _call.assistantEl = null;
+  _call.assistantBody = null;
+  _call.assistantContentEl = null;
+  _call.assistantText = "";
+  _call.assistantRendered = 0;
+}
+
+
+// Per-stage status labels with emoji prefixes — server emits the raw stage,
+// browser maps to the user-facing string. `null` hides the pill.
+const _CALL_STATUS_LABELS = {
+  connecting:   "🔌 Connecting…",
+  listening:    "🎙 Listening…",
+  transcribing: "✍ Transcribing…",
+  thinking:     "💭 Thinking…",
+  speaking:     "🔊 Speaking…",
+};
+
+
+function _setCallStatus(stage) {
+  if (!els.callStatus) return;
+  const label = stage ? (_CALL_STATUS_LABELS[stage] || stage) : "";
+  if (!label) {
+    els.callStatus.hidden = true;
+    els.callStatus.textContent = "";
+    return;
+  }
+  els.callStatus.hidden = false;
+  els.callStatus.textContent = label;
+}
+
+
+function _onCallDataEvent(ev) {
+  if (ev.error) {
+    // Don't tear down the whole call on a single-sentence TTS hiccup — just
+    // surface the error. The server keeps streaming the next sentence.
+    console.warn("voice service event error:", ev.error);
+  }
+  if (ev.status) {
+    _setCallStatus(ev.status);
+  }
+  if (ev.transcript != null) {
+    // Finalize any previous (possibly interrupted) assistant bubble before
+    // starting the new turn.
+    _finalizeCallAssistantBubble();
+    const userMsg = {role: "user", content: ev.transcript};
+    state.messages.push(userMsg);
+    renderMessage(userMsg);
+    _call.assistantEl = renderMessage({role: "assistant", content: ""});
+    _call.assistantBody = _call.assistantEl.querySelector(".msg-body");
+    _call.assistantEl.classList.add("cursor");
+    _call.assistantText = "";
+    scrollToBottom();
+    return;
+  }
+  if (ev.chunk != null && _call.assistantEl) {
+    // Append to the "target" text but DON'T re-render the bubble here.
+    // The requestAnimationFrame typewriter pump (above) renders at a steady
+    // ~60fps cadence regardless of how bursty the upstream is, so a 10-token
+    // batch arriving in 1ms is dripped into the DOM as 10 frames instead of
+    // a single jarring repaint followed by a 200ms gap.
+    _call.assistantText += ev.chunk;
+    if (!_call.assistantContentEl) {
+      _call.assistantBody.innerHTML = "";
+      _call.assistantContentEl = document.createElement("div");
+      _call.assistantBody.appendChild(_call.assistantContentEl);
+    }
+    if (!_call.renderRaf) {
+      _call.renderRaf = requestAnimationFrame(_pumpCallTypewriter);
+    }
+    return;
+  }
+  if (ev.end) {
+    _finalizeCallAssistantBubble();
+    loadConversations();   // keep the sidebar list fresh
+    return;
+  }
+}
+
+
+async function _startCall() {
+  if (_call.state !== "idle") return;
+  _call.state = "dialing";
+  els.callBtn.classList.add("calling");
+  // Show "Connecting…" until the WebRTC peer connection actually establishes
+  // and the voice server is ready to receive audio. Once the connectionstate
+  // listener (below) flips to "connected", we switch the pill to "Listening".
+  // Otherwise the UI says "Listening" while the call is still in the multi-
+  // second WebRTC handshake / model-warmup window — misleading the user
+  // into talking before the pipeline can hear them.
+  _setCallStatus("connecting");
+
+  const voiceBackend = (backendCache || []).find(b => b.kind === "voice" && b.enabled);
+  if (!voiceBackend) {
+    _endCall();
+    alert("No voice backend configured. Add one in Settings → + Add endpoint (kind=Voice).");
+    return;
+  }
+
+  if (!state.conversationId) {
+    await newConversation();
+    if (!state.conversationId) { _endCall(); return; }
+  }
+
+  // Read the bot's voice prefs (if any) from the persisted conv. The server
+  // proxy will fill in defaults from /voices if these are empty.
+  let convVoice = "", convLang = "en";
+  try {
+    const conv = await fetch(`/api/conversations/${state.conversationId}`).then(r => r.json());
+    const vs = (conv && conv.voice_settings) || {};
+    convVoice = vs.voice_id || "";
+    convLang = vs.language || "en";
+  } catch (_) {}
+
+  // All three signaling calls go through MiniClosedAI (same origin = HTTPS).
+  // This avoids the "Mixed Content" block browsers slap on HTTP fetches from
+  // an HTTPS page. The audio stream itself flows direct browser ↔ voice
+  // container via WebRTC's UDP transport (not subject to mixed-content
+  // policy) once the SDP exchange is done.
+  const callBase = `/api/conversations/${state.conversationId}/call`;
+
+  // 1. Tell the voice service which bot is being called. The server proxy
+  //    fills in conv_id and the miniclosedai_url itself — the browser only
+  //    sends voice/language preferences.
+  try {
+    const r = await fetch(`${callBase}/configure`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        voice: convVoice || null,
+        language: convLang,
+      }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text().catch(() => "")}`);
+  } catch (e) {
+    _endCall();
+    alert(`Could not configure the call: ${e.message}`);
+    return;
+  }
+
+  // 2. Grab the microphone.
+  try {
+    _call.micStream = await navigator.mediaDevices.getUserMedia({audio: true});
+  } catch (e) {
+    _endCall();
+    alert(`Microphone access failed: ${e.message}`);
+    return;
+  }
+
+  // 3. Build the peer connection + audio element + DataChannel.
+  _call.pc = new RTCPeerConnection({
+    iceServers: [{urls: "stun:stun.l.google.com:19302"}],
+  });
+  _call.micStream.getAudioTracks().forEach(t => _call.pc.addTrack(t, _call.micStream));
+
+  // FastRTC's AudioCallback gates the entire input pump on a DataChannel
+  // being ready (see wait_for_channel() in fastrtc/tracks.py) — without one
+  // in the offer SDP, RTP audio arrives at aiortc but is never drained into
+  // the VAD, and the handler never fires. The channel itself stays unused on
+  // our side; events ride the SSE stream below.
+  _call.dc = _call.pc.createDataChannel("text");
+
+  _call.audioEl = document.createElement("audio");
+  _call.audioEl.autoplay = true;
+  _call.audioEl.playsInline = true;
+  _call.audioEl.style.display = "none";
+  document.body.appendChild(_call.audioEl);
+  _call.pc.addEventListener("track", e => {
+    if (e.streams && e.streams[0]) _call.audioEl.srcObject = e.streams[0];
+  });
+
+  _call.pc.addEventListener("connectionstatechange", () => {
+    const s = _call.pc?.connectionState;
+    if (s === "connected") {
+      _call.state = "talking";
+      // Audio is now actually flowing — flip the pill from "Connecting…"
+      // to "Listening" so the user knows it's safe to speak. The server
+      // will overwrite this with transcribing / thinking / speaking as
+      // each pipeline stage takes over.
+      _setCallStatus("listening");
+    } else if (s === "failed" || s === "disconnected" || s === "closed") {
+      if (_call.state !== "hanging-up" && _call.state !== "idle") _endCall();
+    }
+  });
+
+  // 4. SDP offer/answer with the voice service. FastRTC keys its per-session
+  //    state on a client-supplied webrtc_id, so we generate one here and reuse
+  //    it for the lifetime of this call.
+  const webrtcId = (crypto.randomUUID && crypto.randomUUID())
+    || `call-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  _call.webrtcId = webrtcId;
+  try {
+    await _call.pc.setLocalDescription(await _call.pc.createOffer());
+    // Non-trickle ICE: wait until all candidates are gathered, then send the
+    // *complete* SDP. FastRTC's /webrtc/offer doesn't support trickling, so a
+    // partial offer would leave us with no usable candidates server-side.
+    await _waitForIceGatheringComplete(_call.pc, 3000);
+    const local = _call.pc.localDescription;
+    const r = await fetch(`${callBase}/offer`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({sdp: local.sdp, type: local.type, webrtc_id: webrtcId}),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text().catch(() => "")}`);
+    const answer = await r.json();
+    await _call.pc.setRemoteDescription(answer);
+  } catch (e) {
+    _endCall();
+    alert(`Call failed: ${e.message}`);
+    return;
+  }
+
+  // 5. Subscribe to the server's AdditionalOutputs stream (transcript /
+  //    chunk / end / error). FastRTC keeps these in an internal queue keyed
+  //    by webrtc_id; the SSE endpoint forwards them to us.
+  try {
+    _call.events = new EventSource(`${callBase}/events/${webrtcId}`);
+    _call.events.onmessage = e => {
+      let ev;
+      try { ev = JSON.parse(e.data); } catch { return; }
+      _onCallDataEvent(ev);
+    };
+    _call.events.onerror = () => {
+      // EventSource will auto-reconnect; we only care if the call itself ended.
+      if (_call.state === "idle" || _call.state === "hanging-up") {
+        try { _call.events?.close(); } catch (_) {}
+      }
+    };
+  } catch (e) {
+    console.warn("Could not open call events stream:", e);
+  }
+}
+
+
+function _waitForIceGatheringComplete(pc, timeoutMs) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise(resolve => {
+    let done = false;
+    const finish = () => { if (done) return; done = true; resolve(); };
+    const handler = () => { if (pc.iceGatheringState === "complete") finish(); };
+    pc.addEventListener("icegatheringstatechange", handler);
+    // Hard timeout — some networks never reach "complete"; the SDP we have
+    // already has *some* candidates, send it and let the other side cope.
+    setTimeout(finish, timeoutMs || 3000);
+  });
+}
+
+
+function _endCall() {
+  _call.state = "hanging-up";
+  _finalizeCallAssistantBubble();
+  if (_call.events) {
+    try { _call.events.close(); } catch (_) {}
+    _call.events = null;
+  }
+  if (_call.pc) {
+    try { _call.pc.close(); } catch (_) {}
+    _call.pc = null;
+  }
+  if (_call.micStream) {
+    _call.micStream.getTracks().forEach(t => { try { t.stop(); } catch (_) {} });
+    _call.micStream = null;
+  }
+  if (_call.audioEl) {
+    _call.audioEl.srcObject = null;
+    try { _call.audioEl.remove(); } catch (_) {}
+    _call.audioEl = null;
+  }
+  _call.webrtcId = null;
+  els.callBtn?.classList.remove("calling");
+  _setCallStatus(null);
+  _call.state = "idle";
+}
+
+
+function initCallButton() {
+  if (!els.callBtn) return;
+  els.callBtn.addEventListener("click", () => {
+    if (_call.state === "idle") _startCall();
+    else _endCall();
+  });
+}
+
+
 // ---------- API code modal ----------
 // Each conversation is a saved microservice: its model, system prompt, and
 // sampling params are locked server-side. The snippet only needs to supply
@@ -3884,7 +5038,29 @@ async function loadBackends() {
   } catch {
     backendCache = [];
   }
+  _refreshMicAffordance();
+  _refreshVoicePickerAffordance();
   return backendCache;
+}
+
+// Show the push-to-talk mic button only when at least one enabled voice
+// backend is registered. Hidden by default so users without a voice service
+// see no dead UI.
+function _refreshMicAffordance() {
+  if (!els.micBtn) return;
+  const hasVoice = (backendCache || []).some(b => b.kind === "voice" && b.enabled);
+  els.micBtn.hidden = !hasVoice;
+  _refreshCallAffordance();
+}
+
+// Show the 📞 button only when a voice backend is registered AND we're on a
+// secure context (WebRTC requires it). On plain-HTTP LAN access, the button
+// stays hidden so users don't get a confusing failure when they click.
+function _refreshCallAffordance() {
+  if (!els.callBtn) return;
+  const hasVoice = (backendCache || []).some(b => b.kind === "voice" && b.enabled);
+  const secure = window.isSecureContext;
+  els.callBtn.hidden = !(hasVoice && secure);
 }
 
 function _backendStatusDot(running, enabled, hadErr) {
@@ -4473,30 +5649,53 @@ const ACTIVE_PAGE_KEY = "miniclosedai:activePage";
 // no longer has its own button in the activity bar. The Bots nav icon stays
 // highlighted whether you're on the list (page=bots) or inside a chat
 // (page=dashboard), reinforcing the parent/child relationship.
-const VALID_PAGES = new Set(["dashboard", "bots", "settings", "logs"]);
+const VALID_PAGES = new Set(["dashboard", "bots", "settings", "logs", "apps", "app-detail"]);
 const _BOTS_AREA = new Set(["bots", "dashboard"]);
+// The Apps nav-item owns both the applications list and a single app's detail.
+const _APPS_AREA = new Set(["apps", "app-detail"]);
+// Navigation hierarchy as a flat depth map. Drives the drill-in / drill-out
+// animation: a transition into a DEEPER page (apps → app-detail → dashboard,
+// or bots → dashboard) animates forward; a transition into a SHALLOWER page
+// animates back; same-depth peer hops (activity-bar clicks between top-level
+// pages) don't animate. Adding a new page = add it here and pick its depth.
+const _PAGE_DEPTH = {
+  bots: 0, apps: 0, logs: 0, settings: 0,
+  "app-detail": 1,
+  dashboard: 2,
+};
+
 function applyActivePage(page) {
   const from = document.body.dataset.page;
   const p = VALID_PAGES.has(page) ? page : "bots";
 
-  // Spatial drill-in / drill-out: slide the chat in from the right when going
-  // bots → dashboard, slide the list back in from the left when going
-  // dashboard → bots. The CSS keyframes are gated on body[data-bots-transition].
-  if (from !== p && _BOTS_AREA.has(from) && _BOTS_AREA.has(p)) {
-    const dir = (from === "bots" && p === "dashboard") ? "forward" : "back";
-    document.body.dataset.botsTransition = dir;
-    // Clear the attribute after the keyframe duration so a future toggle re-fires it.
-    setTimeout(() => {
-      if (document.body.dataset.botsTransition === dir) {
-        delete document.body.dataset.botsTransition;
-      }
-    }, 240);
+  // Spatial drill-in / drill-out animation. Direction is derived from page
+  // depth, not from a hard-coded bots-vs-dashboard pair, so EVERY drill-in
+  // (apps → app-detail, app-detail → dashboard, bots → dashboard, etc.) and
+  // every back step (back button or activity-bar climb-out) gets the same
+  // animation treatment. The CSS keyframes live on body[data-page-transition].
+  if (from && from !== p) {
+    const fromDepth = _PAGE_DEPTH[from] ?? 0;
+    const toDepth = _PAGE_DEPTH[p] ?? 0;
+    if (fromDepth !== toDepth) {
+      const dir = toDepth > fromDepth ? "forward" : "back";
+      document.body.dataset.pageTransition = dir;
+      // Clear after the keyframe duration so a future toggle re-fires it.
+      setTimeout(() => {
+        if (document.body.dataset.pageTransition === dir) {
+          delete document.body.dataset.pageTransition;
+        }
+      }, 240);
+    }
   }
 
   document.body.dataset.page = p;
   document.querySelectorAll(".activity-bar .nav-item[data-page]").forEach(btn => {
-    // The Bots nav-item owns BOTH the bots list and the chat (dashboard).
-    const owns = btn.dataset.page === "bots" ? _BOTS_AREA.has(p) : btn.dataset.page === p;
+    // The Bots nav-item owns BOTH the bots list and the chat (dashboard); the
+    // Apps nav-item owns both the apps list and a single app's detail page.
+    let owns;
+    if (btn.dataset.page === "bots") owns = _BOTS_AREA.has(p);
+    else if (btn.dataset.page === "apps") owns = _APPS_AREA.has(p);
+    else owns = btn.dataset.page === p;
     btn.classList.toggle("active", owns);
   });
   try { localStorage.setItem(ACTIVE_PAGE_KEY, p); } catch (_) {}
@@ -4511,6 +5710,9 @@ function applyActivePage(page) {
   }
   if (p === "bots" && typeof onBotsPageEntered === "function") {
     onBotsPageEntered();
+  }
+  if (p === "apps" && typeof onAppsPageEntered === "function") {
+    onAppsPageEntered();
   }
   if (p === "logs" && typeof onLogsPageEntered === "function") {
     onLogsPageEntered();
@@ -4986,12 +6188,19 @@ async function _handleImportFile(file) {
   const result = await _runImport(parsed, null);
   if (result.ok) return;
   if (result.needsBackend) {
-    _importPending = { data: parsed, payload: result.payload };
+    _importPending = { kind: "bot", data: parsed, payload: result.payload };
+    _setImportModalTitle("Import bot — pick a backend");
     _renderImportPickerBody(parsed, result.payload);
     _openImportPickerModal();
     return;
   }
   alert(`Import failed: ${result.error}`);
+}
+
+function _setImportModalTitle(text) {
+  const modal = document.getElementById("import-modal-backdrop");
+  const h3 = modal && modal.querySelector(".modal-header h3");
+  if (h3) h3.textContent = text;
 }
 
 function initImportBotUI() {
@@ -5020,11 +6229,129 @@ function initImportBotUI() {
     const picked = document.querySelector('input[name="import-backend"]:checked');
     if (!picked) return;
     const backendId = parseInt(picked.value, 10);
-    const data = _importPending.data;
+    const { kind, data } = _importPending;
     _closeImportPickerModal();
-    const result = await _runImport(data, backendId);
+    const result = kind === "app"
+      ? await _runAppImport(data, backendId)
+      : await _runImport(data, backendId);
     if (!result.ok) alert(`Import failed: ${result.error || "unknown"}`);
   });
+}
+
+// =====================================================================
+// Application import — same shape as the bot importer, one level up. The
+// file is .miniclosed-app.json; we POST to /api/apps/import and reuse the
+// same backend-picker modal. One backend is chosen for every bot in the
+// imported app (matches the user's chosen UX over a per-bot picker).
+// =====================================================================
+
+async function _runAppImport(data, backendId) {
+  const r = await fetch("/api/apps/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ data, backend_id: backendId }),
+  });
+  const body = await r.json().catch(() => ({}));
+  if (r.status === 201) {
+    if (body.warnings && body.warnings.length) {
+      console.warn("app import warnings:", body.warnings);
+    }
+    // Refresh the bot list (the new app's bots showed up there too) and the
+    // app list, then drop the user into the freshly-imported app.
+    if (typeof loadConversations === "function") await loadConversations();
+    if (typeof loadApps === "function") await loadApps();
+    if (typeof renderAppsPage === "function") renderAppsPage();
+    if (body.id && typeof openApp === "function") await openApp(body.id);
+    return { ok: true };
+  }
+  if (r.status === 409 && body.needs_backend) {
+    return { needsBackend: true, payload: body };
+  }
+  return { ok: false, error: body.detail || `HTTP ${r.status}` };
+}
+
+function _renderAppImportPickerBody(parsed, payload) {
+  const body = document.getElementById("import-modal-body");
+  const confirmBtn = document.getElementById("import-confirm-btn");
+  if (!body) return;
+  const models = (payload.models || []).slice();
+  const backends = payload.available_backends || [];
+  const botCount = (parsed.bots || []).length;
+  const lines = backends.length
+    ? backends.map(b => {
+        const need = b.needed_count ?? models.length;
+        const have = b.matched_count ?? 0;
+        const tail = b.model_present
+          ? " — has every model in this app"
+          : ` — has ${have}/${need} required models`;
+        const label = `${b.name} (${b.kind})${tail}`;
+        return `<label style="display:block; padding:6px 0;">
+          <input type="radio" name="import-backend" value="${b.id}" ${b.model_present ? "checked" : ""} />
+          ${label}
+        </label>`;
+      }).join("")
+    : `<p>No enabled backends found. Add one from Settings, then retry.</p>`;
+  body.innerHTML = `
+    <p>This application bundles <strong>${botCount}</strong> bot${botCount === 1 ? "" : "s"} that need these models: <code>${models.join(", ") || "(none)"}</code>. No enabled backend covers them all. Pick one backend to run every bot against:</p>
+    ${lines}
+    <p style="color: var(--text-muted); font-size: 12px; margin-top: 10px;">
+      Tip: the cleanest fit is a backend that lists all the required models. If none does, pick the closest match — bots will still run, just against whatever models that backend actually serves.
+    </p>`;
+  if (confirmBtn) {
+    // Enable as soon as any backend is selected; default-checked if any backend has them all.
+    confirmBtn.disabled = !backends.some(b => b.model_present);
+    body.querySelectorAll('input[name="import-backend"]').forEach(r => {
+      r.addEventListener("change", () => { confirmBtn.disabled = false; });
+    });
+  }
+}
+
+async function _handleAppImportFile(file) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch (e) {
+    alert(`Couldn't parse ${file.name} as JSON: ${e.message}`);
+    return;
+  }
+  if (parsed?.format !== "miniclosed-app") {
+    alert(`Not a MiniClosedAI application file (format=${parsed?.format ?? "missing"}).`);
+    return;
+  }
+  const result = await _runAppImport(parsed, null);
+  if (result.ok) return;
+  if (result.needsBackend) {
+    _importPending = { kind: "app", data: parsed, payload: result.payload };
+    _setImportModalTitle("Import application — pick a backend for all bots");
+    _renderAppImportPickerBody(parsed, result.payload);
+    _openImportPickerModal();
+    return;
+  }
+  alert(`Import failed: ${result.error}`);
+}
+
+function initAppsImportUI() {
+  const btn = document.getElementById("apps-import-btn");
+  const input = document.getElementById("apps-import-file");
+  if (!btn || !input) return;
+  btn.addEventListener("click", () => input.click());
+  input.addEventListener("change", async () => {
+    const f = input.files && input.files[0];
+    input.value = "";  // reset so picking the same file twice still fires change
+    if (f) await _handleAppImportFile(f);
+  });
+}
+
+function _downloadApp(appId, includeHistory) {
+  const path = includeHistory
+    ? `export?include_history=true`
+    : `export?include_history=false`;
+  const a = document.createElement("a");
+  a.href = `/api/apps/${appId}/${path}`;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 // =====================================================================
@@ -5267,6 +6594,35 @@ function initLogsUI() {
   const filterEl = document.getElementById("logs-filter");
   const pauseEl = document.getElementById("logs-pause-toggle");
   const clearEl = document.getElementById("logs-clear-btn");
+  const exportEl = document.getElementById("logs-export-btn");
+  if (exportEl) {
+    exportEl.addEventListener("click", async () => {
+      // Hit the export endpoint and trigger a browser save via Content-
+      // Disposition. We use a Blob URL + click rather than location.assign
+      // so we can surface a failure as an alert instead of a blank tab.
+      exportEl.disabled = true;
+      const orig = exportEl.textContent;
+      exportEl.textContent = "Exporting…";
+      try {
+        const r = await fetch("/api/logs/export");
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const blob = await r.blob();
+        const disp = r.headers.get("Content-Disposition") || "";
+        const m = /filename="([^"]+)"/.exec(disp);
+        const fname = m ? m[1] : `miniclosedai-logs-${Date.now()}.json`;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = fname;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        alert("Export failed: " + (e?.message || e));
+      } finally {
+        exportEl.textContent = orig;
+        exportEl.disabled = false;
+      }
+    });
+  }
   if (filterEl) {
     filterEl.addEventListener("input", () => {
       _logsState.filter = filterEl.value || "";
@@ -5292,7 +6648,153 @@ function initLogsUI() {
   }
 }
 
+// =====================================================================
+// Global tooltip — ONE fixed-positioned element on <body> that shows
+// the `data-tooltip` text for whichever element you hover or focus.
+//
+// Why a global element instead of a per-trigger `::after` pseudo:
+//   • Every `::after` is rendered inside its parent's stacking + clipping
+//     contexts. Any ancestor with `overflow: hidden`, `transform`, or a
+//     stacking context (sidebar, modal, sticky toolbar, etc.) would clip
+//     or layer-cover the tooltip.
+//   • A single fixed-positioned <body> child sits in the root stacking
+//     context with the maximum z-index, so it's GUARANTEED to render
+//     above every other element on the page.
+//
+// Positioning runs on every show — we compute the trigger's bounding rect
+// in viewport coordinates and place the tooltip directly under it (or
+// above when `data-tooltip-side="top"` is set), clamped to the viewport
+// so it never falls off-screen at narrow widths.
+// =====================================================================
+const _GLOBAL_TOOLTIP_GAP_PX = 6;       // gap between trigger and bubble
+const _GLOBAL_TOOLTIP_VIEWPORT_PAD = 8;  // clamp this far from each edge
+
+let _globalTooltipEl = null;
+let _globalTooltipTrigger = null;        // element currently advertising
+
+function _shouldShowTooltip(trigger) {
+  if (!trigger || !trigger.isConnected) return false;
+  const text = trigger.getAttribute("data-tooltip");
+  if (!text) return false;
+  // Match the old `::after` behaviour: don't compete with an open menu/popover.
+  if (trigger.getAttribute("aria-expanded") === "true") return false;
+  // Don't show on hidden / off-screen elements.
+  if (trigger.hidden || trigger.closest("[hidden]")) return false;
+  return true;
+}
+
+function _showGlobalTooltip(trigger) {
+  if (!_globalTooltipEl || !_shouldShowTooltip(trigger)) return;
+  _globalTooltipTrigger = trigger;
+  const text = trigger.getAttribute("data-tooltip");
+  _globalTooltipEl.textContent = text;
+  _globalTooltipEl.setAttribute("aria-hidden", "false");
+
+  // Reset side class so this measurement is consistent.
+  const wantTop = trigger.getAttribute("data-tooltip-side") === "top";
+  _globalTooltipEl.classList.toggle("side-top", wantTop);
+
+  // Make sure the element is laid out so we can read its size, but stays
+  // invisible until we position it (avoids a one-frame flash at 0,0).
+  _globalTooltipEl.style.visibility = "hidden";
+  _globalTooltipEl.classList.add("visible");
+
+  const triggerRect = trigger.getBoundingClientRect();
+  const ttRect = _globalTooltipEl.getBoundingClientRect();
+  const vw = document.documentElement.clientWidth;
+  const vh = document.documentElement.clientHeight;
+
+  // Horizontal: center under the trigger, then clamp into the viewport so
+  // wide tooltips on edge-aligned buttons don't fall off-screen.
+  let left = triggerRect.left + (triggerRect.width - ttRect.width) / 2;
+  left = Math.max(
+    _GLOBAL_TOOLTIP_VIEWPORT_PAD,
+    Math.min(left, vw - ttRect.width - _GLOBAL_TOOLTIP_VIEWPORT_PAD)
+  );
+
+  // Vertical: prefer the requested side; if it would clip the viewport,
+  // auto-flip.
+  let top;
+  let placedTop = wantTop;
+  if (placedTop) {
+    top = triggerRect.top - ttRect.height - _GLOBAL_TOOLTIP_GAP_PX;
+    if (top < _GLOBAL_TOOLTIP_VIEWPORT_PAD) {
+      placedTop = false;
+      top = triggerRect.bottom + _GLOBAL_TOOLTIP_GAP_PX;
+    }
+  } else {
+    top = triggerRect.bottom + _GLOBAL_TOOLTIP_GAP_PX;
+    if (top + ttRect.height > vh - _GLOBAL_TOOLTIP_VIEWPORT_PAD) {
+      placedTop = true;
+      top = triggerRect.top - ttRect.height - _GLOBAL_TOOLTIP_GAP_PX;
+    }
+  }
+  _globalTooltipEl.classList.toggle("side-top", placedTop);
+
+  _globalTooltipEl.style.left = `${Math.round(left)}px`;
+  _globalTooltipEl.style.top = `${Math.round(top)}px`;
+  _globalTooltipEl.style.visibility = "";
+}
+
+function _hideGlobalTooltip() {
+  if (!_globalTooltipEl) return;
+  _globalTooltipEl.classList.remove("visible");
+  _globalTooltipEl.setAttribute("aria-hidden", "true");
+  _globalTooltipTrigger = null;
+}
+
+function _findTooltipTarget(el) {
+  // Walk up to find an element advertising a `data-tooltip` attribute,
+  // skipping the global tooltip itself.
+  if (!el || el === _globalTooltipEl) return null;
+  return el.closest ? el.closest("[data-tooltip]") : null;
+}
+
+function initGlobalTooltip() {
+  _globalTooltipEl = document.getElementById("global-tooltip");
+  if (!_globalTooltipEl) return;
+
+  // Delegated pointer + keyboard events on document so dynamically-added
+  // [data-tooltip] elements (cards built by JS, modal contents, etc.) get
+  // the tooltip behaviour for free.
+  document.addEventListener("pointerover", e => {
+    const target = _findTooltipTarget(e.target);
+    if (target === _globalTooltipTrigger) return;
+    // Moved off the current trigger (or onto a different one) — drop the
+    // existing tooltip first, then show the new one if present.
+    if (_globalTooltipTrigger) _hideGlobalTooltip();
+    if (target) _showGlobalTooltip(target);
+  });
+  document.addEventListener("pointerout", e => {
+    if (!_globalTooltipTrigger) return;
+    // relatedTarget is where the pointer is going. If it's still inside the
+    // active trigger we're not actually leaving it — let the move stand.
+    const next = e.relatedTarget;
+    if (next && _globalTooltipTrigger.contains(next)) return;
+    // If we're moving from the trigger directly onto another tooltip
+    // trigger, pointerover above will handle the swap — so just hide.
+    _hideGlobalTooltip();
+  });
+  document.addEventListener("focusin", e => {
+    const t = _findTooltipTarget(e.target);
+    if (t) _showGlobalTooltip(t);
+  });
+  document.addEventListener("focusout", e => {
+    const t = _findTooltipTarget(e.target);
+    if (t && _globalTooltipTrigger === t) _hideGlobalTooltip();
+  });
+
+  // Hide on scroll/resize — the cached rect is now wrong, and reshowing on
+  // pointermove is good enough.
+  window.addEventListener("scroll", _hideGlobalTooltip, true);
+  window.addEventListener("resize", _hideGlobalTooltip);
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") _hideGlobalTooltip();
+  });
+}
+
 async function init() {
+  initGlobalTooltip();
   initTheme();
   initSidebarToggle();
   initActivityBar();
@@ -5304,10 +6806,13 @@ async function init() {
   initSplitter();
   initHSplitter();
   initSuggestionChips();
+  initMicButton();
+  initCallButton();
   if (typeof initBackendsUI === "function") initBackendsUI();
   initUiDialog();
   initLogsUI();
   initBotsUI();
+  initAppsUI();
   initKnowledgeUI();
   initKnowledgeModalUI();
   initMcpUI();
@@ -5320,6 +6825,14 @@ async function init() {
   initImportBotUI();
   els.input.addEventListener("input", autoGrowInput);
   await loadModels();
+  // Warm the backend cache at boot so the dashboard's push-to-talk affordance
+  // (which checks for a kind='voice' row) shows up without first opening
+  // Settings. loadBackends() also re-runs every time Settings renders, so
+  // adding / removing a voice endpoint there propagates here on the next save.
+  await loadBackends();
+  // Populate the TTS voice picker. Returns silently when no voice backend is
+  // registered (the picker stays hidden until one is added in Settings).
+  await loadVoices();
   await loadConversations();
   initPromptGenUI();
 
@@ -5483,13 +6996,40 @@ async function _refreshPromptGenAvailability() {
   }
 }
 
+// Status line under the prompt-gen bar. Three states:
+//   _setPromptGenStatus("")                       → hidden
+//   _setPromptGenStatus("…working…")              → "loading" with spinner
+//   _setPromptGenStatus("…failed…", true)         → "error" tint, no spinner
+// The loading state is visible AS SOON AS the request fires, so the user
+// gets immediate feedback even before the first streamed token shows up
+// in the System Prompt textarea (which can take several seconds on a
+// cold-loaded model).
 function _setPromptGenStatus(text, isError = false) {
   const el = document.getElementById("prompt-gen-status");
   if (!el) return;
-  if (!text) { el.hidden = true; el.textContent = ""; return; }
+  if (!text) {
+    el.hidden = true;
+    el.textContent = "";
+    el.classList.remove("loading", "error");
+    return;
+  }
   el.hidden = false;
   el.textContent = text;
   el.classList.toggle("error", !!isError);
+  el.classList.toggle("loading", !isError);
+}
+
+// Show / clear a spinner on the prompt-gen toggle button itself, so the
+// trigger that the user just clicked visibly acknowledges the click rather
+// than going silent. The button text/label stays in place — the icon swaps
+// to a spinner via the `.is-busy` CSS class.
+function _setPromptGenBusy(busy) {
+  const toggle = document.getElementById("prompt-gen-toggle");
+  if (!toggle) return;
+  toggle.classList.toggle("is-busy", !!busy);
+  toggle.setAttribute("aria-busy", busy ? "true" : "false");
+  if (busy) toggle.setAttribute("aria-disabled", "true");
+  else toggle.removeAttribute("aria-disabled");
 }
 
 // Mode is decided by whether the System Prompt textarea has any content.
@@ -5568,6 +7108,7 @@ async function _runPromptGeneration(description) {
   }
 
   _setPromptGenStatus(`${statusVerb} with ${_promptGenModel} on ${_promptGenBackend.name}…`);
+  _setPromptGenBusy(true);
   ta.value = "";
   ta.disabled = true;
 
@@ -5637,6 +7178,7 @@ async function _runPromptGeneration(description) {
     _setPromptGenStatus(`${verb} failed: ${(e && e.message) || e}`, true);
   } finally {
     ta.disabled = false;
+    _setPromptGenBusy(false);
     _updatePromptGenAffordance();
     ta.focus();
   }
@@ -5660,11 +7202,26 @@ function initPromptGenUI() {
 
   toggle?.addEventListener("click", () => showInput(true));
   cancel?.addEventListener("click", () => { showInput(false); _setPromptGenStatus(""); });
-  const fire = () => {
+  // Submit handler. We INTENTIONALLY keep the input row visible during the
+  // request — collapsing it on click would hide the very button the user just
+  // pressed before they can see it acknowledge their click. Instead, we mark
+  // the submit button `.is-busy` (spinner replaces its label) and disable the
+  // row's controls. The row collapses only when streaming is done so the
+  // result lands cleanly into the System Prompt textarea.
+  const fire = async () => {
     const desc = (input?.value || "").trim();
     if (!desc) { input?.focus(); return; }
-    showInput(false);
-    _runPromptGeneration(desc);
+    if (submit) { submit.classList.add("is-busy"); submit.disabled = true; submit.setAttribute("aria-busy", "true"); }
+    if (input) input.disabled = true;
+    if (cancel) cancel.disabled = true;
+    try {
+      await _runPromptGeneration(desc);
+    } finally {
+      if (submit) { submit.classList.remove("is-busy"); submit.disabled = false; submit.removeAttribute("aria-busy"); }
+      if (input) input.disabled = false;
+      if (cancel) cancel.disabled = false;
+      showInput(false);
+    }
   };
   submit?.addEventListener("click", fire);
   input?.addEventListener("keydown", e => {
@@ -5707,6 +7264,615 @@ function initPromptGenUI() {
   // as the backend's reachability flips. Same cadence as upgrade-status poll.
   _refreshPromptGenAvailability();
   setInterval(_refreshPromptGenAvailability, 60 * 1000);
+}
+
+// ─── Applications (groups of bots) ───────────────────────────
+// An "application" is a named group of bots that maps to a real app. Mirrors
+// the Bots page: an overview of cards, a detail view to chat with each bot
+// individually, plus a generated TypeScript SDK per application.
+const _APPS_VIEW_KEY = "miniclosedai:appsView";
+const _appsState = {
+  cache: [], filter: "", current: null,
+  // "list" (vertical stack) or "grid" (responsive tiles). Same toggle pattern
+  // as the bots page (`_botsState.view`); persisted under its own key so the
+  // two views are independent.
+  view: (() => { try { return localStorage.getItem(_APPS_VIEW_KEY) === "grid" ? "grid" : "list"; } catch { return "list"; } })(),
+};
+
+// Apply the current view mode to the apps list container + toggle buttons.
+// Direct clone of `_applyBotsView`, swapped to the apps els + state.
+function _applyAppsView() {
+  const listEl = document.getElementById("apps-list");
+  if (listEl) listEl.classList.toggle("grid-view", _appsState.view === "grid");
+  if (els.appsViewList) {
+    const isList = _appsState.view === "list";
+    els.appsViewList.classList.toggle("active", isList);
+    els.appsViewList.setAttribute("aria-pressed", String(isList));
+  }
+  if (els.appsViewGrid) {
+    const isGrid = _appsState.view === "grid";
+    els.appsViewGrid.classList.toggle("active", isGrid);
+    els.appsViewGrid.setAttribute("aria-pressed", String(isGrid));
+  }
+}
+
+function _setAppsView(view) {
+  _appsState.view = view === "grid" ? "grid" : "list";
+  try { localStorage.setItem(_APPS_VIEW_KEY, _appsState.view); } catch (_) {}
+  _applyAppsView();
+}
+const _sdkState = { files: [], active: 0, appId: null, appName: "", lang: "ts" };
+const _SDK_LANG_LABELS = { ts: "TypeScript", js: "JavaScript", py: "Python" };
+const _SDK_LANG_HINTS = {
+  ts: "Drop this folder into a TypeScript project to call this application's bots over the MiniClosedAI HTTP API. The server must be running and reachable. Each bot is exposed as a function named after it.",
+  js: "Drop this folder into any Node 18+ project (or load it in a browser) to call this application's bots over the MiniClosedAI HTTP API. The server must be running and reachable. Each bot is exposed as a function named after it.",
+  py: "Drop this package into your Python project (anywhere on sys.path — stdlib only, no pip install) to call this application's bots over the MiniClosedAI HTTP API. The server must be running and reachable. Each bot is exposed as a function named after it.",
+};
+
+const _X_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+// Feather: layers — the application (group) avatar fallback.
+const _APP_AVATAR_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>';
+
+function _renderAppAvatarInto(el, a) {
+  el.innerHTML = "";
+  el.style.removeProperty("--avatar-hue");
+  if (a.avatar) {
+    const img = document.createElement("img");
+    img.src = a.avatar; img.alt = "";
+    el.appendChild(img);
+    el.classList.remove("is-fallback");
+  } else {
+    el.innerHTML = _APP_AVATAR_SVG;
+    el.classList.add("is-fallback");
+    // Offset hue from the bot formula so app fallbacks read distinct from bots.
+    el.style.setProperty("--avatar-hue", String((a.id * 67 + 23) % 360));
+  }
+}
+
+function _linkHost(link) {
+  if (!link) return "";
+  try { return new URL(link).host; } catch { return link; }
+}
+
+// JS mirror of sdkgen.function_names — the SDK reference name for each bot.
+const _APP_FN_RESERVED = new Set(["break","case","catch","class","const","continue","debugger","default","delete","do","else","enum","export","extends","false","finally","for","function","if","import","in","instanceof","new","null","return","super","switch","this","throw","true","try","typeof","var","void","while","with","yield","let","static","await","async","Bot","DEFAULT_BASE_URL","MiniClosedAIError"]);
+function _appCamel(name) {
+  const parts = (name || "").split(/[^a-zA-Z0-9]+/).filter(Boolean);
+  if (!parts.length) return "";
+  let head = parts[0];
+  head = head === head.toUpperCase() ? head.toLowerCase() : head[0].toLowerCase() + head.slice(1);
+  let ident = head + parts.slice(1).map(p => p[0].toUpperCase() + p.slice(1)).join("");
+  if (/^[0-9]/.test(ident)) ident = "bot" + ident[0].toUpperCase() + ident.slice(1);
+  return ident;
+}
+function _appFnNames(bots) {
+  const seen = new Set(), out = {};
+  for (const b of bots) {
+    let base = _appCamel(b.title || "");
+    if (!base || _APP_FN_RESERVED.has(base)) base = "bot" + b.id;
+    let name = base;
+    if (seen.has(name)) name = base + "_" + b.id;
+    seen.add(name);
+    out[b.id] = name;
+  }
+  return out;
+}
+
+async function loadApps() {
+  try {
+    const r = await fetch("/api/apps");
+    _appsState.cache = r.ok ? await r.json() : [];
+  } catch { _appsState.cache = []; }
+  renderAppsPage();
+  return _appsState.cache;
+}
+
+function onAppsPageEntered() { loadApps(); }
+
+function _appMatchesFilter(a, q) {
+  if (!q) return true;
+  return `${a.name || ""} ${a.description || ""} ${a.link || ""}`.toLowerCase().includes(q);
+}
+
+function renderAppsPage() {
+  const listEl = document.getElementById("apps-list");
+  if (!listEl) return;
+  _applyAppsView();
+  const q = _appsState.filter.trim().toLowerCase();
+  const all = _appsState.cache || [];
+  const filtered = all.filter(a => _appMatchesFilter(a, q));
+
+  listEl.innerHTML = "";
+  for (const a of filtered) {
+    const card = document.createElement("div");
+    card.className = "bot-card";
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+
+    const avatar = document.createElement("button");
+    avatar.type = "button";
+    avatar.className = "bot-card-avatar";
+    avatar.dataset.tooltip = a.avatar ? "Change logo" : "Add logo";
+    avatar.setAttribute("aria-label", `${a.avatar ? "Change" : "Add"} logo for ${a.name}`);
+    _renderAppAvatarInto(avatar, a);
+    avatar.addEventListener("click", e => { e.stopPropagation(); _pickAppAvatar(a); });
+
+    const title = document.createElement("div");
+    title.className = "bot-card-title";
+    title.textContent = a.name || "(unnamed application)";
+
+    const meta = document.createElement("div");
+    meta.className = "bot-card-meta";
+    const parts = [`${a.bot_count} bot${a.bot_count === 1 ? "" : "s"}`];
+    if (a.link) parts.push(_linkHost(a.link));
+    parts.push(_formatRelative(a.updated_at));
+    parts.forEach((p, i) => {
+      if (i > 0) { const sep = document.createElement("span"); sep.className = "sep"; sep.textContent = "·"; meta.appendChild(sep); }
+      const span = document.createElement("span"); span.textContent = p; meta.appendChild(span);
+    });
+
+    const textWrap = document.createElement("div");
+    textWrap.className = "bot-card-text";
+    textWrap.appendChild(title); textWrap.appendChild(meta);
+    card.appendChild(avatar); card.appendChild(textWrap);
+
+    const actions = document.createElement("div");
+    actions.className = "bot-card-actions";
+    const sdkBtn = document.createElement("button");
+    sdkBtn.type = "button"; sdkBtn.className = "bot-card-action"; sdkBtn.dataset.tooltip = "Generate SDK";
+    sdkBtn.setAttribute("aria-label", `Generate SDK for ${a.name}`);
+    sdkBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>';
+    sdkBtn.addEventListener("click", e => { e.stopPropagation(); openSdkModal(a.id, a.name); });
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button"; exportBtn.className = "bot-card-action";
+    exportBtn.dataset.tooltip = "Export as .miniclosed-app.json (config-only — Shift-click to include history)";
+    exportBtn.setAttribute("aria-label", `Export ${a.name}`);
+    // Download-cloud icon (matches the import button's family).
+    exportBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="8 17 12 21 16 17"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>';
+    exportBtn.addEventListener("click", e => { e.stopPropagation(); _downloadApp(a.id, e.shiftKey); });
+    const editBtn = document.createElement("button");
+    editBtn.type = "button"; editBtn.className = "bot-card-action"; editBtn.dataset.tooltip = "Edit application";
+    editBtn.setAttribute("aria-label", `Edit ${a.name}`);
+    editBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></svg>';
+    editBtn.addEventListener("click", e => { e.stopPropagation(); _openAppFormModal({ app: a }); });
+    const delBtn = document.createElement("button");
+    delBtn.type = "button"; delBtn.className = "bot-card-action danger"; delBtn.dataset.tooltip = "Delete application";
+    delBtn.setAttribute("aria-label", `Delete ${a.name}`);
+    delBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>';
+    delBtn.addEventListener("click", e => { e.stopPropagation(); _deleteApp(a); });
+    actions.append(sdkBtn, exportBtn, editBtn, delBtn);
+    card.appendChild(actions);
+
+    const open = () => openApp(a.id);
+    card.addEventListener("click", open);
+    card.addEventListener("keydown", e => {
+      if (e.target !== card) return;
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+    });
+    listEl.appendChild(card);
+  }
+
+  const countEl = document.getElementById("apps-count");
+  if (countEl) {
+    const total = all.length, shown = filtered.length;
+    countEl.textContent = q ? `${shown} of ${total} application${total === 1 ? "" : "s"}` : `${total} application${total === 1 ? "" : "s"}`;
+  }
+  const emptyEl = document.getElementById("apps-empty");
+  if (emptyEl) {
+    if (!all.length) { emptyEl.textContent = "No applications yet. Click + New application to group your bots."; emptyEl.hidden = false; }
+    else if (!filtered.length) { emptyEl.textContent = "No applications match your filter."; emptyEl.hidden = false; }
+    else emptyEl.hidden = true;
+  }
+}
+
+async function openApp(appId) {
+  let app;
+  try {
+    const r = await fetch(`/api/apps/${appId}`);
+    if (!r.ok) { alert("Application not found."); return; }
+    app = await r.json();
+  } catch (e) { alert(`Could not load application: ${e.message}`); return; }
+  _appsState.current = app;
+  applyActivePage("app-detail");
+  renderAppDetail(app);
+}
+
+
+// ---------- Chat-entry / chat-exit helpers ----------
+//
+// Centralize the two-step "switch to chat + open conversation" pattern so every
+// entry point captures where the user came from. The back button (and Esc on
+// dashboard) restores that return target — so a bot opened from inside an App
+// returns to that App's detail view, not the global Bots page.
+
+function enterChat(convId) {
+  const here = document.body.dataset.page;
+  if (here === "app-detail" && _appsState.current?.id != null) {
+    state.chatReturnTo = { page: "app-detail", appId: _appsState.current.id };
+  } else {
+    state.chatReturnTo = { page: "bots" };
+  }
+  applyActivePage("dashboard");
+  openConversation(convId);
+}
+
+async function exitChatToReturn() {
+  const r = state.chatReturnTo || { page: "bots" };
+  if (r.page === "app-detail" && r.appId != null) {
+    // openApp() alerts + returns silently on failure without setting current;
+    // if loading didn't end up on the app we wanted, fall back to the Apps list.
+    await openApp(r.appId);
+    if (_appsState.current?.id !== r.appId) applyActivePage("apps");
+    return;
+  }
+  applyActivePage(r.page || "bots");
+}
+
+function renderAppDetail(app) {
+  const c = document.getElementById("app-detail-container");
+  if (!c) return;
+  c.innerHTML = "";
+  const bots = app.bots || [];
+  const fnNames = _appFnNames(bots);
+
+  const back = document.createElement("button");
+  back.className = "btn btn-small";
+  back.textContent = "← Applications";
+  back.style.marginBottom = "10px";
+  back.addEventListener("click", () => applyActivePage("apps"));
+  c.appendChild(back);
+
+  const head = document.createElement("div");
+  head.className = "app-detail-head";
+  const avatar = document.createElement("button");
+  avatar.type = "button";
+  avatar.className = "bot-card-avatar";
+  avatar.dataset.tooltip = app.avatar ? "Change logo" : "Add logo";
+  _renderAppAvatarInto(avatar, app);
+  avatar.addEventListener("click", () => _pickAppAvatar(app));
+  const htext = document.createElement("div");
+  htext.className = "app-detail-head-text";
+  const h1 = document.createElement("h1"); h1.textContent = app.name; htext.appendChild(h1);
+  if (app.link) {
+    const link = document.createElement("a");
+    link.className = "app-detail-link"; link.href = app.link;
+    link.target = "_blank"; link.rel = "noopener";
+    link.textContent = app.link; htext.appendChild(link);
+  }
+  if (app.description) {
+    const d = document.createElement("p"); d.className = "app-detail-desc"; d.textContent = app.description; htext.appendChild(d);
+  }
+  head.append(avatar, htext);
+  c.appendChild(head);
+
+  const actions = document.createElement("div");
+  actions.className = "app-detail-actions";
+  const count = document.createElement("span");
+  count.className = "bots-count";
+  count.textContent = `${bots.length} bot${bots.length === 1 ? "" : "s"}`;
+  const spacer = document.createElement("span"); spacer.className = "spacer";
+  const addBtn = document.createElement("button"); addBtn.className = "btn btn-small"; addBtn.textContent = "+ Add bot";
+  addBtn.addEventListener("click", () => _openAddBotModal(app));
+  const editBtn = document.createElement("button"); editBtn.className = "btn btn-small"; editBtn.textContent = "Edit";
+  editBtn.addEventListener("click", () => _openAppFormModal({ app }));
+  const exportBtn = document.createElement("button");
+  exportBtn.className = "btn btn-small";
+  exportBtn.textContent = "Export";
+  exportBtn.title = "Download as .miniclosed-app.json — config only. Shift-click to also include each bot's message history.";
+  exportBtn.addEventListener("click", e => _downloadApp(app.id, e.shiftKey));
+  const sdkBtn = document.createElement("button"); sdkBtn.className = "btn btn-primary btn-small"; sdkBtn.textContent = "Generate SDK";
+  sdkBtn.addEventListener("click", () => openSdkModal(app.id, app.name));
+  actions.append(count, spacer, addBtn, editBtn, exportBtn, sdkBtn);
+  c.appendChild(actions);
+
+  const list = document.createElement("div");
+  list.className = "bots-list";
+  for (const b of bots) {
+    const card = document.createElement("div");
+    card.className = "bot-card"; card.tabIndex = 0; card.setAttribute("role", "button");
+    const av = document.createElement("button");
+    av.type = "button"; av.className = "bot-card-avatar"; av.dataset.tooltip = "Change avatar";
+    _renderAvatarInto(av, b);
+    av.addEventListener("click", e => { e.stopPropagation(); _pickAvatarFor(b); });
+    const title = document.createElement("div"); title.className = "bot-card-title"; title.textContent = b.title || "(untitled)";
+    const meta = document.createElement("div"); meta.className = "bot-card-meta";
+    const m1 = document.createElement("span"); m1.textContent = b.model || "(no model)"; meta.appendChild(m1);
+    const sep = document.createElement("span"); sep.className = "sep"; sep.textContent = "·"; meta.appendChild(sep);
+    const fn = document.createElement("span"); fn.className = "bot-card-fn"; fn.textContent = `${fnNames[b.id]}()`;
+    fn.title = `SDK reference — bot #${b.id}`; meta.appendChild(fn);
+    const textWrap = document.createElement("div"); textWrap.className = "bot-card-text"; textWrap.append(title, meta);
+    card.append(av, textWrap);
+
+    const cardActions = document.createElement("div"); cardActions.className = "bot-card-actions";
+    const rm = document.createElement("button");
+    rm.type = "button"; rm.className = "bot-card-action danger"; rm.dataset.tooltip = "Remove from application";
+    rm.setAttribute("aria-label", `Remove ${b.title} from ${app.name}`);
+    rm.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>';
+    rm.addEventListener("click", async e => {
+      e.stopPropagation();
+      try {
+        const r = await fetch(`/api/apps/${app.id}/bots/${b.id}`, { method: "DELETE" });
+        if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+        await loadConversations();
+        await openApp(app.id);
+      } catch (err) { alert(`Could not remove bot: ${err.message}`); }
+    });
+    cardActions.appendChild(rm);
+    card.appendChild(cardActions);
+
+    const open = () => enterChat(b.id);
+    card.addEventListener("click", open);
+    card.addEventListener("keydown", e => { if (e.target === card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); open(); } });
+    list.appendChild(card);
+  }
+  c.appendChild(list);
+  if (!bots.length) {
+    const empty = document.createElement("div"); empty.className = "bots-empty";
+    empty.textContent = "No bots in this application yet. Click + Add bot to put some in.";
+    c.appendChild(empty);
+  }
+}
+
+// Upload a logo for an application (reuses the bot-avatar downscale pipeline).
+let _appAvatarInput = null;
+function _pickAppAvatar(app) {
+  if (!_appAvatarInput) {
+    _appAvatarInput = document.createElement("input");
+    _appAvatarInput.type = "file"; _appAvatarInput.accept = "image/*"; _appAvatarInput.style.display = "none";
+    document.body.appendChild(_appAvatarInput);
+  }
+  _appAvatarInput.value = "";
+  _appAvatarInput.onchange = async () => {
+    const file = _appAvatarInput.files && _appAvatarInput.files[0];
+    if (!file) return;
+    try {
+      const dataUrl = await _makeAvatarDataUrl(file);
+      const r = await fetch(`/api/apps/${app.id}/avatar`, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ avatar: dataUrl }),
+      });
+      if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+      await loadApps();
+      if (document.body.dataset.page === "app-detail" && _appsState.current && _appsState.current.id === app.id) {
+        await openApp(app.id);
+      }
+    } catch (e) { alert(`Logo upload failed: ${e.message}`); }
+  };
+  _appAvatarInput.click();
+}
+
+// Minimal dynamically-built modal that reuses the existing .modal styling.
+function _spawnModal(buildBody) {
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  backdrop.appendChild(modal);
+  const close = () => backdrop.remove();
+  backdrop.addEventListener("click", e => { if (e.target === backdrop) close(); });
+  buildBody(modal, close);
+  document.body.appendChild(backdrop);
+  return { backdrop, modal, close };
+}
+
+function _modalHeader(modal, titleText, close) {
+  const header = document.createElement("div");
+  header.className = "modal-header";
+  const h = document.createElement("h3"); h.textContent = titleText;
+  const x = document.createElement("button"); x.className = "icon-btn"; x.setAttribute("aria-label", "Close"); x.innerHTML = _X_SVG; x.onclick = close;
+  header.append(h, x); modal.appendChild(header);
+}
+
+function _formField(labelText, { value = "", placeholder = "", multiline = false } = {}) {
+  const label = document.createElement("label"); label.className = "form-field";
+  const span = document.createElement("span"); span.textContent = labelText;
+  const input = multiline ? document.createElement("textarea") : document.createElement("input");
+  if (!multiline) input.type = "text";
+  input.value = value; input.placeholder = placeholder;
+  if (multiline) input.rows = 3;
+  label.append(span, input);
+  return { label, input };
+}
+
+function _openAppFormModal({ app = null } = {}) {
+  _spawnModal((modal, close) => {
+    _modalHeader(modal, app ? "Edit application" : "New application", close);
+    const form = document.createElement("div"); form.className = "backend-form";
+    const name = _formField("Name", { value: app ? app.name : "", placeholder: "My probate app" });
+    const link = _formField("Link (optional)", { value: app ? app.link : "", placeholder: "https://myapp.example" });
+    const desc = _formField("Description (optional)", { value: app ? app.description : "", placeholder: "What this application is and which bots belong to it.", multiline: true });
+    form.append(name.label, link.label, desc.label);
+    const actions = document.createElement("div"); actions.className = "modal-actions";
+    const spacer = document.createElement("div"); spacer.style.flex = "1";
+    const cancel = document.createElement("button"); cancel.className = "btn btn-small"; cancel.textContent = "Cancel"; cancel.onclick = close;
+    const save = document.createElement("button"); save.className = "btn btn-primary btn-small"; save.textContent = "Save";
+    save.addEventListener("click", async () => {
+      const payload = { name: name.input.value.trim(), link: link.input.value.trim(), description: desc.input.value.trim() };
+      if (!payload.name) { name.input.focus(); return; }
+      try {
+        const r = app
+          ? await fetch(`/api/apps/${app.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
+          : await fetch("/api/apps", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+        const created = app ? null : await r.json();
+        close();
+        await loadApps();
+        if (app && document.body.dataset.page === "app-detail" && _appsState.current && _appsState.current.id === app.id) {
+          await openApp(app.id);
+        } else if (!app && created) {
+          await openApp(created.id);
+        }
+      } catch (e) { alert(`Save failed: ${e.message}`); }
+    });
+    actions.append(spacer, cancel, save);
+    modal.append(form, actions);
+    setTimeout(() => name.input.focus(), 0);
+  });
+}
+
+async function _deleteApp(app) {
+  if (!confirm(`Delete the application "${app.name}"? Its bots are kept — they just become ungrouped.`)) return;
+  try {
+    const r = await fetch(`/api/apps/${app.id}`, { method: "DELETE" });
+    if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+    await loadConversations();
+    if (document.body.dataset.page === "app-detail") applyActivePage("apps");
+    await loadApps();
+  } catch (e) { alert(`Delete failed: ${e.message}`); }
+}
+
+function _openAddBotModal(app) {
+  _spawnModal((modal, close) => {
+    _modalHeader(modal, "Add a bot", close);
+    const hint = document.createElement("p"); hint.className = "kb-modal-hint";
+    hint.textContent = "Pick a bot to add to this application. A bot belongs to one application — adding it here moves it from any previous one.";
+    modal.appendChild(hint);
+    const list = document.createElement("div"); list.className = "kb-modal-list";
+    const appNameById = new Map((_appsState.cache || []).map(a => [a.id, a.name]));
+    const bots = _botsState.cache || [];
+    if (!bots.length) {
+      const e = document.createElement("div"); e.className = "kb-modal-empty"; e.textContent = "No bots yet — create one on the Bots page first.";
+      modal.appendChild(e);
+    }
+    for (const b of bots) {
+      const row = document.createElement("div"); row.className = "bot-card";
+      const av = document.createElement("span"); av.className = "bot-card-avatar"; _renderAvatarInto(av, b);
+      const tw = document.createElement("div"); tw.className = "bot-card-text";
+      const t = document.createElement("div"); t.className = "bot-card-title"; t.textContent = b.title || "(untitled)";
+      const m = document.createElement("div"); m.className = "bot-card-meta";
+      const here = b.app_id === app.id;
+      const status = here ? "in this application" : (b.app_id != null ? `in ${appNameById.get(b.app_id) || "another application"}` : "ungrouped");
+      const ms = document.createElement("span"); ms.textContent = status; m.appendChild(ms);
+      tw.append(t, m); row.append(av, tw);
+      const add = document.createElement("button");
+      add.className = "btn btn-small"; add.style.marginLeft = "auto";
+      add.textContent = here ? "Added" : "Add"; add.disabled = here;
+      add.addEventListener("click", async () => {
+        add.disabled = true;
+        try {
+          const r = await fetch(`/api/apps/${app.id}/bots`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversation_id: b.id }) });
+          if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+          await loadConversations();
+          close();
+          await openApp(app.id);
+        } catch (e) { alert(`Could not add bot: ${e.message}`); add.disabled = false; }
+      });
+      row.appendChild(add);
+      list.appendChild(row);
+    }
+    modal.appendChild(list);
+    const actions = document.createElement("div"); actions.className = "modal-actions";
+    const spacer = document.createElement("div"); spacer.style.flex = "1";
+    const done = document.createElement("button"); done.className = "btn btn-primary btn-small"; done.textContent = "Done"; done.onclick = close;
+    actions.append(spacer, done); modal.appendChild(actions);
+  });
+}
+
+// ── SDK preview modal (static markup in index.html) ──
+async function openSdkModal(appId, appName, lang) {
+  _sdkState.appId = appId;
+  _sdkState.appName = appName || "";
+  _sdkState.lang = lang || _sdkState.lang || "ts";
+  const ok = await _loadSdkFiles();
+  if (!ok) return;
+  const bd = document.getElementById("sdk-modal-backdrop");
+  if (bd) bd.classList.remove("hidden");
+}
+
+// Fetch the SDK files for the current (_sdkState.appId, _sdkState.lang) and
+// re-render the modal. Returns false on error so callers can bail without
+// opening/keeping the modal in a broken state.
+async function _loadSdkFiles() {
+  if (_sdkState.appId == null) return false;
+  let data;
+  try {
+    const r = await fetch(`/api/apps/${_sdkState.appId}/sdk?lang=${_sdkState.lang}`);
+    if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+    data = await r.json();
+  } catch (e) { alert(`Could not generate SDK: ${e.message}`); return false; }
+  _sdkState.files = data.files || [];
+  _sdkState.active = 0;
+  const nameEl = document.getElementById("sdk-modal-app");
+  if (nameEl) nameEl.textContent = data.app ? `· ${data.app.name}` : (_sdkState.appName ? `· ${_sdkState.appName}` : "");
+  const langLbl = document.getElementById("sdk-modal-lang-label");
+  if (langLbl) langLbl.textContent = _SDK_LANG_LABELS[_sdkState.lang] || _sdkState.lang;
+  const hint = document.getElementById("sdk-modal-hint");
+  if (hint) hint.textContent = _SDK_LANG_HINTS[_sdkState.lang] || hint.textContent;
+  document.querySelectorAll(".sdk-lang-tab").forEach(b => {
+    const active = b.dataset.lang === _sdkState.lang;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  _renderSdkModal();
+  return true;
+}
+
+function _renderSdkModal() {
+  const listEl = document.getElementById("sdk-file-list");
+  const codeEl = document.getElementById("sdk-code");
+  if (!listEl || !codeEl) return;
+  listEl.innerHTML = "";
+  _sdkState.files.forEach((f, i) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "sdk-file-item" + (i === _sdkState.active ? " active" : "");
+    // Drop the root "<slug>-sdk/" prefix for a cleaner tree.
+    b.textContent = f.path.split("/").slice(1).join("/") || f.path;
+    b.title = f.path;
+    b.addEventListener("click", () => { _sdkState.active = i; _renderSdkModal(); });
+    listEl.appendChild(b);
+  });
+  const f = _sdkState.files[_sdkState.active];
+  codeEl.className = "";
+  codeEl.removeAttribute("data-highlighted");
+  codeEl.textContent = f ? f.content : "";
+  if (window.hljs) { try { window.hljs.highlightElement(codeEl); } catch (_) {} }
+}
+
+function _closeSdkModal() {
+  const bd = document.getElementById("sdk-modal-backdrop");
+  if (bd) bd.classList.add("hidden");
+}
+
+function initAppsUI() {
+  const newBtn = document.getElementById("apps-new-btn");
+  if (newBtn) newBtn.addEventListener("click", () => _openAppFormModal({}));
+  const filter = document.getElementById("apps-filter");
+  if (filter) filter.addEventListener("input", () => { _appsState.filter = filter.value; renderAppsPage(); });
+  if (els.appsViewList) els.appsViewList.addEventListener("click", () => _setAppsView("list"));
+  if (els.appsViewGrid) els.appsViewGrid.addEventListener("click", () => _setAppsView("grid"));
+  _applyAppsView();
+  initAppsImportUI();
+
+  const close = document.getElementById("sdk-modal-close");
+  if (close) close.addEventListener("click", _closeSdkModal);
+  const bd = document.getElementById("sdk-modal-backdrop");
+  if (bd) bd.addEventListener("click", e => { if (e.target === bd) _closeSdkModal(); });
+  const copy = document.getElementById("sdk-copy");
+  if (copy) copy.addEventListener("click", async () => {
+    const f = _sdkState.files[_sdkState.active];
+    if (!f) return;
+    try { await navigator.clipboard.writeText(f.content); copy.textContent = "Copied!"; setTimeout(() => { copy.textContent = "Copy file"; }, 1200); }
+    catch { alert("Copy failed — select the text manually."); }
+  });
+  const dl = document.getElementById("sdk-download");
+  if (dl) dl.addEventListener("click", () => {
+    if (_sdkState.appId == null) return;
+    const a = document.createElement("a");
+    a.href = `/api/apps/${_sdkState.appId}/sdk.zip?lang=${_sdkState.lang}`; a.rel = "noopener";
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+  // Language tabs — switch lang, re-fetch, re-render. Disabled while loading
+  // so a quick double-click doesn't leave the modal showing stale files.
+  document.querySelectorAll(".sdk-lang-tab").forEach(b => {
+    b.addEventListener("click", async () => {
+      const next = b.dataset.lang;
+      if (!next || next === _sdkState.lang) return;
+      _sdkState.lang = next;
+      document.querySelectorAll(".sdk-lang-tab").forEach(x => x.disabled = true);
+      try { await _loadSdkFiles(); }
+      finally { document.querySelectorAll(".sdk-lang-tab").forEach(x => x.disabled = false); }
+    });
+  });
 }
 
 init();

@@ -270,6 +270,93 @@ class FakeOpenAI(_FakeServer):
         return H
 
 
+class FakeVoice(_FakeServer):
+    """Speaks the MiniClosedAI voice-backend contract (see voice.py).
+
+    Just enough of the four endpoints (`/health`, `/voices`, `/transcribe`,
+    `/speak/stream`) to satisfy the backend-status probe, the voices-list
+    reshape, and the per-conversation voice/turn endpoint (task #46). No real
+    ASR or TTS — `/transcribe` returns a canned string, `/speak/stream` yields
+    one short base64'd chunk + `{done:true}`.
+
+    Set `instance.fail = True` to make every route return 503 — used to test
+    the unreachable-backend path without spinning up a separate dead server.
+    """
+    fail: bool = False
+
+    def _handler_class(self):
+        captured = self.captured
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a, **kw): pass
+
+            def do_GET(self):
+                if outer.fail:
+                    self._reply(503, b"down", "text/plain"); return
+                if self.path == "/health":
+                    body = json.dumps({
+                        "ok": True,
+                        "asr_model": "fake-whisper-small",
+                        "tts_model": "fake-melo-multilingual",
+                        "device": "cpu",
+                        "voices_loaded": True,
+                    }).encode()
+                    self._reply(200, body, "application/json"); return
+                if self.path == "/voices":
+                    body = json.dumps({
+                        "en": [
+                            {"id": "en_F_0", "name": "English Female",   "gender": "F"},
+                            {"id": "en_M_0", "name": "English Male",     "gender": "M"},
+                        ],
+                        "es": [
+                            {"id": "es_F_0", "name": "Spanish Female",   "gender": "F"},
+                            {"id": "es_M_0", "name": "Spanish Male",     "gender": "M"},
+                        ],
+                    }).encode()
+                    self._reply(200, body, "application/json"); return
+                self._reply(404, b"not found", "text/plain")
+
+            def do_POST(self):
+                if outer.fail:
+                    self._reply(503, b"down", "text/plain"); return
+                if self.path == "/transcribe":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    self.rfile.read(length)   # drain multipart, don't bother parsing
+                    captured.append({"path": self.path, "len": length})
+                    body = json.dumps({
+                        "text": "hello world",
+                        "language": "en",
+                    }).encode()
+                    self._reply(200, body, "application/json"); return
+                if self.path == "/speak/stream":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length)) if length else {}
+                    captured.append({"path": self.path, "payload": payload})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    # One tiny base64 chunk + the terminal {done:true}.
+                    frames = [
+                        {"chunk_b64": "AAA=", "sample_rate": 22050},
+                        {"done": True, "sample_rate": 22050},
+                    ]
+                    for f in frames:
+                        self.wfile.write(f"data: {json.dumps(f)}\n\n".encode())
+                        self.wfile.flush()
+                    return
+                self._reply(404, b"not found", "text/plain")
+
+            def _reply(self, status, body, ct):
+                self.send_response(status)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        return H
+
+
 # ------------------------------------------------------------------
 # Test runner (tiny, stdlib only)
 # ------------------------------------------------------------------
@@ -284,6 +371,10 @@ def test(name: str):
             t0 = time.perf_counter()
             try:
                 fn()
+            except _SkipTest as e:
+                _RESULTS.append((name, "skip", str(e) or "skipped"))
+                print(f"  ⊘ {name}  (skipped: {e or 'no reason'})  ({time.perf_counter()-t0:.2f}s)")
+                return
             except AssertionError as e:
                 _RESULTS.append((name, False, f"AssertionError: {e}"))
                 print(f"  ✗ {name}  ({time.perf_counter()-t0:.2f}s)")
@@ -300,6 +391,16 @@ def test(name: str):
         _TESTS.append((name, runner))
         return runner
     return deco
+
+
+class _SkipTest(Exception):
+    """Raised by a test to mark itself skipped (e.g. when a live service is
+    unavailable). The test runner catches this separately from real failures."""
+
+
+def skip(reason: str = "") -> None:
+    """Inside a test body, abort and mark the test skipped with `reason`."""
+    raise _SkipTest(reason)
 
 
 # ------------------------------------------------------------------
@@ -331,6 +432,7 @@ def sse_events(raw: bytes | str) -> list[dict]:
 client = TestClient(app_mod.app)    # triggers lifespan → init_db against temp DB
 fake_ollama = FakeOllama()
 fake_openai = FakeOpenAI()
+fake_voice = FakeVoice()
 
 
 def _reseed_builtin_to_fake_ollama() -> None:
@@ -346,6 +448,52 @@ def _add_openai_backend() -> int:
     })
     assert r.status_code == 200, r.text
     return r.json()["id"]
+
+
+def _add_voice_backend() -> int:
+    """Register the fake voice service as a new backend; return its id."""
+    r = client.post("/api/backends", json={
+        "name": "FakeVoice", "kind": "voice",
+        "base_url": fake_voice.base_url,
+    })
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+# Probe for a real, running miniclosedai-voice Docker service. When present,
+# the "voice integration:" tests below run end-to-end against it; when absent,
+# they skip cleanly so CI / a fresh clone without the voice service still goes
+# 100% green. Override with `MINICLOSEDAI_VOICE_URL=…` to point at a remote.
+_VOICE_URL_PROBED: tuple[str, ...] | None = None  # cached after first call
+
+
+def _probe_real_voice_service() -> str | None:
+    """Return the URL of a reachable voice service (with kind='voice' contract),
+    or None if no service responds. Caches the result for the suite lifetime."""
+    global _VOICE_URL_PROBED
+    if _VOICE_URL_PROBED is not None:
+        return _VOICE_URL_PROBED[0] if _VOICE_URL_PROBED else None
+    candidates = [
+        os.environ.get("MINICLOSEDAI_VOICE_URL"),
+        "http://127.0.0.1:8090",
+        "http://localhost:8090",
+    ]
+    import urllib.request, urllib.error
+    for url in candidates:
+        if not url:
+            continue
+        url = url.rstrip("/")
+        try:
+            with urllib.request.urlopen(f"{url}/health", timeout=2) as r:
+                if r.status == 200:
+                    body = json.loads(r.read().decode())
+                    if body.get("ok") is True and body.get("tts_model"):
+                        _VOICE_URL_PROBED = (url,)
+                        return url
+        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            continue
+    _VOICE_URL_PROBED = ()
+    return None
 
 
 # ==================================================================
@@ -564,6 +712,386 @@ def _():
     assert j["models_count"] == 2
 
 
+@test("voice backend: kind=voice round-trips through create + list")
+def _():
+    bid = _add_voice_backend()
+    try:
+        # POST returned the row; list contains it with kind preserved + api_key scrubbed.
+        all_backends = client.get("/api/backends").json()
+        b = next(x for x in all_backends if x["id"] == bid)
+        assert b["kind"] == "voice"
+        assert b["base_url"] == fake_voice.base_url
+        assert b["api_key_set"] is False
+        assert b["enabled"] == 1
+    finally:
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("voice backend: /status reports reachable via /health (and unreachable on failure)")
+def _():
+    bid = _add_voice_backend()
+    try:
+        j = client.get(f"/api/backends/{bid}/status").json()
+        assert j == {"running": True, "base_url": fake_voice.base_url,
+                     "kind": "voice", "enabled": True}, j
+        # Toggle the fake to 503 — /status now reports unreachable, no exception.
+        fake_voice.fail = True
+        try:
+            j2 = client.get(f"/api/backends/{bid}/status").json()
+            assert j2["running"] is False, j2
+        finally:
+            fake_voice.fail = False
+    finally:
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("voice backend: /models reshapes /voices into <lang>/<voice_id> entries")
+def _():
+    bid = _add_voice_backend()
+    try:
+        j = client.get(f"/api/backends/{bid}/models").json()
+        assert j["running"] is True
+        names = {m["name"] for m in j["models"]}
+        # FakeVoice ships 2 English + 2 Spanish voices.
+        assert {"en/en_F_0", "en/en_M_0", "es/es_F_0", "es/es_M_0"}.issubset(names), names
+        # Details carry the language + voice_id so the dropdowns can group cleanly.
+        m = next(m for m in j["models"] if m["name"] == "es/es_F_0")
+        assert m["details"]["language"] == "es"
+        assert m["details"]["voice_id"] == "es_F_0"
+        assert m["details"]["display"] == "Spanish Female"
+        assert m["details"]["family"] == "voice"
+    finally:
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("voice backend: /test draft probe reports reachable + voice count")
+def _():
+    r = client.post("/api/backends/test", json={
+        "name": "voice-draft", "kind": "voice",
+        "base_url": fake_voice.base_url,
+    })
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["running"] is True
+    # /models for voice returns the reshaped voices list; the count is the total
+    # voices across all languages (2 EN + 2 ES = 4).
+    assert j["models_count"] == 4, j
+
+
+@test("voice endpoints: /voice/transcribe proxies through to the backend")
+def _():
+    vbid = _add_voice_backend()
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "voice-transcribe", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        r = client.post(
+            f"/api/conversations/{c['id']}/voice/transcribe",
+            files={"audio": ("hello.wav", b"\x00\x00\x00\x00", "audio/wav")},
+        )
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["text"] == "hello world"
+        assert j["language"] == "en"
+        # Sanity: FakeVoice captured the request.
+        assert any(p.get("path") == "/transcribe" for p in fake_voice.captured)
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{vbid}")
+
+
+@test("voice endpoints: /voice/speak streams SSE chunks + uses defaults from /voices")
+def _():
+    vbid = _add_voice_backend()
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "voice-speak", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        with client.stream("POST", f"/api/conversations/{c['id']}/voice/speak",
+                           json={"text": "Hola"}) as r:
+            body = b"".join(r.iter_bytes())
+        evts = sse_events(body)
+        # FakeVoice emits one chunk + one {done:true}.
+        assert any("chunk_b64" in e for e in evts), evts
+        assert any(e.get("done") for e in evts), evts
+        # Defaulted to the first voice (en/en_F_0) since voice_settings is empty.
+        speak_calls = [p["payload"] for p in fake_voice.captured if p.get("path") == "/speak/stream"]
+        assert speak_calls, fake_voice.captured
+        assert speak_calls[-1]["voice"] == "en_F_0"
+        assert speak_calls[-1]["language"] == "en"
+        assert speak_calls[-1]["text"] == "Hola"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{vbid}")
+
+
+@test("voice endpoints: /voice/turn chains ASR → chat → TTS into one SSE stream")
+def _():
+    vbid = _add_voice_backend()
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "voice-turn", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        fake_voice.captured.clear()
+        with client.stream(
+            "POST", f"/api/conversations/{c['id']}/voice/turn",
+            files={"audio": ("greeting.wav", b"\x00\x00\x00\x00", "audio/wav")},
+        ) as r:
+            body = b"".join(r.iter_bytes())
+        evts = sse_events(body)
+        kinds = [next(iter(e.keys())) for e in evts if e]
+        # Order: transcript first, then LLM chunks, then audio chunks, then end.
+        assert "transcript" in kinds, kinds
+        assert "chunk" in kinds, kinds          # FakeOllama emits the assistant text
+        assert "audio_chunk_b64" in kinds, kinds
+        assert any(e.get("end") for e in evts), evts
+        # The transcript reached FakeOllama as the user message verbatim.
+        ollama_call = next(
+            p["payload"] for p in fake_ollama.captured if p["path"] == "/api/chat"
+        )
+        last_user = next(m for m in reversed(ollama_call["messages"]) if m["role"] == "user")
+        assert last_user["content"] == "hello world"
+        # And the turn was persisted on the conv.
+        got = client.get(f"/api/conversations/{c['id']}").json()
+        roles = [m["role"] for m in got["messages"]]
+        assert roles == ["user", "assistant"], roles
+        assert got["messages"][0]["content"] == "hello world"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{vbid}")
+
+
+@test("call mode: composer ships a #call-btn + app.js carries the WebRTC module")
+def _():
+    # The 📞 button is HTML markup; the JS module wires getUserMedia + RTCPeerConnection
+    # + DataChannel handling. Both must be present in the served assets.
+    html = client.get("/static/index.html").text
+    assert 'id="call-btn"' in html, "call-btn missing from index.html"
+    assert "Call the bot" in html, "call-btn aria-label / tooltip missing"
+    js = client.get("/static/app.js").text
+    assert "_refreshCallAffordance" in js, "call affordance gate missing"
+    assert "_startCall" in js and "_endCall" in js, "call lifecycle helpers missing"
+    assert "RTCPeerConnection" in js, "WebRTC peer connection setup missing"
+    assert "EventSource" in js, "SSE consumer for transcript/chunk events missing"
+    assert "initCallButton" in js, "initCallButton hook missing"
+
+
+@test("voice endpoints: 404 when no voice backend is configured")
+def _():
+    # No voice backend in the DB. Endpoints must surface a clear 404 rather
+    # than blowing up trying to call a phantom backend.
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "no-voice-backend", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        r = client.post(
+            f"/api/conversations/{c['id']}/voice/transcribe",
+            files={"audio": ("x.wav", b"\x00", "audio/wav")},
+        )
+        assert r.status_code == 404
+        assert "Settings" in r.json()["detail"], r.json()
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("voice integration: /voice/speak streams real audio from the live voice service")
+def _():
+    # Live integration — runs only when miniclosedai-voice is reachable.
+    # Validates that MiniClosedAI's /voice/speak proxy actually drives Piper
+    # end-to-end (the FakeVoice tests only check the proxy contract).
+    voice_url = _probe_real_voice_service()
+    if not voice_url:
+        skip("no voice service reachable (start miniclosedai-voice container)")
+    bid = client.post("/api/backends", json={
+        "name": "live-voice", "kind": "voice", "base_url": voice_url,
+    }).json()["id"]
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "speak-live", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        with client.stream("POST", f"/api/conversations/{c['id']}/voice/speak",
+                           json={"text": "Hello from the integration suite.",
+                                 "voice": "en_US-amy-medium", "language": "en"}) as r:
+            body = b"".join(r.iter_bytes())
+        evts = sse_events(body)
+        chunks = [e for e in evts if "chunk_b64" in e]
+        assert chunks, f"no audio chunks: {evts[:3]}"
+        assert any(e.get("done") for e in evts), f"no terminal done event: {evts}"
+        # Each chunk is base64-encoded int16 PCM at the sample_rate advertised.
+        first = chunks[0]
+        assert first.get("sample_rate", 0) > 0
+        raw = base64.b64decode(first["chunk_b64"])
+        assert len(raw) >= 320, f"first chunk too small ({len(raw)} bytes)"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("voice integration: /voice/transcribe round-trips real TTS through real ASR")
+def _():
+    # Synthesize speech via /speak, hand the WAV back to /voice/transcribe,
+    # and verify the round-trip recovers recognizable text. Skips when the
+    # voice service isn't running.
+    voice_url = _probe_real_voice_service()
+    if not voice_url:
+        skip("no voice service reachable (start miniclosedai-voice container)")
+    import urllib.request
+    # 1. Synthesize "this is a test" directly on the voice server.
+    req = urllib.request.Request(
+        f"{voice_url}/speak",
+        data=json.dumps({"text": "This is a test of the voice integration.",
+                         "voice": "en_US-amy-medium", "language": "en"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        wav = r.read()
+    assert wav.startswith(b"RIFF"), f"expected WAV header, got {wav[:8]!r}"
+
+    # 2. Register the live backend + a conv, then transcribe via MiniClosedAI's proxy.
+    bid = client.post("/api/backends", json={
+        "name": "live-voice", "kind": "voice", "base_url": voice_url,
+    }).json()["id"]
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "transcribe-live", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        r = client.post(
+            f"/api/conversations/{c['id']}/voice/transcribe",
+            files={"audio": ("test.wav", wav, "audio/wav")},
+        )
+        assert r.status_code == 200, r.text
+        out = r.json()
+        text = (out.get("text") or "").lower()
+        # Whisper-small isn't perfect — accept partial match of distinctive words.
+        assert "test" in text or "voice" in text or "integration" in text, \
+            f"no recognizable word in transcript: {text!r}"
+        assert out.get("language"), out
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("voice backend: conversations.voice_settings column round-trips through GET")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "voice-prefs", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        got = client.get(f"/api/conversations/{c['id']}").json()
+        # New conv has empty voice_settings — JSON-decoded by row_to_dict.
+        assert "voice_settings" in got
+        assert got["voice_settings"] == {}, got["voice_settings"]
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("/api/voices: 404 when no voice backend is registered")
+def _():
+    # No voice backend in default seed → endpoint refuses cleanly.
+    r = client.get("/api/voices")
+    assert r.status_code == 404, r.text
+
+
+@test("voice picker affordance: visibility tracks /api/backends, not /api/voices catalog")
+def _():
+    # The frontend gate `_hasVoiceBackend()` reads `backendCache` (populated
+    # by `/api/backends`), NOT the `/api/voices` catalog. This test pins the
+    # contract on the server side so the frontend's affordance can rely on
+    # it: `/api/backends` reports whether a voice backend is registered;
+    # `/api/voices` reports the catalog (which may be empty / unreachable
+    # even when the backend exists). Picker should appear/disappear based on
+    # the former so it stays in sync with the mic + call buttons.
+    # 1. No voice backend → /api/backends has none → picker HIDDEN.
+    backends = client.get("/api/backends").json()
+    assert not any(b.get("kind") == "voice" for b in backends), (
+        f"unexpected voice backend in default fixture: {backends}"
+    )
+    # 2. Register a voice backend → /api/backends has one → picker VISIBLE
+    #    (the frontend doesn't need to round-trip through /api/voices to know).
+    vid = _add_voice_backend()
+    try:
+        backends = client.get("/api/backends").json()
+        voice_rows = [b for b in backends if b.get("kind") == "voice" and b.get("enabled")]
+        assert len(voice_rows) == 1, voice_rows
+        # And /api/voices independently works when the backend is reachable —
+        # this is what populates the picker contents (not its visibility).
+        cat = client.get("/api/voices")
+        assert cat.status_code == 200, cat.text
+        assert cat.json()["backend_id"] == vid
+    finally:
+        client.delete(f"/api/backends/{vid}")
+    # 3. After delete → /api/backends has none again → picker HIDDEN.
+    backends = client.get("/api/backends").json()
+    assert not any(b.get("kind") == "voice" for b in backends)
+
+
+@test("/api/voices: flat list with id/name/language/gender from the voice backend")
+def _():
+    vid = _add_voice_backend()
+    try:
+        r = client.get("/api/voices")
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j["backend_id"] == vid
+        voices = j["voices"]
+        # FakeVoice ships 2 English + 2 Spanish.
+        assert len(voices) == 4, voices
+        # Every entry has the four expected keys.
+        for v in voices:
+            assert {"id", "name", "language"}.issubset(v.keys()), v
+        langs = sorted({v["language"] for v in voices})
+        assert langs == ["en", "es"], langs
+        ids = sorted(v["id"] for v in voices)
+        assert ids == ["en_F_0", "en_M_0", "es_F_0", "es_M_0"], ids
+    finally:
+        client.delete(f"/api/backends/{vid}")
+
+
+@test("PATCH conversation: voice_settings persists round-trip")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "voice-pick", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        # Set
+        r = client.patch(f"/api/conversations/{c['id']}", json={
+            "voice_settings": {"voice_id": "en_F_0", "language": "en"},
+        })
+        assert r.status_code == 200, r.text
+        got = client.get(f"/api/conversations/{c['id']}").json()
+        assert got["voice_settings"] == {"voice_id": "en_F_0", "language": "en"}
+        # Clear with empty dict
+        r = client.patch(f"/api/conversations/{c['id']}", json={"voice_settings": {}})
+        assert r.status_code == 200, r.text
+        assert client.get(f"/api/conversations/{c['id']}").json()["voice_settings"] == {}
+        # Reject non-object
+        r = client.patch(f"/api/conversations/{c['id']}", json={"voice_settings": "nope"})
+        assert r.status_code == 422 or r.status_code == 400, r.text
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+
+
+@test("static: voice picker markup present + JS symbols")
+def _():
+    html = client.get("/").text
+    # The voice picker sits to the left of the model picker in the topbar.
+    assert 'id="voice-picker"' in html
+    assert 'id="voice-select"' in html
+    js = client.get("/static/app.js").text
+    for sym in ("loadVoices", "_renderVoicePicker", "_setVoiceSelectFromConv", "_buildVoiceSettingsPatch",
+                "_hasVoiceBackend", "_refreshVoicePickerAffordance"):
+        assert sym in js, f"missing {sym} in served app.js"
+
+
 @test("/api/models: aggregated shape + legacy back-compat keys")
 def _():
     _reseed_builtin_to_fake_ollama()
@@ -581,6 +1109,27 @@ def _():
         assert any(m["name"] == "ollama-a:3b" for m in j["models"])
     finally:
         client.delete(f"/api/backends/{bid}")
+
+
+@test("/api/models: voice backends are NOT listed — TTS voices stay out of the LLM picker")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    vid = _add_voice_backend()
+    try:
+        r = client.get("/api/models")
+        assert r.status_code == 200
+        j = r.json()
+        kinds = [b["kind"] for b in j["backends"]]
+        assert "voice" not in kinds, (
+            f"voice backend leaked into /api/models — kinds: {kinds}. "
+            "TTS voices would pollute the LLM model dropdown in the chat topbar."
+        )
+        # The voice backend itself still exists via /api/backends — only the
+        # LLM-picker endpoint excludes it.
+        all_backends = client.get("/api/backends").json()
+        assert any(b["id"] == vid and b["kind"] == "voice" for b in all_backends)
+    finally:
+        client.delete(f"/api/backends/{vid}")
 
 
 @test("conversations: CRUD roundtrip + backend_id persists")
@@ -1150,6 +1699,20 @@ def _():
     assert 'id="model-picker-btn"' in body
     assert 'id="model-picker-search"' in body
     assert 'id="model-select"' in body
+    # Apps page header + toolbar wiring: import button, file input, the
+    # list/grid view toggle (mirrors the Bots page's toggle one-for-one).
+    assert 'id="apps-list"' in body
+    assert 'id="apps-import-btn"' in body
+    assert 'id="apps-import-file"' in body
+    assert 'id="apps-view-list"' in body
+    assert 'id="apps-view-grid"' in body
+    # The global tooltip element — a single fixed-positioned <body> child
+    # that every [data-tooltip] hover hijacks. Without this, tooltips fall
+    # back to per-trigger pseudo-elements that get clipped by ancestor
+    # `overflow: hidden`. Guard the architectural decision in CI.
+    assert 'id="global-tooltip"' in body
+    # Backend-picker modal is shared between bot and app import flows.
+    assert 'id="import-modal-backdrop"' in body
 
 
 @test("static: app.js is served and contains recent helpers")
@@ -1183,6 +1746,14 @@ def _():
         "initEvalsUI", "initEvalModalUI",
         # Searchable model picker
         "initModelPicker", "_rebuildModelPicker", "_syncModelPickerLabel",
+        # Application export / import — mirrors the bot pattern at the apps level.
+        "_handleAppImportFile", "_runAppImport", "_downloadApp",
+        "initAppsImportUI",
+        # Apps page grid/list view toggle (parallels the bots toggle).
+        "_APPS_VIEW_KEY", "_applyAppsView", "_setAppsView",
+        # Global tooltip system — one fixed-positioned element on <body>
+        # that escapes every stacking context / overflow clip.
+        "initGlobalTooltip", "_showGlobalTooltip", "_hideGlobalTooltip",
     ]
     for needle in needles:
         assert needle in r.text, f"missing {needle} in served app.js"
@@ -3169,6 +3740,240 @@ def _():
     assert r.status_code == 400, r.text
 
 
+# ---- App import/export ----
+
+@test("app export: returns miniclosed-app json with metadata + each bot block")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    b1 = client.post("/api/conversations", json={
+        "title": "App Bot Alpha", "model": "ollama-a:3b",
+        "system_prompt": "alpha system", "temperature": 0.4, "backend_id": 1,
+    }).json()["id"]
+    b2 = client.post("/api/conversations", json={
+        "title": "App Bot Beta", "model": "ollama-a:3b",
+        "system_prompt": "beta system", "temperature": 0.7, "backend_id": 1,
+    }).json()["id"]
+    aid = client.post("/api/apps", json={
+        "name": "Exportable App", "description": "for the test", "link": "https://e.example",
+    }).json()["id"]
+    try:
+        assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b1}).status_code == 201
+        assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b2}).status_code == 201
+
+        r = client.get(f"/api/apps/{aid}/export")
+        assert r.status_code == 200, r.text
+        assert ".miniclosed-app.json" in r.headers.get("content-disposition", ""), r.headers
+        j = r.json()
+        assert j["format"] == "miniclosed-app"
+        assert j["format_version"] == 1
+        assert j["application"]["name"] == "Exportable App"
+        assert j["application"]["description"] == "for the test"
+        assert j["application"]["link"] == "https://e.example"
+        # Bots come through as a list of bot blocks (same shape as bot export's `bot`).
+        assert isinstance(j["bots"], list) and len(j["bots"]) == 2
+        titles = sorted(b["title"] for b in j["bots"])
+        assert titles == ["App Bot Alpha", "App Bot Beta"], titles
+        for b in j["bots"]:
+            assert "backend_id" not in b, "backend_id must not leak — it's per-instance"
+            assert "id" not in b, "DB id must not leak"
+            assert isinstance(b["params"], dict)
+            assert b["sample_messages"] == []  # include_history defaults to false
+    finally:
+        client.delete(f"/api/apps/{aid}")
+        client.delete(f"/api/conversations/{b1}")
+        client.delete(f"/api/conversations/{b2}")
+
+
+@test("app export: include_history=true carries each bot's messages")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    cid = _seed_conv_with_turn("app-export-history")
+    aid = client.post("/api/apps", json={"name": "History App"}).json()["id"]
+    try:
+        assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": cid}).status_code == 201
+        r = client.get(f"/api/apps/{aid}/export?include_history=true")
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert len(j["bots"]) == 1
+        msgs = j["bots"][0]["sample_messages"]
+        assert isinstance(msgs, list) and len(msgs) >= 2, msgs
+        roles = [m.get("role") for m in msgs]
+        assert "user" in roles and "assistant" in roles, roles
+    finally:
+        client.delete(f"/api/apps/{aid}")
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("app import: round-trip — export then import recreates app + bots with one backend")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    b1 = client.post("/api/conversations", json={
+        "title": "RT App Bot 1", "model": "ollama-a:3b",
+        "system_prompt": "one", "temperature": 0.3, "backend_id": 1,
+    }).json()["id"]
+    b2 = client.post("/api/conversations", json={
+        "title": "RT App Bot 2", "model": "ollama-a:3b",
+        "system_prompt": "two", "temperature": 0.9, "backend_id": 1,
+    }).json()["id"]
+    aid = client.post("/api/apps", json={"name": "Roundtrip App"}).json()["id"]
+    new_app_id = None
+    new_bot_ids: list[int] = []
+    try:
+        client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b1})
+        client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b2})
+        export = client.get(f"/api/apps/{aid}/export").json()
+
+        r = client.post("/api/apps/import", json={"data": export})
+        assert r.status_code == 201, r.text
+        body = r.json()
+        new_app_id = body["id"]
+        new_bot_ids = list(body["bot_ids"])
+        assert body["matched_backend_id"] == 1, body
+        # App name collides with source -> suffix appended.
+        assert body["name"].startswith("Roundtrip App") and body["name"] != "Roundtrip App", body
+        # Detail page returns both bots, bound to the new app.
+        detail = client.get(f"/api/apps/{new_app_id}").json()
+        assert len(detail["bots"]) == 2
+        assert {b["title"].split(" (")[0] for b in detail["bots"]} == {"RT App Bot 1", "RT App Bot 2"}
+        for b in detail["bots"]:
+            assert b["backend_id"] == 1
+        # Each bot also appears in the global conversation list with the new app_id.
+        convs = {c["id"]: c["app_id"] for c in client.get("/api/conversations").json()}
+        for nb in new_bot_ids:
+            assert convs[nb] == new_app_id, (nb, convs.get(nb))
+    finally:
+        for nb in new_bot_ids:
+            client.delete(f"/api/conversations/{nb}")
+        if new_app_id is not None:
+            client.delete(f"/api/apps/{new_app_id}")
+        client.delete(f"/api/apps/{aid}")
+        client.delete(f"/api/conversations/{b1}")
+        client.delete(f"/api/conversations/{b2}")
+
+
+@test("app import: 409 needs_backend when no enabled backend covers every model")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    export = {
+        "format": "miniclosed-app",
+        "format_version": 1,
+        "application": {"name": "Unmatched App"},
+        "bots": [
+            {"title": "X", "model": "no-such-model:99b", "system_prompt": "x", "params": {}},
+            {"title": "Y", "model": "also-missing:1b", "system_prompt": "y", "params": {}},
+        ],
+    }
+    r = client.post("/api/apps/import", json={"data": export})
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body.get("needs_backend") is True
+    assert set(body.get("models", [])) == {"no-such-model:99b", "also-missing:1b"}, body
+    # Built-in backend appears in candidates but doesn't have either model.
+    assert any(b["id"] == 1 for b in body["available_backends"])
+    assert all(not b["model_present"] for b in body["available_backends"]), body
+
+
+@test("app import: explicit backend_id bypasses auto-match and is applied to every bot")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    export = {
+        "format": "miniclosed-app",
+        "format_version": 1,
+        "application": {"name": "Forced App"},
+        "bots": [
+            {"title": "F1", "model": "no-such-model:99b", "system_prompt": "f1", "params": {}},
+            {"title": "F2", "model": "also-missing:1b", "system_prompt": "f2", "params": {}},
+        ],
+    }
+    r = client.post("/api/apps/import", json={"data": export, "backend_id": 1})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    new_app_id = body["id"]
+    new_bot_ids = list(body["bot_ids"])
+    try:
+        assert body["matched_backend_id"] == 1
+        for nb in new_bot_ids:
+            row = client.get(f"/api/conversations/{nb}").json()
+            assert row["backend_id"] == 1, row
+    finally:
+        for nb in new_bot_ids:
+            client.delete(f"/api/conversations/{nb}")
+        client.delete(f"/api/apps/{new_app_id}")
+
+
+@test("app import: title-collision suffix applied per bot and to the app name")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    # Pre-seed a conv whose title will clash with one of the imported bots.
+    existing = client.post("/api/conversations", json={
+        "title": "Collider Bot", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()["id"]
+    existing_app = client.post("/api/apps", json={"name": "Collider App"}).json()["id"]
+    export = {
+        "format": "miniclosed-app",
+        "format_version": 1,
+        "application": {"name": "Collider App"},
+        "bots": [
+            {"title": "Collider Bot", "model": "ollama-a:3b", "system_prompt": "s", "params": {}},
+            {"title": "Other Bot", "model": "ollama-a:3b", "system_prompt": "s", "params": {}},
+        ],
+    }
+    r = client.post("/api/apps/import", json={"data": export})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    new_app_id = body["id"]
+    new_bot_ids = list(body["bot_ids"])
+    try:
+        assert body["name"] != "Collider App", body
+        assert body["name"].startswith("Collider App"), body
+        new_titles = {
+            client.get(f"/api/conversations/{nb}").json()["title"]
+            for nb in new_bot_ids
+        }
+        # The "Collider Bot" title clashed with the seeded conv -> suffix.
+        assert "Collider Bot" not in new_titles, new_titles
+        assert any(t.startswith("Collider Bot") for t in new_titles), new_titles
+    finally:
+        for nb in new_bot_ids:
+            client.delete(f"/api/conversations/{nb}")
+        client.delete(f"/api/apps/{new_app_id}")
+        client.delete(f"/api/apps/{existing_app}")
+        client.delete(f"/api/conversations/{existing}")
+
+
+@test("app import: malformed payload rejected with 400")
+def _():
+    # Wrong format string
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-bot", "format_version": 1, "application": {"name": "x"}, "bots": []}})
+    assert r.status_code == 400, r.text
+    # Missing application
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-app", "format_version": 1, "bots": []}})
+    assert r.status_code == 400, r.text
+    # Empty application.name
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-app", "format_version": 1,
+                                   "application": {"name": "  "}, "bots": []}})
+    assert r.status_code == 400, r.text
+    # Missing bots array
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-app", "format_version": 1,
+                                   "application": {"name": "ok"}}})
+    assert r.status_code == 400, r.text
+    # Bad bot inside list (no model)
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-app", "format_version": 1,
+                                   "application": {"name": "ok"},
+                                   "bots": [{"title": "missing-model"}]}})
+    assert r.status_code == 400, r.text
+    # Future format_version
+    r = client.post("/api/apps/import",
+                    json={"data": {"format": "miniclosed-app", "format_version": 99,
+                                   "application": {"name": "ok"}, "bots": []}})
+    assert r.status_code == 400, r.text
+
+
 # ---- LLM request/response log buffer ----
 
 @test("logs: chat calls are recorded with status, latency, response preview")
@@ -3468,6 +4273,493 @@ def _():
 
 
 # ==================================================================
+# Applications (groups of bots) + per-app TypeScript SDK
+# ==================================================================
+
+@test("apps: migration adds apps table + conversations.app_id")
+def _():
+    import sqlite3
+    conn = sqlite3.connect(_TMP_DB)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "apps" in tables, tables
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)")}
+        assert "app_id" in cols, cols
+    finally:
+        conn.close()
+
+
+@test("apps: CRUD + bot_count; delete unlinks bots (keeps them)")
+def _():
+    bid = _add_openai_backend()
+    b1 = client.post("/api/conversations", json={"title": "App Bot 1", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    b2 = client.post("/api/conversations", json={"title": "App Bot 2", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    r = client.post("/api/apps", json={"name": "Test App", "link": "https://x.example", "description": "d"})
+    assert r.status_code == 201, r.text
+    aid = r.json()["id"]
+    assert r.json()["name"] == "Test App"
+    assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b1}).status_code == 201
+    assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b2}).status_code == 201
+    row = next(a for a in client.get("/api/apps").json() if a["id"] == aid)
+    assert row["bot_count"] == 2, row
+    detail = client.get(f"/api/apps/{aid}").json()
+    assert {x["title"] for x in detail["bots"]} == {"App Bot 1", "App Bot 2"}
+    assert client.patch(f"/api/apps/{aid}", json={"name": "Renamed"}).status_code == 200
+    assert client.get(f"/api/apps/{aid}").json()["name"] == "Renamed"
+    # conversation list exposes app_id
+    convs = {c["id"]: c["app_id"] for c in client.get("/api/conversations").json()}
+    assert convs[b1] == aid, convs
+    # delete app -> bots survive, ungrouped
+    assert client.delete(f"/api/apps/{aid}").status_code == 200
+    convs = {c["id"]: c["app_id"] for c in client.get("/api/conversations").json()}
+    assert convs[b1] is None and convs[b2] is None, convs
+    assert client.get(f"/api/conversations/{b1}").status_code == 200
+    client.delete(f"/api/conversations/{b1}")
+    client.delete(f"/api/conversations/{b2}")
+
+
+@test("apps: one app per bot — adding to a second app moves it")
+def _():
+    bid = _add_openai_backend()
+    b = client.post("/api/conversations", json={"title": "Mover", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    a1 = client.post("/api/apps", json={"name": "A1"}).json()["id"]
+    a2 = client.post("/api/apps", json={"name": "A2"}).json()["id"]
+    client.post(f"/api/apps/{a1}/bots", json={"conversation_id": b})
+    assert len(client.get(f"/api/apps/{a1}").json()["bots"]) == 1
+    client.post(f"/api/apps/{a2}/bots", json={"conversation_id": b})  # moves out of a1
+    assert len(client.get(f"/api/apps/{a1}").json()["bots"]) == 0
+    assert len(client.get(f"/api/apps/{a2}").json()["bots"]) == 1
+    assert client.delete(f"/api/apps/{a2}/bots/{b}").status_code == 200
+    assert len(client.get(f"/api/apps/{a2}").json()["bots"]) == 0
+    # removing a bot not in the app -> 404
+    assert client.delete(f"/api/apps/{a1}/bots/{b}").status_code == 404
+    client.delete(f"/api/apps/{a1}")
+    client.delete(f"/api/apps/{a2}")
+    client.delete(f"/api/conversations/{b}")
+
+
+@test("apps: SDK preview + zip expose bots as deduped functions")
+def _():
+    bid = _add_openai_backend()
+    b1 = client.post("/api/conversations", json={"title": "Intake Reviewer", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    b2 = client.post("/api/conversations", json={"title": "Intake Reviewer", "model": "openai-a-4b", "backend_id": bid}).json()["id"]
+    aid = client.post("/api/apps", json={"name": "SDK App"}).json()["id"]
+    client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b1})
+    client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b2})
+    sdk = client.get(f"/api/apps/{aid}/sdk").json()
+    paths = [f["path"] for f in sdk["files"]]
+    assert any(p.endswith("client.ts") for p in paths), paths
+    assert any(p.endswith("index.ts") for p in paths), paths
+    bot_files = sorted(p for p in paths if "/bots/" in p)
+    assert len(bot_files) == 2 and bot_files[0] != bot_files[1], bot_files  # dup titles deduped
+    blob = "\n".join(f["content"] for f in sdk["files"])
+    assert "intakeReviewer" in blob
+    assert f"new Bot({b1})" in blob and f"new Bot({b2})" in blob, blob
+    z = client.get(f"/api/apps/{aid}/sdk.zip")
+    assert z.status_code == 200 and z.headers["content-type"].startswith("application/zip")
+    assert "sdk-app-sdk.zip" in z.headers.get("content-disposition", "")
+    import zipfile as _zip, io as _io
+    names = _zip.ZipFile(_io.BytesIO(z.content)).namelist()
+    assert any(n.endswith("index.ts") for n in names), names
+    client.delete(f"/api/apps/{aid}")
+    client.delete(f"/api/conversations/{b1}")
+    client.delete(f"/api/conversations/{b2}")
+
+
+@test("apps: SDK lang=js produces a JavaScript package + zip filename suffix")
+def _():
+    bid = _add_openai_backend()
+    b = client.post("/api/conversations", json={
+        "title": "Intake Reviewer", "model": "openai-a-4b", "backend_id": bid,
+    }).json()["id"]
+    aid = client.post("/api/apps", json={"name": "JS App"}).json()["id"]
+    client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b})
+    sdk = client.get(f"/api/apps/{aid}/sdk?lang=js").json()
+    assert sdk["lang"] == "js"
+    paths = [f["path"] for f in sdk["files"]]
+    assert any(p.endswith("client.js") for p in paths), paths
+    assert any(p.endswith("index.js") for p in paths), paths
+    assert not any(p.endswith(".ts") for p in paths), paths  # no TS leakage
+    blob = "\n".join(f["content"] for f in sdk["files"])
+    assert "intakeReviewer" in blob          # camelCase function (same as TS)
+    assert ": string" not in blob            # type annotations stripped
+    z = client.get(f"/api/apps/{aid}/sdk.zip?lang=js")
+    assert z.status_code == 200
+    assert "js-app-js-sdk.zip" in z.headers.get("content-disposition", "")
+    client.delete(f"/api/apps/{aid}")
+    client.delete(f"/api/conversations/{b}")
+
+
+@test("apps: SDK lang=py produces an importable Python package")
+def _():
+    bid = _add_openai_backend()
+    b = client.post("/api/conversations", json={
+        "title": "Intake Reviewer", "model": "openai-a-4b", "backend_id": bid,
+    }).json()["id"]
+    aid = client.post("/api/apps", json={"name": "Py App"}).json()["id"]
+    client.post(f"/api/apps/{aid}/bots", json={"conversation_id": b})
+    sdk = client.get(f"/api/apps/{aid}/sdk?lang=py").json()
+    assert sdk["lang"] == "py"
+    paths = [f["path"] for f in sdk["files"]]
+    # Python package uses underscores in the folder so it's directly importable.
+    assert all(p.startswith("py_app_sdk/") for p in paths), paths
+    assert "py_app_sdk/__init__.py" in paths
+    assert "py_app_sdk/client.py" in paths
+    bot_files = [p for p in paths if p.startswith("py_app_sdk/bots/") and p.endswith(".py")
+                 and not p.endswith("__init__.py")]
+    assert len(bot_files) == 1, bot_files
+    # Snake-case Python function name derived from the title.
+    blob = "\n".join(f["content"] for f in sdk["files"])
+    assert "def intake_reviewer(" in blob, blob
+    assert f"Bot({b})" in blob, blob
+    # All generated files must parse as Python.
+    import ast as _ast
+    for f in sdk["files"]:
+        if f["path"].endswith(".py"):
+            _ast.parse(f["content"], filename=f["path"])
+    z = client.get(f"/api/apps/{aid}/sdk.zip?lang=py")
+    assert z.status_code == 200
+    assert "py-app-py-sdk.zip" in z.headers.get("content-disposition", "")
+    client.delete(f"/api/apps/{aid}")
+    client.delete(f"/api/conversations/{b}")
+
+
+@test("apps: SDK lang validation — unknown value rejected, default stays ts")
+def _():
+    aid = client.post("/api/apps", json={"name": "Lang App"}).json()["id"]
+    # No lang → default TypeScript (backwards-compat for existing clients).
+    assert client.get(f"/api/apps/{aid}/sdk").json()["lang"] == "ts"
+    # Unknown lang → 400.
+    assert client.get(f"/api/apps/{aid}/sdk?lang=ruby").status_code == 400
+    # Default zip keeps the old filename (no language suffix) for ts.
+    z = client.get(f"/api/apps/{aid}/sdk.zip")
+    assert "lang-app-sdk.zip" in z.headers.get("content-disposition", "")
+    client.delete(f"/api/apps/{aid}")
+
+
+@test("apps: 404s for missing app / bot")
+def _():
+    assert client.get("/api/apps/999999").status_code == 404
+    assert client.patch("/api/apps/999999", json={"name": "x"}).status_code == 404
+    assert client.delete("/api/apps/999999").status_code == 404
+    assert client.get("/api/apps/999999/sdk").status_code == 404
+    aid = client.post("/api/apps", json={"name": "E"}).json()["id"]
+    assert client.post(f"/api/apps/{aid}/bots", json={"conversation_id": 999999}).status_code == 404
+    client.delete(f"/api/apps/{aid}")
+
+
+# ==================================================================
+# xbench-methodology endpoints — clone, in-flight 409, nested params,
+# auto-register against a fake miniclosedai-llm manager.
+# ==================================================================
+
+@test("clone: POST /api/conversations/{id}/clone copies config with empty messages")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    src = client.post("/api/conversations", json={
+        "title": "extractor", "model": "ollama-a:3b",
+        "system_prompt": "Return pure JSON.", "temperature": 0.2,
+    }).json()
+    try:
+        r = client.post(f"/api/conversations/{src['id']}/clone", json={})
+        assert r.status_code == 201, r.text
+        new = r.json()
+        try:
+            assert new["from_id"] == src["id"]
+            assert new["title"].startswith("extractor")
+            got = client.get(f"/api/conversations/{new['id']}").json()
+            assert got["model"] == "ollama-a:3b"
+            assert got["system_prompt"] == "Return pure JSON."
+            assert got["params"]["temperature"] == 0.2
+            assert got["messages"] == []
+        finally:
+            client.delete(f"/api/conversations/{new['id']}")
+    finally:
+        client.delete(f"/api/conversations/{src['id']}")
+
+
+@test("clone: body overrides apply (title + nested params merge)")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    src = client.post("/api/conversations", json={
+        "title": "src", "model": "ollama-a:3b", "temperature": 0.7,
+    }).json()
+    try:
+        r = client.post(f"/api/conversations/{src['id']}/clone", json={
+            "title": "worker-0",
+            "params": {"temperature": 0.0, "max_tokens": 999},
+        })
+        assert r.status_code == 201, r.text
+        new_id = r.json()["id"]
+        try:
+            assert r.json()["title"] == "worker-0"
+            got = client.get(f"/api/conversations/{new_id}").json()
+            assert got["params"]["temperature"] == 0.0
+            assert got["params"]["max_tokens"] == 999
+        finally:
+            client.delete(f"/api/conversations/{new_id}")
+    finally:
+        client.delete(f"/api/conversations/{src['id']}")
+
+
+@test("clone: title-collision adds a numeric suffix")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    src = client.post("/api/conversations", json={
+        "title": "dup", "model": "ollama-a:3b",
+    }).json()
+    a = client.post(f"/api/conversations/{src['id']}/clone", json={"title": "dup"}).json()
+    b = client.post(f"/api/conversations/{src['id']}/clone", json={"title": "dup"}).json()
+    try:
+        assert a["title"] != b["title"], f"both clones got {a['title']!r}"
+        assert "dup" in a["title"] and "dup" in b["title"]
+    finally:
+        client.delete(f"/api/conversations/{a['id']}")
+        client.delete(f"/api/conversations/{b['id']}")
+        client.delete(f"/api/conversations/{src['id']}")
+
+
+@test("clone: 404 when source conv does not exist")
+def _():
+    r = client.post("/api/conversations/99999/clone", json={})
+    assert r.status_code == 404, r.text
+
+
+@test("conversations: accept nested params.temperature on create")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    r = client.post("/api/conversations", json={
+        "model": "ollama-a:3b", "backend_id": 1,
+        "params": {"temperature": 0.0, "top_p": 0.5},
+    })
+    assert r.status_code == 200, r.text
+    cid = r.json()["id"]
+    try:
+        got = client.get(f"/api/conversations/{cid}").json()
+        assert got["params"]["temperature"] == 0.0
+        assert got["params"]["top_p"] == 0.5
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("conversations: nested + top-level temperature CONFLICT → 400")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    r = client.post("/api/conversations", json={
+        "model": "ollama-a:3b", "backend_id": 1,
+        "temperature": 0.5, "params": {"temperature": 0.0},
+    })
+    assert r.status_code == 400, r.text
+    assert "temperature" in r.text.lower()
+
+
+@test("conversations: nested + top-level agreeing → 200 (idempotent)")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    r = client.post("/api/conversations", json={
+        "model": "ollama-a:3b", "backend_id": 1,
+        "temperature": 0.0, "params": {"temperature": 0.0},
+    })
+    assert r.status_code == 200, r.text
+    cid = r.json()["id"]
+    try:
+        assert client.get(f"/api/conversations/{cid}").json()["params"]["temperature"] == 0.0
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("conversations: PATCH accepts nested params.temperature")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    cid = client.post("/api/conversations", json={"model": "ollama-a:3b"}).json()["id"]
+    try:
+        r = client.patch(f"/api/conversations/{cid}", json={"params": {"temperature": 0.0}})
+        assert r.status_code == 200, r.text
+        assert client.get(f"/api/conversations/{cid}").json()["params"]["temperature"] == 0.0
+    finally:
+        client.delete(f"/api/conversations/{cid}")
+
+
+# ----- Auto-register against a fake miniclosedai-llm manager -----
+
+class FakeManager(_FakeServer):
+    """Speaks just enough of miniclosedai-llm's /api/models for the
+    auto-register endpoint to find a served model."""
+
+    def _handler_class(self):
+        outer = self
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a, **kw): pass
+            def do_GET(self):
+                if self.path == "/api/models":
+                    body = json.dumps([
+                        {
+                            "id": "qwen3-vl-8b",
+                            "served_name": "qwen3-vl-8b",
+                            "hf_id": "Qwen/Qwen3-VL-8B-Instruct",
+                            "status": "running",
+                            "base_url": "http://localhost:8001/v1",
+                            "alt_base_url": "http://host.docker.internal:8001/v1",
+                        },
+                        {
+                            "id": "stopped-model",
+                            "served_name": "stopped-model",
+                            "hf_id": "Foo/Bar",
+                            "status": "stopped",
+                            "base_url": "http://localhost:8002/v1",
+                            "alt_base_url": "http://host.docker.internal:8002/v1",
+                        },
+                    ]).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404); self.end_headers()
+        return H
+
+
+fake_manager = FakeManager()
+
+
+@test("auto-register: GET /api/models → INSERT openai backend with base_url")
+def _():
+    r = client.post("/api/backends/auto-register", json={
+        "manager_url": fake_manager.base_url,
+        "model_id": "qwen3-vl-8b",
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    bid = body["id"]
+    try:
+        assert body["kind"] == "openai"
+        assert body["base_url"] == "http://localhost:8001/v1"
+        assert body["served_model"] == "qwen3-vl-8b"
+        # Backend actually inserted in the DB.
+        all_backends = client.get("/api/backends").json()
+        assert any(b["id"] == bid for b in all_backends)
+    finally:
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("auto-register: prefer_docker_host=true picks alt_base_url")
+def _():
+    r = client.post("/api/backends/auto-register", json={
+        "manager_url": fake_manager.base_url,
+        "model_id": "qwen3-vl-8b",
+        "prefer_docker_host": True,
+    })
+    assert r.status_code == 201, r.text
+    bid = r.json()["id"]
+    try:
+        assert r.json()["base_url"] == "http://host.docker.internal:8001/v1"
+    finally:
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("auto-register: unknown model_id → 404 with available list")
+def _():
+    r = client.post("/api/backends/auto-register", json={
+        "manager_url": fake_manager.base_url,
+        "model_id": "no-such-model",
+    })
+    assert r.status_code == 404, r.text
+    body = r.json()
+    assert "available" in body["detail"]
+    assert "qwen3-vl-8b" in body["detail"]["available"]
+
+
+@test("auto-register: model exists but is stopped → 422")
+def _():
+    r = client.post("/api/backends/auto-register", json={
+        "manager_url": fake_manager.base_url,
+        "model_id": "stopped-model",
+    })
+    assert r.status_code == 422, r.text
+    assert "not running" in r.text.lower() or "mc start" in r.text.lower()
+
+
+@test("auto-register: unreachable manager → 502")
+def _():
+    r = client.post("/api/backends/auto-register", json={
+        "manager_url": "http://127.0.0.1:1",   # nothing listening
+        "model_id": "anything",
+    })
+    assert r.status_code == 502, r.text
+
+
+# ----- In-flight 409 guard -----
+
+@test("in-flight 409: second persist+message chat on same conv is rejected")
+def _():
+    """Manually park a 'running' generation in _generations[cid], then verify
+    both /chat and /chat/stream reject new persist+message turns with 409.
+
+    We park the marker directly (same trick the cancel-test uses, test_e2e.py
+    around line 1493) rather than racing a real HTTP stream — TestClient
+    consumes streams synchronously, which doesn't reliably leave the bg task
+    in 'running' state long enough for sibling requests to observe it."""
+    _reseed_builtin_to_fake_ollama()
+    cid = client.post("/api/conversations", json={
+        "model": "ollama-a:3b", "backend_id": 1, "temperature": 0.0,
+    }).json()["id"]
+    try:
+        # Park a "running" generation marker on this conv.
+        gen = app_mod._new_generation()
+        app_mod._generations[cid] = gen
+
+        # Streaming sibling → 409.
+        r = client.post(f"/api/conversations/{cid}/chat/stream",
+                        json={"message": "second", "persist": True})
+        assert r.status_code == 409, r.text
+        body = r.json()
+        assert body["detail"]["code"] == "generation_in_flight"
+        assert "clone" in body["detail"]["message"].lower()
+
+        # Non-streaming sibling → 409 too.
+        r = client.post(f"/api/conversations/{cid}/chat",
+                        json={"message": "second", "persist": True})
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["code"] == "generation_in_flight"
+
+        # And reattach: true bypasses the guard (so the GUI's refresh-path
+        # behaviour from API callers can also reconnect).
+        gen["status"] = "running"   # ensure still parked
+        r = client.post(f"/api/conversations/{cid}/chat",
+                        json={"message": "second", "persist": True, "reattach": True})
+        # The non-streaming /chat with reattach=true is allowed through; it
+        # falls into the regular code path (which will fail downstream but
+        # NOT with 409 — that's the only thing we're asserting).
+        assert r.status_code != 409, r.text
+    finally:
+        app_mod._generations.pop(cid, None)
+        client.delete(f"/api/conversations/{cid}")
+
+
+@test("in-flight 409: non-persist or messages= form is NOT 409'd")
+def _():
+    """The 409 only applies to the persist + single-message path (where the
+    background-resume race lives). One-shot non-persist callers run through
+    the regular code path and never touch _generations."""
+    _reseed_builtin_to_fake_ollama()
+    cid = client.post("/api/conversations", json={
+        "model": "ollama-a:3b", "backend_id": 1, "temperature": 0.0,
+    }).json()["id"]
+    try:
+        gen = app_mod._new_generation()
+        app_mod._generations[cid] = gen
+
+        # persist=False → not guarded.
+        r = client.post(f"/api/conversations/{cid}/chat",
+                        json={"message": "fire and forget", "persist": False})
+        assert r.status_code != 409, r.text
+    finally:
+        app_mod._generations.pop(cid, None)
+        client.delete(f"/api/conversations/{cid}")
+
+
+# ==================================================================
 # Main
 # ==================================================================
 
@@ -3483,16 +4775,23 @@ def main() -> int:
             fn()
 
     total = time.perf_counter() - t0
-    passed = sum(1 for _, ok, _ in _RESULTS if ok)
-    failed = len(_RESULTS) - passed
+    passed  = sum(1 for _, ok, _ in _RESULTS if ok is True)
+    skipped = sum(1 for _, ok, _ in _RESULTS if ok == "skip")
+    failed  = len(_RESULTS) - passed - skipped
     print(f"\n{'='*48}")
-    print(f"{passed}/{len(_RESULTS)} passed · {failed} failed · {total:.2f}s")
+    skip_str = f" · {skipped} skipped" if skipped else ""
+    print(f"{passed}/{len(_RESULTS)} passed · {failed} failed{skip_str} · {total:.2f}s")
     print('='*48)
     if failed:
         print("\nFailures:")
         for name, ok, msg in _RESULTS:
-            if not ok:
+            if ok is False:
                 print(f"  ✗ {name}  → {msg}")
+    if skipped:
+        print("\nSkipped:")
+        for name, ok, msg in _RESULTS:
+            if ok == "skip":
+                print(f"  ⊘ {name}  → {msg}")
 
     # Cleanup
     fake_ollama.stop()

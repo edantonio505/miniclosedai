@@ -28,6 +28,10 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
       <span class="nav-active-dot" aria-hidden="true"></span>
     </button>
+    <button class="nav-item" data-page="apps" title="Applications — groups of bots" aria-label="Applications">
+      <!-- Feather: layers — a stack of bots grouped into one application -->
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+    </button>
     <button class="nav-item" data-page="logs" title="Logs — LLM request/response activity" aria-label="Logs">
       <!-- Feather: terminal — represents request/response stream activity -->
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
@@ -65,6 +69,17 @@
     </div>
 
     <div class="top-controls">
+      <!-- TTS voice picker. Sits LEFT of the model picker so the audio voice
+           reads as a peer choice next to the LLM. Hidden until a voice
+           backend is registered (see _updateVoicePickerAffordance in
+           app.js). The selected voice is persisted per-conversation under
+           voice_settings.voice_id (+ language). -->
+      <div class="voice-picker" id="voice-picker" hidden>
+        <select id="voice-select" class="voice-select" data-tooltip="TTS voice for audio replies" aria-label="TTS voice">
+          <option value="">Default voice</option>
+        </select>
+      </div>
+
       <!-- Searchable model picker. The native <select> stays as the backing
            state (lots of code reads its value/selectedOptions); the button +
            popover are a filter layer that write back to it. -->
@@ -148,6 +163,7 @@
 
   <main class="layout">
     <aside class="sidebar">
+      <div class="sidebar-scroll">
       <div class="panel sys-prompt-panel">
         <div class="sys-prompt-head">
           <button id="sys-prompt-avatar" type="button" class="bot-card-avatar sys-avatar" aria-label="Bot avatar" data-tooltip="Add avatar"></button>
@@ -267,6 +283,7 @@
         <h3>Status</h3>
         <div id="status-line">Checking Ollama…</div>
       </div>
+      </div>
     </aside>
 
     <div id="splitter" class="splitter" title="Drag to resize. Double-click to reset."></div>
@@ -307,8 +324,25 @@
           <div class="composer-main">
             <div id="attachment-list" class="attachment-list" hidden></div>
             <div id="attachment-warning" class="attachment-warning" hidden></div>
+            <!-- Live transcription preview while holding the mic. The browser's
+                 SpeechRecognition API gives instant partial transcripts; the
+                 final Whisper transcript from the server replaces this chip
+                 with the real user message bubble. -->
+            <div id="voice-preview" class="voice-preview" hidden aria-live="polite"></div>
             <textarea id="input" rows="1" placeholder="Message your model…"></textarea>
           </div>
+          <button type="button" id="mic-btn" class="composer-attach-btn" hidden data-tooltip="Hold to speak (or click to toggle)" data-tooltip-side="top" aria-label="Push to talk">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+          </button>
+          <button type="button" id="voice-stop-btn" class="composer-attach-btn voice-stop-btn" hidden data-tooltip="Stop bot audio" data-tooltip-side="top" aria-label="Stop audio playback">
+            <!-- Stop-circle: a filled square for "stop the sound" -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6" rx="1" fill="currentColor"/></svg>
+          </button>
+          <button type="button" id="call-btn" class="composer-attach-btn" hidden data-tooltip="Call the bot (continuous conversation; click again to hang up)" data-tooltip-side="top" aria-label="Call the bot">
+            <!-- Feather: phone — start/end a live duplex audio call -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+          </button>
+          <span id="call-status" class="call-status" hidden aria-live="polite"></span>
           <button type="submit" id="send-btn" class="btn btn-primary" data-tooltip="Send (Enter)" data-tooltip-side="top" aria-label="Send">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
           </button>
@@ -326,13 +360,14 @@
       <div class="logs-header">
         <div>
           <h1>LLM logs</h1>
-          <p class="logs-hint">Live record of every chat call across all endpoints — request metadata, response preview, and latency. Up to 500 most-recent entries; reset on server restart.</p>
+          <p class="logs-hint">Live record of every chat call across all endpoints — request metadata, response preview, and latency. Up to 200 most-recent entries; reset on server restart. <strong>Export</strong> downloads the full request+response pairs as JSON.</p>
         </div>
         <div class="logs-actions">
           <label class="logs-pause">
             <input type="checkbox" id="logs-pause-toggle" />
             <span>Pause</span>
           </label>
+          <button type="button" id="logs-export-btn" class="btn btn-small" title="Download every captured request paired with its full response as JSON">Export</button>
           <button type="button" id="logs-clear-btn" class="btn btn-small">Clear</button>
         </div>
       </div>
@@ -380,6 +415,45 @@
         <p>Click <strong>+ New bot</strong> above to author your first one, or open <strong>Settings → Add endpoint</strong> first if you haven't registered an LLM endpoint yet.</p>
       </div>
     </div>
+  </div>
+
+  <div class="page page-apps">
+    <div class="bots-container">
+      <div class="bots-header">
+        <div>
+          <h1>Applications</h1>
+          <p class="bots-hint">Group your bots into applications. Open one to chat with its bots individually and generate a ready-to-use TypeScript SDK that connects back to this server.</p>
+        </div>
+        <div class="apps-header-actions">
+          <button id="apps-import-btn" type="button" class="btn btn-small" data-tooltip="Import an application from .miniclosed-app.json">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+            Import
+          </button>
+          <input id="apps-import-file" type="file" accept=".json,application/json" hidden />
+          <button id="apps-new-btn" type="button" class="btn btn-primary">+ New application</button>
+        </div>
+      </div>
+      <div class="bots-toolbar">
+        <input type="search" id="apps-filter" placeholder="Filter applications by name…" />
+        <span class="bots-count" id="apps-count">0 applications</span>
+        <div class="view-toggle" role="group" aria-label="View mode">
+          <button id="apps-view-list" type="button" class="view-toggle-btn active" data-view="list" data-tooltip="List view" aria-label="List view" aria-pressed="true">
+            <!-- Feather: list -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+          </button>
+          <button id="apps-view-grid" type="button" class="view-toggle-btn" data-view="grid" data-tooltip="Grid view" aria-label="Grid view" aria-pressed="false">
+            <!-- Feather: grid -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          </button>
+        </div>
+      </div>
+      <div id="apps-list" class="bots-list"></div>
+      <div id="apps-empty" class="bots-empty" hidden></div>
+    </div>
+  </div>
+
+  <div class="page page-app-detail">
+    <div id="app-detail-container" class="bots-container"></div>
   </div>
 
   <div class="page page-settings">
@@ -468,12 +542,13 @@
           <select id="backend-kind" required>
             <option value="ollama">Ollama</option>
             <option value="openai" selected>OpenAI-compatible</option>
+            <option value="voice">Voice (ASR + TTS)</option>
           </select>
         </label>
         <label class="form-field">
           <span>Base URL</span>
           <input type="text" id="backend-base-url" required placeholder="http://localhost:1234/v1" />
-          <small class="form-hint" id="backend-url-hint">Include the <code>/v1</code> suffix for LM Studio / vLLM / OpenAI-compat servers.</small>
+          <small class="form-hint" id="backend-url-hint">Include the <code>/v1</code> suffix for LM Studio / vLLM / OpenAI-compat servers. For <strong>Voice</strong>: paste the URL of your running voice service (e.g. <code>http://localhost:8090</code> or your RunPod proxy URL).</small>
         </label>
         <label class="form-field">
           <span>API key (optional)</span>
@@ -642,6 +717,38 @@
       <div id="eval-status" class="kb-status" hidden></div>
     </div>
   </div>
+
+  <!-- TypeScript SDK Modal — opened by an application's "Generate SDK" button -->
+  <div id="sdk-modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal sdk-modal">
+      <div class="modal-header">
+        <h3><span id="sdk-modal-lang-label">TypeScript</span> SDK <span id="sdk-modal-app" class="kb-modal-bot"></span></h3>
+        <button id="sdk-modal-close" class="icon-btn" data-tooltip="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="sdk-lang-tabs" id="sdk-lang-tabs" role="tablist" aria-label="SDK language">
+        <button type="button" class="sdk-lang-tab active" data-lang="ts" role="tab" aria-selected="true">TypeScript</button>
+        <button type="button" class="sdk-lang-tab" data-lang="js" role="tab" aria-selected="false">JavaScript</button>
+        <button type="button" class="sdk-lang-tab" data-lang="py" role="tab" aria-selected="false">Python</button>
+      </div>
+      <p class="kb-modal-hint" id="sdk-modal-hint">Drop this folder into a TypeScript project to call this application's bots over the MiniClosedAI HTTP API. The server must be running and reachable. Each bot is exposed as a function named after it.</p>
+      <div class="sdk-modal-body">
+        <div id="sdk-file-list" class="sdk-file-list"></div>
+        <pre class="sdk-code"><code id="sdk-code"></code></pre>
+      </div>
+      <div class="modal-actions">
+        <button id="sdk-copy" class="btn btn-small">Copy file</button>
+        <div style="flex:1"></div>
+        <button id="sdk-download" class="btn btn-primary btn-small">Download .zip</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Single global tooltip element. Positioned with position:fixed and
+       the maximum z-index by app.js (initGlobalTooltip), so it escapes
+       every stacking context / overflow clip on the page. -->
+  <div id="global-tooltip" role="tooltip" aria-hidden="true"></div>
 
   <script src="/static/app.js"></script>
 </body>

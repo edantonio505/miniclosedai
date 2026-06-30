@@ -26,7 +26,7 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 3. [Install](#install) · [One-line install](#quickest--one-line-install-macos-linux-wsl) · [Docker quick start (with baked models)](#docker-quick-start-with-baked-models)
 4. [Run](#run)
 5. [Your first bot — 60 seconds](#your-first-bot--60-seconds)
-6. [UI guide](#ui-guide) · [Sidebar panels — Knowledge / Extensions / Evals](#sidebar)
+6. [UI guide](#ui-guide) · [Sidebar panels — Knowledge / Extensions / Evals](#sidebar) · [Apps + per-app SDK (TypeScript / JavaScript / Python)](#apps-page-grouping-bots--generate-a-per-app-sdk) · [Voice — push-to-talk + call mode](#voice--push-to-talk--call-mode)
 7. [Connecting LM Studio and other OpenAI-compatible endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)
 8. [Generating system prompts](#generating-system-prompts)
 9. [The microservice pattern](#the-microservice-pattern)
@@ -38,14 +38,16 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 15. [Automated image labeling — hot dog / not hot dog](#automated-image-labeling--hot-dog--not-hot-dog)
 16. [Building a chatbot against a saved bot](#building-a-chatbot-against-a-saved-bot)
 17. [Python client SDK](#python-client-sdk--compose-bots-in-your-own-code)
-18. [Sharing bots between instances](#sharing-bots-between-instances)
-19. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
-20. [LAN access](#lan-access)
-21. [Troubleshooting](#troubleshooting)
-22. [Testing](#testing)
-23. [Project layout](#project-layout)
-24. [Security](#security)
-25. [License](#license)
+18. [Benchmarking with miniclosedai-llm](#benchmarking-with-miniclosedai-llm)
+19. [Sharing bots between instances](#sharing-bots-between-instances)
+20. [Sharing an application between instances](#sharing-an-application-between-instances)
+21. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
+22. [LAN access](#lan-access)
+23. [Troubleshooting](#troubleshooting)
+24. [Testing](#testing)
+25. [Project layout](#project-layout)
+26. [Security](#security)
+27. [License](#license)
 
 ---
 
@@ -396,6 +398,106 @@ Single full-page surface listing every saved conversation, newest first. Each ca
 - **Card with a pulse dot** → that bot has a streaming reply in progress OR a completed reply you haven't viewed yet. Clicking the card clears the dot.
 - **Hover a card → row actions appear** on the right (work the same in list and grid view): **`</>` API code** (snippet modal scoped to that bot), **📚 Manage knowledge** (opens a modal listing that bot's documents — filename · chunks · size · date — with per-doc delete and an **+ Add document** button), **🧩 Manage extensions** (opens a modal listing that bot's MCP plugins with a per-server enable toggle, remove, and an add-by-URL row), **📊 Evals** (opens the score/auto-improve modal for that bot), and **🗑 Delete** (confirms with the bot's title, clears stale unread/streaming dots, falls back to the empty state if it was the last bot). All buttons stop event propagation so clicking them doesn't also open the chat; a gradient mask fades the title/meta underneath so the buttons read as an intentional overlay. Editing a bot that's currently open keeps its sidebar panels in sync.
 - **Quick-switch shortcut**: `⌘K` / `Ctrl+K` from anywhere, or `/` when you're not in a text field, jumps to the Bots page and focuses the filter.
+
+### Apps page (grouping bots) — generate a per-app SDK
+
+The **Apps** activity-bar icon opens a second top-level surface that groups bots into named **applications** (e.g. *"GA Probate"*, *"Sales Pipeline"*). Each app has a name, an optional description + link, an avatar, and a list of bots assigned to it. Clicking an app drills into its detail view — a card grid of just that app's bots — and clicking a bot from there opens the chat. The back button returns to the **same app's detail view** (not the global Bots list), so app-scoped workflows feel like their own little surface.
+
+The Apps page mirrors the Bots page's affordances one-to-one: a **search input**, a **list ↔ grid view toggle** (persisted to `localStorage` under `miniclosedai:appsView`, independent from the bots view), per-card **Generate SDK / Export / Edit / Delete** actions, a header **Import** button (upload-cloud icon — pick a `.miniclosed-app.json` to recreate the whole application on this instance), and the **+ New application** button. **Export** is a download-cloud icon on each card; **Shift-click** to include every bot's message history. See [Sharing an application between instances](#sharing-an-application-between-instances) for the full round-trip story.
+
+Navigation feel is consistent with the Bots page: clicking an app slides the app-detail surface in from the right; clicking a bot inside an app slides the chat in further; **Back** slides whichever surface you came from back in from the left. The same spatial drill-in / drill-out animation that powers the Bots ↔ chat transition powers every list → detail step here too.
+
+The headline feature is **per-app SDK generation**. Each application has a **Generate SDK** button: it opens a modal with a language tab strip — **TypeScript**, **JavaScript**, or **Python** — and downloads a ready-to-use client package wired specifically for *this app's* bots, with each bot exposed as a named function and its bot id baked in:
+
+```python
+# Python — drop ga_probate_sdk/ anywhere on sys.path, then:
+from ga_probate_sdk import triage, drafter
+
+intent = triage("Client is asking about asset valuation", history=False)
+reply  = drafter(f"Draft a response covering: {intent}")
+```
+
+```ts
+// TypeScript / JavaScript — same shape, ESM, native fetch
+import { triage, drafter } from "./ga-probate-sdk";
+
+const intent = await triage("Client is asking about asset valuation");
+const reply  = await drafter(`Draft a response covering: ${intent}`);
+```
+
+What each language gives you:
+- **TypeScript** — typed, per-bot files + `index.ts` barrel + `package.json` + `README.md`. Works in modern TS projects (`moduleResolution: "NodeNext"` or `"bundler"`).
+- **JavaScript** — plain ESM `.js` (types stripped, same shape). Drop into any Node 18+ project or load directly in a modern browser; no bundler required.
+- **Python** — stdlib-only package (urllib + json, no `pip install`). Folder uses underscores so it's directly importable as `<app_slug>_sdk`.
+
+**Drop-in usage notes** (the same caveats apply to all three languages):
+- The MiniClosedAI server must be **running and reachable** from wherever the SDK runs — these are thin HTTP clients; the model + bot logic stay on the server.
+- The server URL is **baked at generation time**. Override it via the `MINICLOSEDAI_BASE_URL` env var, or per call with `baseUrl` (TS/JS) / `base_url=` (Python), if your consuming app runs somewhere that can't reach the original host.
+- Bot ids are **pinned in the generated files** — recreate a bot and its id changes; regenerate the SDK after structural changes.
+- There's **no auth on the API** and CORS is wide open (`allow_origins=["*"]`). Fine for LAN / your own infra; put a reverse proxy + auth in front before exposing port `8095` to the public internet.
+
+### Voice — push-to-talk + call mode
+
+MiniClosedAI's chat composer surfaces **two voice buttons**, both fed by a separate **voice service** running as its own microservice. The voice service connects to MiniClosedAI exactly like Ollama or LM Studio: you paste its URL into **Settings → LLM Endpoints → + Add endpoint**, pick **Voice (ASR + TTS)** as the kind, and the voice buttons appear in the composer.
+
+- **🎤 Push-to-talk** — hold the button, speak, release. Browser uploads the clip; ASR + LLM + TTS chain runs in one merged SSE.
+- **📞 Call mode** — click once, full-duplex WebRTC call. Continuous listening with VAD-based turn detection; the bot's reply streams back as audio while the text appears live in the bubble. Click again to hang up. A "Connecting…" pill shows during WebRTC handshake; flips to "Listening" the moment audio is actually flowing.
+
+If no voice backend is registered, both buttons stay hidden and the rest of MiniClosedAI works exactly as before — voice is strictly opt-in.
+
+#### The voice service lives in its own repo
+
+The voice microservice was split out of this repo into [**edantonio505/miniclosedai-voice**](https://github.com/edantonio505/miniclosedai-voice). It's a FastAPI app wrapping:
+
+| Layer | Engine | Notes |
+|---|---|---|
+| ASR | HuggingFace **Whisper** via `transformers` + PyTorch | `small.en` default; `tiny.en` / `medium.en` / `large-v3` selectable |
+| TTS | **Chatterbox Turbo** (token-streaming, fp16, 4 CFM steps) | ~700ms median first-chunk latency on GPU |
+| VAD | Silero VAD via `fastrtc[vad]` | tuned for conversational turn-taking (`min_silence_duration_ms=300`) |
+| Denoise | DeepFilterNet | ONNX, single-digit ms on GPU |
+| WebRTC | aiortc via FastRTC | mounts `/webrtc/offer`, exposes a `/call/events` SSE channel |
+
+It runs on any Linux machine with an NVIDIA driver (CUDA 11.8 / 12.4 / 12.8 / 13.x — auto-detected) **or CPU-only**. No Docker required.
+
+#### Bring it up
+
+```bash
+git clone https://github.com/edantonio505/miniclosedai-voice.git
+cd miniclosedai-voice
+./setup.sh                  # detect CUDA, create env/, install everything
+./start.sh -d               # daemon mode; log → /tmp/voice.log
+```
+
+Then in MiniClosedAI: **Settings → + Add endpoint** → kind **Voice (ASR + TTS)** → paste the URL (`http://localhost:8090` locally, or your RunPod proxy URL like `https://<pod-id>-8090.proxy.runpod.net`) → Test → Save.
+
+Both buttons light up once a voice backend is enabled. Refresh the page if it doesn't pick up immediately.
+
+#### How each turn flows
+
+**Push-to-talk (🎤):**
+
+1. Hold the button → `MediaRecorder` captures audio (WebM/Opus on Chrome, OGG/Opus on Firefox, MP4 on Safari).
+2. Release → the blob POSTs to `/api/conversations/{id}/voice/turn`.
+3. MiniClosedAI calls the voice service's `/transcribe`, then streams the bot reply from `/chat/stream` while **buffering tokens into sentences**, **cleaning each one** (strips markdown `*` / `#` / `_`, emojis, list bullets, `<think>` tags, code fences — anything the TTS would mispronounce), and forwarding it to `/speak/stream`.
+4. One merged SSE stream comes back: `{transcript}` (user bubble), `{chunk}` × N (assistant text streams in live), `{audio_chunk_b64}` × M (base64 PCM-16 plays via Web Audio).
+
+**Call mode (📞):**
+
+1. Click 📞 → browser opens a WebRTC peer connection to the voice service. Status pill shows **🔌 Connecting…**.
+2. WebRTC handshake completes → pill flips to **🎙 Listening…**. Silero VAD detects end-of-speech, the voice service runs Whisper → calls MiniClosedAI's `/chat/stream` → sentence-buffers tokens with the same cleaner → speaks per sentence via Chatterbox.
+3. Audio plays back through the same WebRTC connection. Text bubble updates live via the `/call/events/{webrtc_id}` SSE channel.
+4. Click 📞 again to hang up.
+
+#### Voice cloning
+
+Drop a 5–10 s clean speech WAV into `miniclosedai-voice/voices/` named `<id>.wav`. The shipped `voices/default.wav` is the fallback. Restart the voice service to pick up new voices.
+
+#### Caveats
+
+- No auth on the API by default; set `VOICE_API_KEY=…` on the voice service and use it as the backend's API key field if you expose it to the public internet.
+- `can_interrupt=False` is hardcoded in the voice service to prevent speaker→mic echo from cancelling the bot's reply mid-sentence. Re-enable for headsets with proper AEC. See the voice repo's README.
+
+See [the voice repo's README](https://github.com/edantonio505/miniclosedai-voice/blob/main/README.md) for the full API, performance numbers (ASR p50 ~350 ms, TTS first chunk ~700 ms), tuning knobs, and `./test.sh` end-to-end smoke harness.
 
 ### Chat view — topbar
 
@@ -926,6 +1028,8 @@ GET    /api/conversations/{id}/export.zip             → JSONL + images bundle 
 GET    /api/conversations/{id}/export.classify.zip    → image-classification dataset (image,label CSV + images/)
 GET    /api/conversations/{id}/export                 → portable bot config (.miniclosed-bot.json)
 POST   /api/conversations/import                      → import a .miniclosed-bot.json file
+GET    /api/apps/{id}/export                          → portable application (.miniclosed-app.json — app + all its bots)
+POST   /api/apps/import                               → import a .miniclosed-app.json file
 ```
 
 **Create** — supply any subset of config fields. `backend_id` defaults to `1` (built-in Ollama); set it to pin the bot to an OpenAI-compatible endpoint you registered in Settings.
@@ -2208,6 +2312,36 @@ Why it matters: each specialist is an independent self-hosted expert, so you can
 
 ---
 
+## Benchmarking with miniclosedai-llm
+
+There's a focused sister flow for **model selection** — pair this gateway with a CUDA-served vLLM control plane (`miniclosedai-llm`, sibling repo) and benchmark a frozen test set across candidate base models before fine-tuning. Four MiniClosedAI endpoints make the harness a thin script instead of a workaround:
+
+| Endpoint | Why it's needed |
+|---|---|
+| `POST /api/backends/auto-register` | Pulls a vLLM model's `base_url` from the manager at `:8099` — no copy/paste from `mc url` |
+| `POST /api/conversations/{id}/clone` | One conversation per parallel worker (concurrent calls on the same bot race) |
+| `POST /api/conversations` accepts `params: {...}` nested form | Eliminates the historical footgun where `params.temperature` was silently ignored and 0.7 was used |
+| 409 `generation_in_flight` on `/chat` + `/chat/stream` | Loud error instead of silent message-history corruption when parallel callers forget to clone |
+
+A reference Python client lives at `clients/xbench_client.py` (~270 LOC, one `XBenchClient` class + `cloned_bots` context manager). Full prose + endpoint reference in [DOCUMENTATION.md → Benchmarking with miniclosedai-llm](./DOCUMENTATION.md#benchmarking-with-miniclosedai-llm).
+
+```python
+from clients.xbench_client import XBenchClient
+
+mc = XBenchClient("https://192.168.0.110:8095", verify=False)
+backend = mc.auto_register_backend(
+    manager_url="http://localhost:8099", model_id="qwen3-vl-8b",
+)
+base = mc.create_conversation(
+    model=backend["served_model"], backend_id=backend["id"],
+    system_prompt="...", params={"temperature": 0.0},
+)
+with mc.clone(base["id"], title="worker-0") as worker:
+    reply = mc.chat(worker.id, message=doc_text, persist=False)
+```
+
+---
+
 ## Sharing bots between instances
 
 A bot in MiniClosedAI is a row in the `conversations` table — title, model name, system prompt, sampling params, optional message history. To move that configuration to another machine (a teammate's laptop, a production box, a fresh install), export it as a `.miniclosed-bot.json` file and import it on the other side.
@@ -2267,6 +2401,62 @@ curl -X POST http://localhost:8095/api/conversations/import \
 If the import returns **409 needs_backend**, the response body includes an `available_backends` array — pick one's `id` and retry the POST with `backend_id` set. Title collisions get a numeric suffix (`"Doctor's Office Bot (2)"`); imports never overwrite existing rows.
 
 Full schema reference — every field, every error case, and the resolution-flow diagram — lives in [DOCUMENTATION.md → Bot import / export](./DOCUMENTATION.md#bot-import--export).
+
+---
+
+## Sharing an application between instances
+
+If a single bot is the unit of portability for the Bots page, an **application** is the unit of portability for the Apps page. The same shape one level up: every bot in an app, plus the app's own metadata (name, description, link, avatar), packed into a single `.miniclosed-app.json` file.
+
+**What's in the file** — exactly the same minimal config the bot file carries, repeated for every bot in the app:
+
+- App-level: `name`, `description`, `link`, `avatar`.
+- Per-bot: `title`, `model` (as a string), `system_prompt`, `params`, and optionally `sample_messages` (each bot's history — if you exported with "+ history").
+
+**What's deliberately NOT in the file**: backend rows, API keys, DB ids. Same security stance as the bot file — safe to email / Slack / git.
+
+### Export from the GUI
+
+1. Open the **Applications** page (second activity-bar icon).
+2. On any app card, click the **download-cloud** icon (config only). Hold **Shift** while clicking to include every bot's message history.
+3. The browser downloads `<app-name>.miniclosed-app.json`.
+
+The app detail page also has an **Export** button at the top with the same Shift-click behaviour.
+
+### Import from the GUI
+
+1. On the Applications page, click the **Import** button (upload-cloud icon) next to *+ New application*.
+2. Pick the `.miniclosed-app.json` file.
+3. If a single enabled backend covers *every* model referenced by the bots in the file, the new app is created and opens automatically.
+4. Otherwise the same backend-picker modal as bot import appears — titled *"Import application — pick a backend for all bots"* — listing each backend with `<matched>/<needed>` model coverage. Pick one and click **Import**; every bot in the imported app will run against that backend.
+
+### Round-trip via API
+
+```bash
+# On instance A: export the app + every bot in it.
+curl -o ga_probate.miniclosed-app.json \
+  http://localhost:8095/api/apps/1/export
+
+# Include each bot's message history (bigger file):
+curl -o ga_probate-full.miniclosed-app.json \
+  "http://localhost:8095/api/apps/1/export?include_history=true"
+
+# On instance B: import (auto-match a backend that covers every model).
+curl -X POST http://localhost:8095/api/apps/import \
+  -H "Content-Type: application/json" \
+  -d "{\"data\": $(cat ga_probate.miniclosed-app.json)}"
+# → 201 { "id": 5, "name": "GA Probate", "matched_backend_id": 1,
+#         "bot_ids": [42, 43, 44], "warnings": [] }
+
+# On instance B: import with one backend pinned for every bot.
+curl -X POST http://localhost:8095/api/apps/import \
+  -H "Content-Type: application/json" \
+  -d "{\"data\": $(cat ga_probate.miniclosed-app.json), \"backend_id\": 4}"
+```
+
+A 409 response means *no single backend covers every model in the file*. The body's `models` array lists the unique models needed, and `available_backends[].model_present` tells you which backends have full coverage (if any). Retry with `backend_id` set to whichever you want to run the whole app against. App-name and per-bot title collisions both get the same `(2)`, `(3)`, … suffix scheme as the bot import.
+
+Full schema reference and the resolution-flow diagram live in [DOCUMENTATION.md → Application import / export](./DOCUMENTATION.md#application-import--export).
 
 ---
 
@@ -2404,13 +2594,23 @@ MiniClosedAI ships a single-file end-to-end test suite. One command, no extra de
 python test_e2e.py
 ```
 
-Typical output: **28 tests, ~1.5 seconds, exits 0 on success** (1 on any failure, so it slots into CI or a pre-commit hook with no config).
+Typical output: **170 tests, ~16 seconds, exits 0 on success** (1 on any failure, so it slots into CI or a pre-commit hook with no config).
+
+For live voice-pipeline verification — once both servers are up via `./dev.sh up` — there's a separate **`tools/test_call.py`** harness that drives a real WebRTC call through the full ASR → LLM → TTS chain and reports per-stage timing:
+
+```bash
+./dev.sh test                                    # against the default bot
+./dev.sh test --conv-id 42 --phrase "..."        # against a specific bot
+```
+
+This is the right tool to run after changing the voice integration in `app.py` or the voice service itself.
 
 ### What it checks
 
 The suite is designed so every time you add or change a feature, running it catches the regressions that cost an afternoon to debug:
 
 - **Schema + migration** — additive `ALTER TABLE ADD COLUMN` is non-destructive, built-in Ollama is seeded at id=1, `init_db()` is idempotent.
+- **Voice integration — with and without backend** — `FakeVoice` fixture + a live-service probe verify `/transcribe`, `/speak`, `/speak/stream`, `/voice/turn` (sentence-streaming through the TTS), `/voice/say`, and the call signaling proxies (`/call/configure`, `/call/offer`, `/call/events`). A separate test confirms that **with no voice backend registered, voice endpoints return a clean 404 with a `Settings → + Add endpoint` hint** — proving the architectural guarantee that voice is fully optional.
 - **Backends CRUD** — create, patch, delete with guardrails (403 for the built-in, 409 when conversations are still bound); `api_key` scrubbed from responses.
 - **Probes** — `/api/backends/{id}/status`, `/models`, and the server-side `/api/backends/test` draft probe.
 - **Aggregated `/api/models`** — new grouped shape plus back-compat legacy keys.
@@ -2457,16 +2657,23 @@ Now every commit runs the suite first and refuses to record if anything is red.
 miniclosedai/
 ├── app.py                     # FastAPI routes (native + OpenAI-compat, multi-backend)
 ├── llm.py                     # Kind-dispatched client: Ollama + OpenAI-compat
+├── voice.py                   # Client for kind='voice' backends (transcribe / speak / call signaling)
 ├── db.py                      # SQLite schema + MINICLOSEDAI_DB_PATH env override
-├── logs.py                    # In-memory chat request/response buffer for the Logs page
+├── logs.py                    # In-memory chat request/response buffer for the Logs page (+ CSV export)
 ├── requirements.txt           # fastapi, uvicorn, httpx, pypdf, python-multipart
 ├── upgrade.sh                 # in-place upgrade: git pull + reinstall + restart with auto-rollback
+├── dev.sh                     # one-command launcher: brings up HTTPS uvicorn + voice service (if sibling)
+├── dev-https.sh               # generate self-signed dev cert + start HTTPS uvicorn (for mic on LAN)
 ├── static/
 │   ├── index.html             # Single-page UI (activity bar + Dashboard + Settings)
 │   ├── style.css              # Design system (light + dark)
-│   └── app.js                 # Theme, splitters, chat, endpoint CRUD, grouped model dropdown
+│   └── app.js                 # Theme, splitters, chat, endpoint CRUD, grouped model dropdown,
+│                              #   push-to-talk recorder, call mode WebRTC client
 ├── scripts/
 │   └── bake-models.sh         # Docker: background-daemon Ollama pull with clean shutdown
+├── tools/
+│   └── test_call.py           # Programmatic call-quality test — drives the full WebRTC pipeline
+│                              #   end-to-end with timing breakdown (run via `./dev.sh test`)
 ├── Dockerfile                 # App image — python:3.12-slim, ~160 MB
 ├── Dockerfile.ollama          # Ollama image with 3 models baked in, ~10.3 GB
 ├── docker-compose.yml         # Two-service orchestration, GPU, healthchecks
@@ -2486,11 +2693,13 @@ miniclosedai/
 │       ├── Support Ticket Router.md        # JSON extractor / classifier
 │       ├── Inbound Lead Qualifier.md       # Scoring + routing
 │       └── RAG Query Router.md             # Bonsai-paired classifier
-├── test_e2e.py                # Single-file end-to-end regression suite
+├── test_e2e.py                # Single-file end-to-end regression suite (170 tests, ~16s)
 └── miniclosedai.db            # SQLite file (gitignored; Docker: in named volume)
 ```
 
-**Backend:** ~900 LoC Python total. **Frontend:** ~1700 LoC JS + ~850 CSS + ~240 HTML. **Docker scaffolding:** ~200 LoC across 6 files.
+**Voice service** lives in its **own repo** at [edantonio505/miniclosedai-voice](https://github.com/edantonio505/miniclosedai-voice). Clone it as a sibling directory (e.g. `../miniclosedai-voice/`) and `dev.sh` will find it automatically, or set `MINICLOSEDAI_VOICE_DIR` to a custom path.
+
+**Backend:** ~1100 LoC Python total. **Frontend:** ~2200 LoC JS + ~900 CSS + ~250 HTML. **Docker scaffolding:** ~200 LoC across 6 files.
 
 ---
 
