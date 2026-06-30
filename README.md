@@ -25,29 +25,30 @@ Built with **FastAPI** (5 Python deps), vanilla JS, and SQLite. Runs on a laptop
 2. [Requirements](#requirements)
 3. [Install](#install) · [One-line install](#quickest--one-line-install-macos-linux-wsl) · [Docker quick start (with baked models)](#docker-quick-start-with-baked-models)
 4. [Run](#run)
-5. [Your first bot — 60 seconds](#your-first-bot--60-seconds)
-6. [UI guide](#ui-guide) · [Sidebar panels — Knowledge / Extensions / Evals](#sidebar) · [Apps + per-app SDK (TypeScript / JavaScript / Python)](#apps-page-grouping-bots--generate-a-per-app-sdk) · [Voice — push-to-talk + call mode](#voice--push-to-talk--call-mode)
-7. [Connecting LM Studio and other OpenAI-compatible endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)
-8. [Generating system prompts](#generating-system-prompts)
-9. [The microservice pattern](#the-microservice-pattern)
-10. [API reference — native endpoints](#api-reference--native-endpoints)
-11. [OpenAI-compatible endpoint](#openai-compatible-endpoint)
-12. [Recipes — common bot patterns](#recipes--common-bot-patterns)
-13. [Getting good responses from small models](#getting-good-responses-from-small-models)
-14. [Curating fine-tuning data](#curating-fine-tuning-data)
-15. [Automated image labeling — hot dog / not hot dog](#automated-image-labeling--hot-dog--not-hot-dog)
-16. [Building a chatbot against a saved bot](#building-a-chatbot-against-a-saved-bot)
-17. [Python client SDK](#python-client-sdk--compose-bots-in-your-own-code)
-18. [Benchmarking with miniclosedai-llm](#benchmarking-with-miniclosedai-llm)
-19. [Sharing bots between instances](#sharing-bots-between-instances)
-20. [Sharing an application between instances](#sharing-an-application-between-instances)
-21. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
-22. [LAN access](#lan-access)
-23. [Troubleshooting](#troubleshooting)
-24. [Testing](#testing)
-25. [Project layout](#project-layout)
-26. [Security](#security)
-27. [License](#license)
+5. [Terminal CLI (`mcai`) — local, remote & LLM-agent access](#terminal-cli-mcai)
+6. [Your first bot — 60 seconds](#your-first-bot--60-seconds)
+7. [UI guide](#ui-guide) · [Sidebar panels — Knowledge / Extensions / Evals](#sidebar) · [Apps + per-app SDK (TypeScript / JavaScript / Python)](#apps-page-grouping-bots--generate-a-per-app-sdk) · [Voice — push-to-talk + call mode](#voice--push-to-talk--call-mode)
+8. [Connecting LM Studio and other OpenAI-compatible endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)
+9. [Generating system prompts](#generating-system-prompts)
+10. [The microservice pattern](#the-microservice-pattern)
+11. [API reference — native endpoints](#api-reference--native-endpoints)
+12. [OpenAI-compatible endpoint](#openai-compatible-endpoint)
+13. [Recipes — common bot patterns](#recipes--common-bot-patterns)
+14. [Getting good responses from small models](#getting-good-responses-from-small-models)
+15. [Curating fine-tuning data](#curating-fine-tuning-data)
+16. [Automated image labeling — hot dog / not hot dog](#automated-image-labeling--hot-dog--not-hot-dog)
+17. [Building a chatbot against a saved bot](#building-a-chatbot-against-a-saved-bot)
+18. [Python client SDK](#python-client-sdk--compose-bots-in-your-own-code)
+19. [Benchmarking with miniclosedai-llm](#benchmarking-with-miniclosedai-llm)
+20. [Sharing bots between instances](#sharing-bots-between-instances)
+21. [Sharing an application between instances](#sharing-an-application-between-instances)
+22. [Upgrading MiniClosedAI](#upgrading-miniclosedai)
+23. [LAN access](#lan-access)
+24. [Troubleshooting](#troubleshooting)
+25. [Testing](#testing)
+26. [Project layout](#project-layout)
+27. [Security](#security)
+28. [License](#license)
 
 ---
 
@@ -402,14 +403,73 @@ live on your `PATH`.)
 
 A bot or app argument accepts either its numeric id or a unique substring of its
 title/name. Configuration via env (or `.env`): `MINICLOSEDAI_URL` (default
-`https://localhost:8095`), `MINICLOSEDAI_PORT`, `MINICLOSEDAI_API_KEY` (only if you've
-put the server behind auth), and `MINICLOSEDAI_VERIFY=1` to enforce TLS verification
-(off by default since the dev server uses a self-signed cert). Run `./mcai <command> -h`
-for per-command help. Symlink it onto your `PATH` if you like:
-`ln -s "$(pwd)/mcai" ~/.local/bin/mcai`.
+`https://localhost:8095`), `MINICLOSEDAI_PORT`, `MINICLOSEDAI_API_KEY` (sent as a
+bearer if set — useful when you front the server with an auth proxy), and
+`MINICLOSEDAI_VERIFY=1` to enforce TLS verification (off by default since the dev
+server uses a self-signed cert). Run `./mcai <command> -h` for per-command help.
+Symlink it onto your `PATH` if you like: `ln -s "$(pwd)/mcai" ~/.local/bin/mcai`.
 
 > Voice (push-to-talk / call mode) and the WebRTC duplex path remain GUI-only — they
 > need a browser mic/speaker. Everything else in the GUI is reachable from `mcai`.
+
+### From another machine, or from an LLM agent
+
+Every bot is reachable over the network, so a coding/agent LLM running on a **different
+server** can discover and call any bot with no SDK lock-in and (on a trusted network) no
+credentials. The server binds `0.0.0.0`, so just point at the host. Two ways:
+
+**1. The OpenAI-compatible endpoint — the easiest for any agent framework.** Use the
+**conversation id as the `model`** and any OpenAI client. No API key is required by
+default:
+
+```python
+from openai import OpenAI
+import httpx
+
+# Point at the remote MiniClosedAI. verify=False because the dev server's TLS is
+# self-signed (or just use an http:// URL if you run uvicorn without TLS).
+client = OpenAI(base_url="https://<host>:8095/v1", api_key="not-needed",
+                http_client=httpx.Client(verify=False))
+
+# Discover bots first (id + title), then call one by id:
+bots = httpx.get("https://<host>:8095/api/conversations", verify=False).json()
+# [{"id": 75, "title": "Summarizer", ...}, ...]
+
+r = client.chat.completions.create(
+    model="75",                                  # the bot's conversation id
+    messages=[{"role": "user", "content": "Summarize: ..."}])
+print(r.choices[0].message.content)
+```
+
+The same in pure `curl` (no SDK):
+
+```bash
+# list bots
+curl -sk https://<host>:8095/api/conversations
+
+# call bot 75 (its saved system prompt + params are applied server-side)
+curl -sk https://<host>:8095/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "75", "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+**2. The `mcai` CLI on the remote box.** `cli.py` is a single, dependency-free
+(stdlib-only) file — copy it over and run it with system `python3`; no venv, no install:
+
+```bash
+scp you@miniclosedai-host:~/miniclosedai/cli.py .
+MINICLOSEDAI_URL=https://<host>:8095 python3 cli.py bots ls
+MINICLOSEDAI_URL=https://<host>:8095 python3 cli.py send 75 "Summarize: ..."
+```
+
+**Security note — read before exposing it.** By default MiniClosedAI has **no
+authentication**: anyone who can reach `:8095` can read, modify, run, and delete every
+bot. That's fine on a trusted LAN. If the host has a public IP or sits on an untrusted
+network, do **not** expose `:8095` directly — put it behind a reverse proxy (nginx,
+Caddy) that enforces a token or mTLS, restrict it to a VPN/private subnet, or bind it to
+`127.0.0.1` and tunnel over SSH. `mcai` and the OpenAI SDK will send
+`Authorization: Bearer $MINICLOSEDAI_API_KEY` when that env var is set, so a token-checking
+proxy is a drop-in. See [Security](#security) and [LAN access](#lan-access).
 
 ---
 
@@ -2708,6 +2768,8 @@ Now every commit runs the suite first and refuses to record if anything is red.
 miniclosedai/
 ├── app.py                     # FastAPI routes (native + OpenAI-compat, multi-backend)
 ├── llm.py                     # Kind-dispatched client: Ollama + OpenAI-compat
+├── cli.py                     # `mcai` terminal CLI — stdlib-only HTTP client over /api (GUI parity)
+├── mcai                       # Bash wrapper for cli.py (uses project venv if present)
 ├── voice.py                   # Client for kind='voice' backends (transcribe / speak / call signaling)
 ├── db.py                      # SQLite schema + MINICLOSEDAI_DB_PATH env override
 ├── logs.py                    # In-memory chat request/response buffer for the Logs page (+ CSV export)
@@ -2769,6 +2831,11 @@ If you need to expose MiniClosedAI beyond that, put it behind:
 - A reverse proxy (nginx, Caddy) with basic auth or OAuth2-Proxy.
 - A VPN (Tailscale, WireGuard).
 - A firewall allow-list.
+
+This applies equally to terminal/agent access: the `mcai` CLI and the OpenAI-compatible
+endpoint reach the same unauthenticated `/api`. If you front the server with a
+token-checking proxy, set `MINICLOSEDAI_API_KEY` and both `mcai` and OpenAI SDK clients
+will send `Authorization: Bearer …`. See [Terminal CLI → From another machine, or from an LLM agent](#terminal-cli-mcai).
 
 The app does **not** speak HTTPS directly. `navigator.clipboard` requires HTTPS or `localhost`; the app falls back to `document.execCommand("copy")` over plain-HTTP.
 

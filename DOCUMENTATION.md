@@ -24,34 +24,35 @@ For the extreme-quantization 1-bit Bonsai integration (`llama.cpp` server on por
 1. [Requirements](#requirements)
 2. [Architecture overview](#architecture-overview)
 3. [Running](#running)
-4. [Docker deployment](#docker-deployment)
-5. [UI features](#ui-features)
-6. [Voice — push-to-talk + call mode (separate microservice repo)](#voice-push-to-talk--call-mode-via-a-separate-microservice)
-7. [Apps + per-app SDK generation (TypeScript / JavaScript / Python)](#apps-groups-of-bots-and-per-app-sdk-generation)
-8. [Knowledge base (RAG)](#knowledge-base-rag)
-7. [Extensibility — MCP plugins](#extensibility--mcp-plugins)
-8. [Evaluation & auto-improve](#evaluation--auto-improve-scoring)
-9. [Worked example — connecting Bonsai (1-bit 8B)](#worked-example--connecting-bonsai-1-bit-8b)
-10. [Per-chat microservice pattern](#per-chat-microservice-pattern)
-11. [API reference](#api-reference)
-12. [Thinking / reasoning control](#thinking--reasoning-control)
-13. [Stopping generation](#stopping-generation)
-14. [Fine-tuning data export](#fine-tuning-data-export)
-15. [Worked example — automated image labeling](#worked-example--automated-image-labeling)
-16. [Worked example — chatbot frontends (Python CLI + HTML widget)](#worked-example--chatbot-frontends-python-cli--html-widget)
-17. [Client SDK — composing bots from your code](#client-sdk--composing-bots-from-your-code)
-18. [Bot import / export](#bot-import--export)
-19. [Application import / export](#application-import--export)
-20. [Self-upgrade](#self-upgrade)
-20. [Prompt generator](#prompt-generator)
-21. [Activity logs](#activity-logs)
-22. [Benchmarking with miniclosedai-llm](#benchmarking-with-miniclosedai-llm)
-23. [Database](#database)
-23. [Configuration](#configuration)
-24. [File layout](#file-layout)
-25. [Security](#security)
-26. [Troubleshooting](#troubleshooting)
-27. [Testing](#testing)
+4. [Terminal CLI (`mcai`) — local, remote & agent access](#terminal-cli-mcai)
+5. [Docker deployment](#docker-deployment)
+6. [UI features](#ui-features)
+7. [Voice — push-to-talk + call mode (separate microservice repo)](#voice-push-to-talk--call-mode-via-a-separate-microservice)
+8. [Apps + per-app SDK generation (TypeScript / JavaScript / Python)](#apps-groups-of-bots-and-per-app-sdk-generation)
+9. [Knowledge base (RAG)](#knowledge-base-rag)
+10. [Extensibility — MCP plugins](#extensibility--mcp-plugins)
+11. [Evaluation & auto-improve](#evaluation--auto-improve-scoring)
+12. [Worked example — connecting Bonsai (1-bit 8B)](#worked-example--connecting-bonsai-1-bit-8b)
+13. [Per-chat microservice pattern](#per-chat-microservice-pattern)
+14. [API reference](#api-reference)
+15. [Thinking / reasoning control](#thinking--reasoning-control)
+16. [Stopping generation](#stopping-generation)
+17. [Fine-tuning data export](#fine-tuning-data-export)
+18. [Worked example — automated image labeling](#worked-example--automated-image-labeling)
+19. [Worked example — chatbot frontends (Python CLI + HTML widget)](#worked-example--chatbot-frontends-python-cli--html-widget)
+20. [Client SDK — composing bots from your code](#client-sdk--composing-bots-from-your-code)
+21. [Bot import / export](#bot-import--export)
+22. [Application import / export](#application-import--export)
+23. [Self-upgrade](#self-upgrade)
+24. [Prompt generator](#prompt-generator)
+25. [Activity logs](#activity-logs)
+26. [Benchmarking with miniclosedai-llm](#benchmarking-with-miniclosedai-llm)
+27. [Database](#database)
+28. [Configuration](#configuration)
+29. [File layout](#file-layout)
+30. [Security](#security)
+31. [Troubleshooting](#troubleshooting)
+32. [Testing](#testing)
 
 ---
 
@@ -246,6 +247,136 @@ uvicorn app:app --port 8096
 ```bash
 OLLAMA_URL=http://192.168.1.42:11434 python app.py
 ```
+
+---
+
+## Terminal CLI (`mcai`)
+
+`mcai` gives the web GUI a complete shell equivalent. It is a **dependency-free,
+stdlib-only** HTTP client (`cli.py`, ~argparse + urllib + json + ssl) over the *same*
+`/api` endpoints the dashboard uses — so the CLI and GUI are never out of sync. Create a
+bot from the terminal and it appears in the browser; edit it in the browser and `mcai`
+sees the change immediately. There is no separate database access and no duplicated
+business logic: the running server stays the single source of truth.
+
+It mirrors the `mc` CLI shipped by the sibling `miniclosedai-llm` repo (see
+[Benchmarking with miniclosedai-llm](#benchmarking-with-miniclosedai-llm)); the binary is
+named `mcai` rather than `mc` so both can live on your `PATH` at once.
+
+### Invocation
+
+```bash
+./mcai <command> [args]          # via the bash wrapper (uses ./.venv if present, else system python3)
+python3 cli.py <command> [args]  # directly — works under any python3, no venv needed
+./mcai <command> -h              # per-command help
+```
+
+`cli.py` is self-contained, so it can be copied to any machine and run as-is (see
+[remote / agent access](#remote--agent-access) below).
+
+### Configuration (env vars, or a `.env` in the repo root)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MINICLOSEDAI_URL` | `https://localhost:8095` | Full base URL of the target server (overrides PORT). |
+| `MINICLOSEDAI_PORT` | `8095` | Port, when `MINICLOSEDAI_URL` is unset (scheme is `https`). |
+| `MINICLOSEDAI_VERIFY` | unset | `1`/`true` enforces TLS cert verification. Off by default because the dev server's cert is self-signed. |
+| `MINICLOSEDAI_API_KEY` | unset | Sent as `Authorization: Bearer …` on every request. The app does not require it; set it when you front the server with an auth proxy that does. |
+
+Exit codes: `0` ok · `1` API/usage error · `2` server unreachable / unauthorized.
+
+### Command surface (maps 1:1 to GUI features)
+
+A `<bot>` or `<app>` argument accepts the numeric id **or** a unique case-insensitive
+substring of the title/name.
+
+| Command group | Commands | Backing endpoint(s) |
+|---|---|---|
+| **status / models** | `status`, `models [--json]` | `GET /api/backends` (+ `/{id}/status`), `GET /api/models` |
+| **backend** | `ls`, `add`, `edit`, `rm`, `test`, `status`, `models`, `pull`, `pulls`, `unpull`, `auto-register` | `…/api/backends*`, `/api/pulls` |
+| **bots** | `ls [--app]`, `show`, `create`, `edit`, `clone`, `clear`, `rm`, `export`, `import` | `…/api/conversations*`, `/conversations/import`, `…/export*` |
+| **chat** | `chat <bot>` (interactive REPL; `/reset`, `/exit`) | `POST /api/conversations/{id}/chat/stream` (SSE) |
+| **send** | `send <bot> "prompt" [--ephemeral] [--json]` | `POST /api/conversations/{id}/chat` |
+| **url** | `url <bot>` (prints callable endpoints + curl/python snippets) | — (composed client-side) |
+| **kb** (RAG) | `ls`, `add <file>`, `rm <doc_id>` | `…/api/conversations/{id}/knowledge*` (PDFs go through `/api/extract-pdf`) |
+| **mcp** | `ls`, `add`, `rm`, `enable`, `disable`, `test` | `…/api/conversations/{id}/mcp*` |
+| **eval** | `ls`, `add`, `rm`, `clear`, `seed`, `run --mode exact\|contains\|judge` | `…/api/conversations/{id}/eval/*` |
+| **apps** | `ls`, `show`, `create`, `edit`, `rm`, `add-bot`, `rm-bot`, `sdk --lang ts\|js\|py [--out] [--zip]` | `…/api/apps*`, `…/apps/{id}/sdk[.zip]` |
+| **logs** | `logs [--limit N] [--json]`, `logs clear`, `logs export [--out f]` | `…/api/logs*` |
+
+### Examples
+
+```bash
+./mcai status                         # server + per-backend online/offline
+./mcai bots create --title "Summarizer" --backend 1 --model qwen3:8b \
+    --system "One-sentence summaries, under 20 words." --param temperature=0.2
+./mcai send "Summarizer" "Long text..."   # one-shot (persists the turn by default)
+./mcai chat "Summarizer"                  # interactive REPL
+./mcai url  "Summarizer"                   # callable endpoint + copy-paste snippets
+./mcai kb add "Summarizer" notes.md       # chunk + embed a doc into the bot's RAG store
+./mcai eval add "Summarizer" --input "2+2?" --expected "4"
+./mcai eval run "Summarizer" --mode contains
+./mcai apps sdk "Support" --lang ts --out ./sdk
+./mcai bots export "Summarizer" --out bot.json
+./mcai bots import bot.json --backend 1
+```
+
+`send` persists the turn and includes prior history by default (it behaves like the GUI
+chat); pass `--ephemeral` for a stateless one-shot call (the microservice pattern — no
+history, nothing saved).
+
+### Remote / agent access
+
+Because every bot is an HTTP resource and the server can bind `0.0.0.0`, a coding/agent
+LLM on a **different server** can discover and drive any bot. Two paths:
+
+**1. OpenAI-compatible endpoint (recommended for agents).** Any OpenAI client works; the
+**`model` field is the conversation id**, and the bot's saved system prompt + sampling
+params are applied server-side. No API key required by default.
+
+```python
+from openai import OpenAI
+import httpx
+
+client = OpenAI(base_url="https://<host>:8095/v1", api_key="not-needed",
+                http_client=httpx.Client(verify=False))   # self-signed dev TLS
+bots = httpx.get("https://<host>:8095/api/conversations", verify=False).json()
+r = client.chat.completions.create(
+    model="75", messages=[{"role": "user", "content": "Summarize: ..."}])
+print(r.choices[0].message.content)
+```
+
+Pure HTTP, no SDK:
+
+```bash
+curl -sk https://<host>:8095/api/conversations                       # discover ids
+curl -sk https://<host>:8095/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "75", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+**2. `mcai` on the remote box.** Copy the single `cli.py` over and point it at the host:
+
+```bash
+scp you@miniclosedai-host:~/miniclosedai/cli.py .
+MINICLOSEDAI_URL=https://<host>:8095 python3 cli.py bots ls
+MINICLOSEDAI_URL=https://<host>:8095 python3 cli.py send 75 "Summarize: ..."
+```
+
+> **Self-signed TLS:** the dev server uses a self-signed cert. `mcai` skips verification
+> by default; raw HTTP clients need `verify=False` (httpx/requests) — or run uvicorn
+> without TLS and use an `http://` URL.
+>
+> **No auth by default:** anyone who can reach `:8095` has full read/write/run access to
+> every bot. Safe on a trusted LAN; for a public IP or untrusted network, front it with a
+> token-checking reverse proxy (set `MINICLOSEDAI_API_KEY` so `mcai`/SDK send the bearer),
+> restrict to a VPN/subnet, or bind `127.0.0.1` and tunnel over SSH. See [Security](#security).
+
+### Not covered (GUI-only)
+
+Voice push-to-talk / TTS playback and the WebRTC duplex call path need a browser
+mic/speaker and are intentionally not in `mcai`. Everything else the GUI does is a CLI
+command.
 
 ---
 
@@ -2445,6 +2576,8 @@ Ollama-side env vars (set on the `ollama` service in compose):
 miniclosedai/
 ├── app.py                     # FastAPI routes (models, conversations, chat, SSE)
 ├── llm.py                     # Client: Ollama + OpenAI-compat, think support
+├── cli.py                     # `mcai` terminal CLI — stdlib-only HTTP client over /api (full GUI parity)
+├── mcai                       # Bash wrapper for cli.py (project venv if present, else system python3)
 ├── db.py                      # SQLite schema + helpers (MINICLOSEDAI_DB_PATH override)
 ├── logs.py                    # In-memory ring buffer for the Logs page (chat req/resp records)
 ├── requirements.txt           # fastapi, uvicorn, httpx, pypdf, python-multipart
