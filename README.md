@@ -362,6 +362,57 @@ That's the whole loop: **configure → save → call**.
 
 ---
 
+## Terminal CLI (`mcai`)
+
+Everything the web GUI does has a shell equivalent. `mcai` is a dependency-free
+(stdlib-only) HTTP client over the same `/api` endpoints the dashboard uses, so the
+two stay in live sync — create a bot from the terminal and it shows up in the browser,
+and vice-versa. (It mirrors `miniclosedai-llm`'s `mc` CLI; the names differ so both can
+live on your `PATH`.)
+
+```bash
+./mcai status                       # server + backend health
+./mcai backend ls                   # registered endpoints (Ollama / OpenAI-compat / Voice)
+./mcai models                       # every model across online backends
+
+# Bots (saved conversations) — full CRUD
+./mcai bots ls
+./mcai bots create --title "Summarizer" --backend 1 --model qwen3:8b \
+    --system "One-sentence summaries, under 20 words." --param temperature=0.2
+./mcai send "Summarizer" "Long text to summarize..."   # one-shot
+./mcai chat "Summarizer"                               # interactive REPL (/reset, /exit)
+./mcai url "Summarizer"                                # callable endpoint + curl/python snippets
+
+# Per-bot knowledge (RAG), extensions (MCP), and evals
+./mcai kb add "Summarizer" notes.md
+./mcai mcp add "Summarizer" --url https://my-mcp-server/sse
+./mcai eval add "Summarizer" --input "2+2?" --expected "4"
+./mcai eval run  "Summarizer" --mode contains
+
+# Apps (groups of bots) + per-app SDK generation
+./mcai apps create --name "Support"
+./mcai apps add-bot "Support" "Summarizer"
+./mcai apps sdk "Support" --lang ts --out ./sdk
+
+# Import / export a bot, tail recent requests
+./mcai bots export "Summarizer" --out bot.json
+./mcai bots import bot.json --backend 1
+./mcai logs
+```
+
+A bot or app argument accepts either its numeric id or a unique substring of its
+title/name. Configuration via env (or `.env`): `MINICLOSEDAI_URL` (default
+`https://localhost:8095`), `MINICLOSEDAI_PORT`, `MINICLOSEDAI_API_KEY` (only if you've
+put the server behind auth), and `MINICLOSEDAI_VERIFY=1` to enforce TLS verification
+(off by default since the dev server uses a self-signed cert). Run `./mcai <command> -h`
+for per-command help. Symlink it onto your `PATH` if you like:
+`ln -s "$(pwd)/mcai" ~/.local/bin/mcai`.
+
+> Voice (push-to-talk / call mode) and the WebRTC duplex path remain GUI-only — they
+> need a browser mic/speaker. Everything else in the GUI is reachable from `mcai`.
+
+---
+
 ## UI guide
 
 ### Navigation model
