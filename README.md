@@ -1931,6 +1931,24 @@ Closest sibling to the Doctor's Office Bot — primary-care archetype, dental-sp
 
 ---
 
+### 13. LLM extraction & benchmarking playbook — [full methodology](./docs/recipes/LLM%20Extraction%20%26%20Benchmarking%20Playbook.md)
+
+Unlike the bot recipes above, this is a **process playbook for the engineer/agent building an
+extractor** — how to take any extraction / document-parsing / structured-LLM task to production
+accuracy quickly and repeatably. Distilled from a real project that went from **93.5% → 99.1%
+per-field accuracy with zero fine-tuning**. Covers: hand-verified frozen test sets + a field-aware
+scorer (normalize dates/names/addresses so format ≠ error), parallel multi-model benchmarking through
+the gateway (one bot per model, cloned per-worker conversations, transient-only retries), an error
+taxonomy to diagnose before optimizing, the **optimization ladder** (input quality → prompt →
+validators → targeted re-read → self-consistency → fine-tune LAST), **self-tiling** for vision OCR
+(full page + high-res crops to beat a VLM's fixed image-token cap), and serving/hardware guidance
+(local endpoint not a tunnel, native-FP8 GPUs, prefix caching). Includes a **⭐ gemma-4 known-good
+settings** block (tiling DPIs, exact vLLM serve flags) to copy verbatim. Full playbook in
+**[`LLM Extraction & Benchmarking Playbook.md`](./docs/recipes/LLM%20Extraction%20%26%20Benchmarking%20Playbook.md)**;
+coding agents should start from the root **[`AGENTS.md`](./AGENTS.md)**.
+
+---
+
 ## Getting good responses from small models
 
 Small local models are *capable* but *literal*. A few rules of thumb:
@@ -2794,6 +2812,7 @@ miniclosedai/
 ├── docker-compose.lite.yml    # Lite mode: single-service, no Ollama container, MINICLOSEDAI_NO_OLLAMA=1
 ├── .dockerignore              # Build-context exclusions
 ├── README.md                  # This document
+├── AGENTS.md                  # Coding-agent entrypoint → extraction/benchmarking methodology
 ├── DOCUMENTATION.md           # Extra architecture detail (covers Docker in depth)
 ├── INSTALL.md                 # Per-OS Ollama install detail
 ├── docs/
@@ -2805,7 +2824,8 @@ miniclosedai/
 │       ├── Dentist Appointment Bot.md      # Conversational, qwen3:8b
 │       ├── Support Ticket Router.md        # JSON extractor / classifier
 │       ├── Inbound Lead Qualifier.md       # Scoring + routing
-│       └── RAG Query Router.md             # Bonsai-paired classifier
+│       ├── RAG Query Router.md             # Bonsai-paired classifier
+│       └── LLM Extraction & Benchmarking Playbook.md  # Process playbook: benchmark→tile→optimize→serve
 ├── test_e2e.py                # Single-file end-to-end regression suite (170 tests, ~16s)
 └── miniclosedai.db            # SQLite file (gitignored; Docker: in named volume)
 ```
