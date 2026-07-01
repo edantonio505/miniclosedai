@@ -4096,6 +4096,43 @@ def _():
     chat_logs.clear()
 
 
+@test("logs: base64 image payloads are stripped from the export blob")
+def _():
+    # Regression: retaining raw data:image;base64 URLs in the export-only
+    # `_full` blob ballooned memory into GBs and stalled /api/logs/export on
+    # image-heavy servers. record_chat must strip them to a compact marker
+    # while keeping text and non-base64 URLs intact.
+    import logs as chat_logs
+    chat_logs.clear()
+    big_b64 = "A" * 400_000  # ~300 KB decoded
+    chat_logs.record_chat(
+        endpoint="/api/test", kind="sync",
+        backend={"id": 1, "name": "fake", "kind": "openai"},
+        model="m",
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + big_b64}},
+                {"type": "image_url", "image_url": {"url": "images/0_user_0.png"}},
+            ],
+        }],
+        params={}, response_text="a cat", latency_ms=5,
+    )
+    # The export endpoint surfaces the full request messages.
+    r = client.get("/api/logs/export")
+    assert r.status_code == 200, r.status_code
+    body = r.text
+    # The 400 KB base64 blob must be gone; the marker + text + path must remain.
+    assert big_b64 not in body, "base64 payload leaked into export"
+    assert "image/png" in body and "omitted" in body, "expected image marker"
+    assert "what is this?" in body, "text content dropped"
+    assert "images/0_user_0.png" in body, "non-base64 url should be preserved"
+    # And the whole export must stay small (was multi-hundred-KB before).
+    assert len(body) < 5_000, f"export unexpectedly large: {len(body)} bytes"
+    chat_logs.clear()
+
+
 # ---- Relay auto-route override ----
 
 def _reset_relay_cache():

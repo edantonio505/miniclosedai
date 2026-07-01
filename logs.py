@@ -43,6 +43,49 @@ def _truncate(text: str | None, limit: int) -> tuple[str, bool]:
     return text[:limit] + "…", True
 
 
+def _sanitize_full_messages(messages: list[dict]) -> list[dict]:
+    """Deep-ish copy of the request messages with base64 image payloads
+    stripped, for storage in the export-only `_full` blob.
+
+    The raw request can carry multi-megabyte `data:image/...;base64,...` URLs
+    (one per attached image). Retaining those verbatim for every entry blows
+    up both process memory and the `/api/logs/export` CSV — a heavy export
+    then stalls and connections pile up. We keep the message structure, roles,
+    and all text intact (that's the useful part of an export) but replace each
+    inline base64 image URL with a compact `[image: <mime>, ~<n> KB omitted]`
+    marker. Non-base64 image URLs (e.g. relative paths) are small and kept
+    as-is. Never mutates the caller's message objects.
+    """
+    out: list[dict] = []
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            out.append(m)
+            continue
+        new_parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "image_url":
+                url = ((p.get("image_url") or {}).get("url")) or ""
+                if url.startswith("data:"):
+                    # data:<mime>;base64,<payload>
+                    mime = "image"
+                    approx_kb = 0
+                    try:
+                        header, b64 = url.split(",", 1)
+                        mime = header[5:].split(";", 1)[0] or "image"
+                        approx_kb = (len(b64) * 3 // 4) // 1024
+                    except (ValueError, IndexError):
+                        pass
+                    new_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"[image: {mime}, ~{approx_kb} KB omitted]"},
+                    })
+                    continue
+            new_parts.append(p)
+        out.append({**m, "content": new_parts})
+    return out
+
+
 def _summarize_messages(messages: list[dict]) -> list[dict]:
     """Compact preview of the LLM-bound message list.
 
@@ -125,9 +168,11 @@ def record_chat(
             "error": error,
             "latency_ms": latency_ms,
             # Full payload for export. Not surfaced by /api/logs (the polling
-            # list endpoint) to keep that response small.
+            # list endpoint) to keep that response small. Base64 image data is
+            # stripped here so long-running servers with image-heavy chats
+            # don't accumulate GBs of payload (which also stalls the export).
             "_full": {
-                "messages": messages or [],
+                "messages": _sanitize_full_messages(messages or []),
                 "response_text": full_resp,
                 "thinking_text": full_think,
             },
