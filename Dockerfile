@@ -60,4 +60,10 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # Bind to 0.0.0.0 so the published port on the host actually reaches the
 # app. `python app.py` would silently bind to loopback-only via the
 # __main__ block.
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8095"]
+#   --limit-concurrency   cap in-flight requests; excess gets a fast 503
+#                         instead of silently piling up connections + threads
+#                         and exhausting memory (as a stalled export once did).
+#   --timeout-keep-alive  drop idle keep-alive sockets so the browser's
+#                         frequent pollers don't accumulate dead connections.
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8095", \
+     "--limit-concurrency", "128", "--timeout-keep-alive", "10"]
