@@ -2325,6 +2325,31 @@ body.sidebar-collapsed #sidebar-toggle {
   font-size: 13px;
 }
 
+/* Wrapper that makes the textarea a positioning context for the clear (X) icon.
+   min-height:0 lets it shrink when the horizontal splitter shrinks the panel. */
+.sys-prompt-textarea-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+.sys-prompt-clear {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 24px;
+  height: 24px;
+  color: var(--text-faint);
+  z-index: 2;
+}
+.sys-prompt-clear:hover { color: var(--text); }
+.sys-prompt-clear svg { width: 14px; height: 14px; }
+/* Hide the X when the prompt is empty (placeholder visible) or while streaming
+   (textarea disabled) — evaluated live from the DOM, so it stays correct even
+   when the value is set programmatically without an input event. */
+.sys-prompt-textarea-wrap:has(#system-prompt:placeholder-shown) .sys-prompt-clear { display: none; }
+.sys-prompt-textarea-wrap:has(#system-prompt:disabled) .sys-prompt-clear { display: none; }
+
 /* "Generate prompt" affordance — only visible when an enabled+running
    ollama backend hosted on app.interdataresearch.* is registered. */
 .prompt-gen-bar {

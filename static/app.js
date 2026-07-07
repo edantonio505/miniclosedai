@@ -56,6 +56,7 @@ const els = {
   deleteChatBtn: document.getElementById("delete-chat-btn"),
   apiCodeBtn: document.getElementById("api-code-btn"),
   systemPrompt: document.getElementById("system-prompt"),
+  sysPromptClear: document.getElementById("sys-prompt-clear"),
   sysPromptAvatar: document.getElementById("sys-prompt-avatar"),
   temperature: document.getElementById("temperature"),
   tempVal: document.getElementById("temp-val"),
@@ -367,6 +368,23 @@ function bindParamDisplay() {
   });
   els.think.addEventListener("change", () => { syncParamDisplay(); saveSettings(); scheduleSaveToConversation(); });
   els.systemPrompt.addEventListener("input", () => { saveSettings(); scheduleSaveToConversation(); });
+  if (els.sysPromptClear) {
+    els.sysPromptClear.addEventListener("click", () => {
+      els.systemPrompt.value = "";
+      // Reuse the existing input listeners: saveSettings + _updatePromptGenAffordance.
+      els.systemPrompt.dispatchEvent(new Event("input"));
+      // The debounced full-patch omits system_prompt when empty (the `|| undefined`
+      // in _buildConfigPatch), so send an explicit empty prompt to persist the clear.
+      if (state.conversationId) {
+        fetch(`/api/conversations/${state.conversationId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ system_prompt: "" }),
+        }).catch(() => {});
+      }
+      els.systemPrompt.focus();
+    });
+  }
   els.modelSelect.addEventListener("change", () => { saveSettings(); scheduleSaveToConversation(); });
   if (els.voiceSelect) {
     els.voiceSelect.addEventListener("change", () => { saveSettings(); scheduleSaveToConversation(); });

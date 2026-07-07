@@ -183,7 +183,13 @@
           </div>
           <div id="prompt-gen-status" class="prompt-gen-status" hidden></div>
         </div>
-        <textarea id="system-prompt" placeholder="You are a helpful AI assistant."></textarea>
+        <div class="sys-prompt-textarea-wrap">
+          <textarea id="system-prompt" placeholder="You are a helpful AI assistant."></textarea>
+          <button id="sys-prompt-clear" type="button" class="sys-prompt-clear icon-btn" data-tooltip="Clear system prompt" aria-label="Clear system prompt">
+            <!-- X: clear to a blank system prompt -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
       </div>
 
       <div id="h-splitter" class="h-splitter" title="Drag to resize. Double-click to reset."></div>
