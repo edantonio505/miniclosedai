@@ -1055,6 +1055,109 @@ def _():
         client.delete(f"/api/backends/{vid}")
 
 
+@test("/api/voices: aggregates ALL enabled voice backends, tagging each voice")
+def _():
+    # Two voice backends pointing at the same fake server — the id-collision
+    # case (two identical voice servers expose identical voice ids). Each
+    # voice must carry its backend_id/backend_name so the picker can tell
+    # them apart.
+    vbid1 = _add_voice_backend()
+    r = client.post("/api/backends", json={
+        "name": "FakeVoice2", "kind": "voice", "base_url": fake_voice.base_url,
+    })
+    assert r.status_code == 200, r.text
+    vbid2 = r.json()["id"]
+    try:
+        j = client.get("/api/voices").json()
+        voices = j["voices"]
+        assert len(voices) == 8, voices                      # 4 voices × 2 backends
+        assert all("backend_id" in v and "backend_name" in v for v in voices), voices
+        by_backend = {v["backend_id"] for v in voices}
+        assert by_backend == {vbid1, vbid2}, by_backend
+        # Same voice id present under BOTH backends (the collision).
+        owners = {v["backend_id"] for v in voices if v["id"] == "en_F_0"}
+        assert owners == {vbid1, vbid2}, owners
+        # backends report: both ok. Legacy top-level keys = first backend.
+        rep = {b["id"]: b for b in j["backends"]}
+        assert rep[vbid1]["ok"] and rep[vbid2]["ok"], j["backends"]
+        assert j["backend_id"] == vbid1
+    finally:
+        client.delete(f"/api/backends/{vbid1}")
+        client.delete(f"/api/backends/{vbid2}")
+
+
+@test("/api/voices: one offline backend is skipped, not fatal; all-offline → 502")
+def _():
+    vbid1 = _add_voice_backend()
+    # Dead backend: nothing listens on the discard port → fast refusal.
+    r = client.post("/api/backends", json={
+        "name": "DeadVoice", "kind": "voice", "base_url": "http://127.0.0.1:9",
+    })
+    assert r.status_code == 200, r.text
+    vbid2 = r.json()["id"]
+    try:
+        j = client.get("/api/voices").json()
+        assert len(j["voices"]) == 4, j["voices"]            # live backend only
+        assert {v["backend_id"] for v in j["voices"]} == {vbid1}
+        rep = {b["id"]: b for b in j["backends"]}
+        assert rep[vbid1]["ok"] is True
+        assert rep[vbid2]["ok"] is False and rep[vbid2].get("error"), rep[vbid2]
+        assert j["backend_id"] == vbid1                      # legacy = first OK
+        # Every backend dead → 502 (matches the old single-backend contract).
+        fake_voice.fail = True
+        try:
+            r2 = client.get("/api/voices")
+            assert r2.status_code == 502, r2.text
+        finally:
+            fake_voice.fail = False
+    finally:
+        client.delete(f"/api/backends/{vbid1}")
+        client.delete(f"/api/backends/{vbid2}")
+
+
+@test("voice routing: voice_settings.voice_backend_id targets the RIGHT backend")
+def _():
+    fake_voice2 = FakeVoice()
+    vbid1 = _add_voice_backend()
+    r = client.post("/api/backends", json={
+        "name": "FakeVoice2", "kind": "voice", "base_url": fake_voice2.base_url,
+    })
+    assert r.status_code == 200, r.text
+    vbid2 = r.json()["id"]
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "voice-route", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        # Pin the bot's voice to the SECOND backend.
+        r = client.patch(f"/api/conversations/{c['id']}", json={
+            "voice_settings": {"voice_backend_id": vbid2, "voice_id": "en_M_0",
+                               "language": "en"},
+        })
+        assert r.status_code == 200, r.text
+        before1 = len([p for p in fake_voice.captured if p.get("path") == "/speak/stream"])
+        with client.stream("POST", f"/api/conversations/{c['id']}/voice/speak",
+                           json={"text": "Hola"}) as resp:
+            b"".join(resp.iter_bytes())
+        calls2 = [p["payload"] for p in fake_voice2.captured if p.get("path") == "/speak/stream"]
+        assert calls2 and calls2[-1]["voice"] == "en_M_0", fake_voice2.captured
+        after1 = len([p for p in fake_voice.captured if p.get("path") == "/speak/stream"])
+        assert after1 == before1, "speak leaked to the wrong (first) voice backend"
+        # Stale pin: delete backend #2 → speak falls back to backend #1, no 4xx.
+        client.delete(f"/api/backends/{vbid2}")
+        with client.stream("POST", f"/api/conversations/{c['id']}/voice/speak",
+                           json={"text": "Hola"}) as resp:
+            body = b"".join(resp.iter_bytes())
+            assert resp.status_code == 200, body
+        assert len([p for p in fake_voice.captured if p.get("path") == "/speak/stream"]) > before1, \
+            "stale voice_backend_id did not fall back to the remaining backend"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{vbid1}")
+        client.delete(f"/api/backends/{vbid2}")
+        fake_voice2.stop()
+
+
 @test("PATCH conversation: voice_settings persists round-trip")
 def _():
     _reseed_builtin_to_fake_ollama()
@@ -1088,7 +1191,7 @@ def _():
     assert 'id="voice-select"' in html
     js = client.get("/static/app.js").text
     for sym in ("loadVoices", "_renderVoicePicker", "_setVoiceSelectFromConv", "_buildVoiceSettingsPatch",
-                "_hasVoiceBackend", "_refreshVoicePickerAffordance"):
+                "_hasVoiceBackend", "_refreshVoicePickerAffordance", "_voiceKey"):
         assert sym in js, f"missing {sym} in served app.js"
 
 

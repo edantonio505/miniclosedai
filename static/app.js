@@ -311,10 +311,13 @@ function _buildVoiceSettingsPatch() {
   // and visible — otherwise we'd overwrite an existing setting on every save.
   if (!els.voiceSelect || !els.voicePicker || els.voicePicker.hidden) return undefined;
   const opt = els.voiceSelect.selectedOptions[0];
-  const vid = (opt && opt.value) || "";
-  if (!vid) return {};   // "Default voice" → clear stored setting
+  if (!opt || !opt.value) return {};   // "Default voice" → clear stored setting
+  // voice_id must stay the BARE id (sent verbatim to the voice server);
+  // the option's value is the composite "backendId:voiceId" picker key.
+  const out = { voice_id: opt.dataset.voiceId || opt.value };
+  const bid = parseInt(opt.dataset.backendId, 10);
+  if (Number.isFinite(bid)) out.voice_backend_id = bid;
   const lang = opt.dataset.language || "";
-  const out = { voice_id: vid };
   if (lang) out.language = lang;
   return out;
 }
@@ -436,13 +439,23 @@ function _sortModels(models) {
 // live on a different backend kind (`kind="voice"`) and are surfaced via
 // their own `/api/voices` endpoint. Hidden whenever no voice backend is
 // registered (mirrors the mic-button affordance rule). Persisted per-bot
-// in `voice_settings.voice_id` / `voice_settings.language`.
+// in `voice_settings.voice_id` / `voice_settings.language` /
+// `voice_settings.voice_backend_id` (which backend the voice lives on —
+// voices from ALL enabled voice backends are aggregated in the picker).
 // =====================================================================
 const _voicesState = {
-  cache: [],         // [{id, name, language, gender?}, ...]
-  byId: new Map(),   // id → {id, name, language, ...}
+  cache: [],         // [{id, name, language, gender?, backend_id, backend_name}, ...]
+  byId: new Map(),   // "backendId:voiceId" → voice. Composite key: two identical
+                     // voice servers expose identical voice ids, so id alone
+                     // is NOT unique across backends.
   loaded: false,
 };
+
+// Composite option key. `backend_id` may be missing on very old cached
+// responses — fall back to the bare id so the picker still renders.
+function _voiceKey(v) {
+  return v.backend_id != null ? `${v.backend_id}:${v.id}` : String(v.id);
+}
 
 async function loadVoices() {
   if (!els.voicePicker || !els.voiceSelect) return;
@@ -475,7 +488,7 @@ async function loadVoices() {
     }
     const j = await r.json();
     _voicesState.cache = Array.isArray(j.voices) ? j.voices : [];
-    _voicesState.byId = new Map(_voicesState.cache.map(v => [v.id, v]));
+    _voicesState.byId = new Map(_voicesState.cache.map(v => [_voiceKey(v), v]));
   } catch {
     _voicesState.cache = [];
     _voicesState.byId.clear();
@@ -525,25 +538,44 @@ function _renderVoicePicker() {
   sel.appendChild(placeholder);
 
   // Group by language so the dropdown is browsable when there are many.
-  const byLang = new Map();
+  // With voices from MORE THAN ONE backend, group by backend+language and
+  // prefix the optgroup label with the backend name so identical voices on
+  // two servers are tellable apart. Single-backend installs keep the
+  // language-only labels (no visual change).
+  const multi = new Set(_voicesState.cache.map(v => v.backend_id)).size > 1;
+  const byGroup = new Map();  // key → {label, order, voices}
   for (const v of _voicesState.cache) {
     const lang = v.language || "?";
-    if (!byLang.has(lang)) byLang.set(lang, []);
-    byLang.get(lang).push(v);
+    const key = multi ? `${v.backend_id} ${lang}` : lang;
+    if (!byGroup.has(key)) {
+      byGroup.set(key, {
+        label: multi ? `${v.backend_name || "backend " + v.backend_id} — ${lang.toUpperCase()}` : lang.toUpperCase(),
+        backendId: v.backend_id ?? 0,
+        lang,
+        voices: [],
+      });
+    }
+    byGroup.get(key).voices.push(v);
   }
-  // English first, then alphabetical.
-  const langs = [...byLang.keys()].sort((a, b) => {
-    if (a === "en") return -1;
-    if (b === "en") return 1;
-    return a.localeCompare(b);
+  // Backend id ascending (matches the server's fallback order), then
+  // English first, then alphabetical — same ordering as before within
+  // a single backend.
+  const groups = [...byGroup.values()].sort((a, b) => {
+    if (a.backendId !== b.backendId && multi) return a.backendId - b.backendId;
+    if (a.lang === b.lang) return 0;
+    if (a.lang === "en") return -1;
+    if (b.lang === "en") return 1;
+    return a.lang.localeCompare(b.lang);
   });
-  for (const lang of langs) {
+  for (const g of groups) {
     const grp = document.createElement("optgroup");
-    grp.label = lang.toUpperCase();
-    for (const v of byLang.get(lang)) {
+    grp.label = g.label;
+    for (const v of g.voices) {
       const opt = document.createElement("option");
-      opt.value = v.id;
+      opt.value = _voiceKey(v);
       opt.dataset.language = v.language || "";
+      opt.dataset.voiceId = v.id;
+      if (v.backend_id != null) opt.dataset.backendId = String(v.backend_id);
       const gender = v.gender ? ` (${v.gender})` : "";
       opt.textContent = `${v.name || v.id}${gender}`;
       grp.appendChild(opt);
@@ -558,12 +590,19 @@ function _setVoiceSelectFromConv(conv) {
   if (!els.voiceSelect || !_voicesState.loaded) return;
   const vs = (conv && conv.voice_settings) || {};
   const vid = vs.voice_id || "";
-  // Only set if the option exists; otherwise fall back to "Default voice".
-  if (vid && _voicesState.byId.has(vid)) {
-    els.voiceSelect.value = vid;
-  } else {
-    els.voiceSelect.value = "";
+  if (!vid) { els.voiceSelect.value = ""; return; }
+  // Exact match: composite backend+voice key.
+  if (vs.voice_backend_id != null) {
+    const key = `${vs.voice_backend_id}:${vid}`;
+    els.voiceSelect.value = _voicesState.byId.has(key) ? key : "";
+    return;
   }
+  // Legacy settings (saved before backend tagging) carry only voice_id.
+  // Match the first backend that has it — cache is in backend-id order,
+  // mirroring the server's lowest-id fallback, so what we display matches
+  // what TTS will actually use.
+  const hit = _voicesState.cache.find(v => v.id === vid);
+  els.voiceSelect.value = hit ? _voiceKey(hit) : "";
 }
 
 async function loadModels() {

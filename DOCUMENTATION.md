@@ -673,7 +673,8 @@ The voice service ships its own **`./test.sh`** smoke harness (15 assertions cov
   - `POST /api/conversations/{id}/voice/transcribe` — multipart audio → JSON transcript.
   - `POST /api/conversations/{id}/voice/speak` — JSON `{text}` → SSE audio chunks.
   - `POST /api/conversations/{id}/voice/turn` — multipart audio → one merged SSE: ASR transcript, chat reply (text), TTS audio. Reuses `_resolve_conversation_chat`, `_augment_messages_with_knowledge`, `_maybe_override_to_relay`, and `_persist_conv_chat_turn` so RAG, relay-routing, and conversation persistence all behave identically to a normal `/chat/stream` turn.
-- Per-conversation `voice_settings` JSON column (`{voice_backend_id?, voice_id?, language?, autoplay?}`) — the resolver picks the explicit backend id, else the first enabled voice backend; the voice/language resolve from `voice_settings` else the backend's first English voice.
+- Per-conversation `voice_settings` JSON column (`{voice_backend_id?, voice_id?, language?, autoplay?}`) — the resolver picks the explicit backend id, else the first enabled voice backend; the voice/language resolve from `voice_settings` else the backend's first English voice. A stale `voice_backend_id` (backend deleted/disabled) falls back to the first enabled voice backend instead of erroring.
+- **Multiple voice backends are supported.** `GET /api/voices` aggregates the catalogs of ALL enabled `kind='voice'` backends (concurrently, best-effort — an unreachable one is skipped and reported `ok:false` in the `backends` array; only all-dead → 502). Each voice carries `backend_id`/`backend_name`, the picker groups options per backend ("Name — EN") when more than one is registered, and the chosen voice's backend is persisted per-bot via `voice_settings.voice_backend_id` so TTS/calls route to the server that voice lives on. With a single backend the picker looks exactly as before.
 
 **Frontend** (`static/app.js`, `index.html`, `style.css`):
 
@@ -704,7 +705,7 @@ Then in MiniClosedAI: **Settings → LLM Endpoints → + Add endpoint** → kind
 
 ### Testing
 
-`test_e2e.py` ships a `FakeVoice` (mirrors `FakeOllama` / `FakeOpenAI`) serving canned `/health`, `/voices`, `/transcribe`, and `/speak/stream`. Nine voice-related tests cover: `kind='voice'` CRUD round-trip; `/status` reachable/unreachable; `/models` reshape into `<lang>/<voice_id>` entries; `/test` draft probe; `voice_settings` column round-trip; `/voice/transcribe` proxy; `/voice/speak` SSE + default-voice resolution; `/voice/turn` full ASR→Ollama→TTS chain with persistence; 404 when no voice backend is configured. Run via `.venv/bin/python test_e2e.py`.
+`test_e2e.py` ships a `FakeVoice` (mirrors `FakeOllama` / `FakeOpenAI`) serving canned `/health`, `/voices`, `/transcribe`, and `/speak/stream`. Twelve voice-related tests cover: `kind='voice'` CRUD round-trip; `/status` reachable/unreachable; `/models` reshape into `<lang>/<voice_id>` entries; `/test` draft probe; `voice_settings` column round-trip; `/voice/transcribe` proxy; `/voice/speak` SSE + default-voice resolution; `/voice/turn` full ASR→Ollama→TTS chain with persistence; 404 when no voice backend is configured; multi-backend aggregation with per-voice `backend_id` tagging (including the identical-voice-ids collision case); offline-backend skip (`ok:false`, all-dead → 502); and `voice_settings.voice_backend_id` routing to the right backend with graceful fallback when that backend is deleted. Run via `.venv/bin/python test_e2e.py`.
 
 ---
 

@@ -3758,18 +3758,24 @@ def _load_conv_for_voice(conv_id: int) -> dict:
 
 
 def _resolve_voice_backend(conv: dict) -> dict:
-    """Return the voice backend for this conv, or 404 if none is configured."""
+    """Return the voice backend for this conv, or 404 if none is configured.
+
+    A conv's `voice_settings.voice_backend_id` pins its voice to a specific
+    backend (written by the GUI's voice picker). If that pin has gone stale —
+    backend deleted, disabled, or repurposed to a non-voice kind — fall through
+    to the first-enabled fallback instead of erroring: a leftover per-bot
+    setting must not break speak/call. The picker self-heals the stale id on
+    the next settings save.
+    """
     settings = conv.get("voice_settings") or {}
     explicit_id = settings.get("voice_backend_id")
     if explicit_id is not None:
-        b = _load_backend(explicit_id)
-        if b.get("kind") != "voice":
-            raise HTTPException(
-                400, f"Backend #{explicit_id} is not a voice backend (kind={b.get('kind')!r}).",
-            )
-        if not b.get("enabled"):
-            raise HTTPException(400, f"Voice backend #{explicit_id} is disabled.")
-        return b
+        try:
+            b = _load_backend(explicit_id)
+            if b.get("kind") == "voice" and b.get("enabled"):
+                return b
+        except HTTPException:
+            pass  # deleted — fall through
     # Fallback: first enabled voice backend.
     with db.get_conn() as conn:
         row = conn.execute(
@@ -3816,49 +3822,86 @@ async def _resolve_voice_choice(
 
 @app.get("/api/voices")
 async def api_list_voices():
-    """Flat catalog of every voice the registered voice backend can produce.
+    """Flat catalog of every voice across ALL enabled voice backends.
 
     Powers the chat-topbar voice picker (mirrors the LLM model picker but
     only TTS voices, so the two pickers stay strictly separate). Returns
     404 with a Settings hint when no voice backend is registered — the
     frontend hides the voice picker in that case.
 
-    Response: {"voices": [{"id", "name", "language", "gender"?}, ...]}.
-    Voices are flattened across all languages so the picker is a single
-    flat dropdown (we don't ask the user to first pick a language then a
-    voice — `id` + `language` together fully identify a voice).
+    Multiple voice backends are aggregated best-effort: each is queried
+    concurrently, an unreachable one is skipped (reported in `backends`
+    with ok=false) rather than failing the whole response. Only when EVERY
+    backend fails does this 502.
+
+    Response:
+      {"voices":   [{"id", "name", "language", "gender"?,
+                     "backend_id", "backend_name"}, ...],
+       "backends": [{"id", "name", "ok", "error"?}, ...],
+       "backend_id": <first successful backend>,   # legacy key
+       "backend_name": <first successful backend>} # legacy key
+
+    Voices are flattened across languages; (`backend_id`, `id`, `language`)
+    together fully identify a voice — two identical voice servers can expose
+    identical voice ids, so `id` alone is NOT unique across backends.
     """
     with db.get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM backends WHERE kind = 'voice' AND enabled = 1 ORDER BY id LIMIT 1"
-        ).fetchone()
-    if not row:
+        rows = conn.execute(
+            "SELECT * FROM backends WHERE kind = 'voice' AND enabled = 1 ORDER BY id"
+        ).fetchall()
+    if not rows:
         raise HTTPException(404, "No voice backend configured.")
-    backend = db.row_to_dict(row)
-    try:
-        cat = await voice.list_voices(backend)
-    except Exception as e:
-        raise HTTPException(502, f"Could not query voices catalog: {e}")
-    if not isinstance(cat, dict):
-        raise HTTPException(502, "Voice backend returned a malformed /voices catalog.")
+    backends = [db.row_to_dict(r) for r in rows]
+
+    async def _fetch(b: dict):
+        try:
+            cat = await voice.list_voices(b)
+        except Exception as e:
+            return b, None, str(e)
+        if not isinstance(cat, dict):
+            return b, None, "malformed /voices catalog"
+        return b, cat, None
+
+    results = await asyncio.gather(*(_fetch(b) for b in backends))
+
     out: list[dict] = []
-    for lang in sorted(cat.keys()):
-        voices_list = cat.get(lang) or []
-        if not isinstance(voices_list, list):
+    report: list[dict] = []
+    errors: list[str] = []
+    first_ok: dict | None = None
+    for b, cat, err in results:
+        if cat is None:
+            report.append({"id": b["id"], "name": b["name"], "ok": False, "error": err})
+            errors.append(f"{b['name']}: {err}")
             continue
-        for v in voices_list:
-            if not isinstance(v, dict):
+        report.append({"id": b["id"], "name": b["name"], "ok": True})
+        if first_ok is None:
+            first_ok = b
+        for lang in sorted(cat.keys()):
+            voices_list = cat.get(lang) or []
+            if not isinstance(voices_list, list):
                 continue
-            vid = v.get("id") or v.get("name")
-            if not vid:
-                continue
-            out.append({
-                "id": vid,
-                "name": v.get("name") or vid,
-                "language": lang,
-                "gender": v.get("gender"),
-            })
-    return {"voices": out, "backend_id": backend["id"], "backend_name": backend["name"]}
+            for v in voices_list:
+                if not isinstance(v, dict):
+                    continue
+                vid = v.get("id") or v.get("name")
+                if not vid:
+                    continue
+                out.append({
+                    "id": vid,
+                    "name": v.get("name") or vid,
+                    "language": lang,
+                    "gender": v.get("gender"),
+                    "backend_id": b["id"],
+                    "backend_name": b["name"],
+                })
+    if first_ok is None:
+        raise HTTPException(502, "Could not query voices catalog: " + "; ".join(errors))
+    return {
+        "voices": out,
+        "backends": report,
+        "backend_id": first_ok["id"],
+        "backend_name": first_ok["name"],
+    }
 
 
 @app.post("/api/conversations/{conv_id}/voice/transcribe")

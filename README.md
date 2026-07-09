@@ -556,6 +556,8 @@ MiniClosedAI's chat composer surfaces **two voice buttons**, both fed by a separ
 
 If no voice backend is registered, both buttons stay hidden and the rest of MiniClosedAI works exactly as before — voice is strictly opt-in.
 
+**Multiple voice backends are supported.** Register as many voice services as you like; the chat topbar's voice picker aggregates the voices from all of them (grouped per backend when there's more than one), and each bot remembers *which* backend its chosen voice lives on — TTS and calls route to that server. If one voice server is offline, the others' voices still show.
+
 #### The voice service lives in its own repo
 
 The voice microservice was split out of this repo into [**edantonio505/miniclosedai-voice**](https://github.com/edantonio505/miniclosedai-voice). It's a FastAPI app wrapping:
