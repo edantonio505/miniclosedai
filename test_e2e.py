@@ -298,8 +298,13 @@ class FakeVoice(_FakeServer):
 
     Set `instance.fail = True` to make every route return 503 — used to test
     the unreachable-backend path without spinning up a separate dead server.
+    Set `instance.relay_capable = False` to mimic an OLD voice server (no
+    relay support advertised in /health). `instance.next_call_events` is the
+    scripted list of event dicts /call/events/{id} emits before closing.
     """
     fail: bool = False
+    relay_capable: bool = True
+    next_call_events: list | None = None
 
     def _handler_class(self):
         captured = self.captured
@@ -308,18 +313,48 @@ class FakeVoice(_FakeServer):
         class H(BaseHTTPRequestHandler):
             def log_message(self, *a, **kw): pass
 
+            def _read_body(self) -> bytes:
+                # httpx streams relay pushes with Transfer-Encoding: chunked
+                # (no Content-Length) — BaseHTTPRequestHandler doesn't dechunk.
+                if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+                    data = b""
+                    while True:
+                        size_line = self.rfile.readline().strip()
+                        try:
+                            size = int(size_line, 16)
+                        except ValueError:
+                            break
+                        if size == 0:
+                            self.rfile.readline()
+                            break
+                        data += self.rfile.read(size)
+                        self.rfile.readline()
+                    return data
+                length = int(self.headers.get("Content-Length", "0"))
+                return self.rfile.read(length) if length else b""
+
             def do_GET(self):
                 if outer.fail:
                     self._reply(503, b"down", "text/plain"); return
                 if self.path == "/health":
-                    body = json.dumps({
+                    h = {
                         "ok": True,
                         "asr_model": "fake-whisper-small",
                         "tts_model": "fake-melo-multilingual",
                         "device": "cpu",
                         "voices_loaded": True,
-                    }).encode()
-                    self._reply(200, body, "application/json"); return
+                    }
+                    if outer.relay_capable:
+                        h["relay_capable"] = True
+                    self._reply(200, json.dumps(h).encode(), "application/json"); return
+                if self.path.startswith("/call/events/"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    for e in (outer.next_call_events or []):
+                        self.wfile.write(f"data: {json.dumps(e)}\n\n".encode())
+                        self.wfile.flush()
+                    return
                 if self.path == "/voices":
                     body = json.dumps({
                         "en": [
@@ -337,6 +372,25 @@ class FakeVoice(_FakeServer):
             def do_POST(self):
                 if outer.fail:
                     self._reply(503, b"down", "text/plain"); return
+                if self.path == "/call/configure":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length)) if length else {}
+                    captured.append({"path": self.path, "payload": payload})
+                    self._reply(200, json.dumps({"ok": True}).encode(), "application/json")
+                    return
+                if self.path.startswith("/call/turn/"):
+                    raw = self._read_body().decode(errors="replace")
+                    events = []
+                    for line in raw.splitlines():
+                        line = line.strip()
+                        if line:
+                            try:
+                                events.append(json.loads(line))
+                            except ValueError:
+                                pass
+                    captured.append({"path": self.path, "events": events})
+                    self._reply(200, json.dumps({"ok": True}).encode(), "application/json")
+                    return
                 if self.path == "/transcribe":
                     length = int(self.headers.get("Content-Length", "0"))
                     self.rfile.read(length)   # drain multipart, don't bother parsing
@@ -490,24 +544,33 @@ def _probe_real_voice_service() -> str | None:
     global _VOICE_URL_PROBED
     if _VOICE_URL_PROBED is not None:
         return _VOICE_URL_PROBED[0] if _VOICE_URL_PROBED else None
+    # HTTPS first: the bare-metal voice service serves TLS with a self-signed
+    # cert (start.sh generates one), so probe with verification off — same as
+    # dev.sh's health check. Legacy Docker deployments stay plain HTTP.
     candidates = [
         os.environ.get("MINICLOSEDAI_VOICE_URL"),
+        "https://127.0.0.1:8090",
+        "https://localhost:8090",
         "http://127.0.0.1:8090",
         "http://localhost:8090",
     ]
+    import ssl
     import urllib.request, urllib.error
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     for url in candidates:
         if not url:
             continue
         url = url.rstrip("/")
         try:
-            with urllib.request.urlopen(f"{url}/health", timeout=2) as r:
+            with urllib.request.urlopen(f"{url}/health", timeout=2, context=ctx) as r:
                 if r.status == 200:
                     body = json.loads(r.read().decode())
                     if body.get("ok") is True and body.get("tts_model"):
                         _VOICE_URL_PROBED = (url,)
                         return url
-        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
             continue
     _VOICE_URL_PROBED = ()
     return None
@@ -957,7 +1020,13 @@ def _():
     voice_url = _probe_real_voice_service()
     if not voice_url:
         skip("no voice service reachable (start miniclosedai-voice container)")
+    import ssl
     import urllib.request
+    # Self-signed cert on the bare-metal HTTPS voice service — same unverified
+    # context the probe uses.
+    _ctx = ssl.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = ssl.CERT_NONE
     # 1. Synthesize "this is a test" directly on the voice server.
     req = urllib.request.Request(
         f"{voice_url}/speak",
@@ -966,7 +1035,7 @@ def _():
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with urllib.request.urlopen(req, timeout=60, context=_ctx) as r:
         wav = r.read()
     assert wav.startswith(b"RIFF"), f"expected WAV header, got {wav[:8]!r}"
 
@@ -1173,6 +1242,149 @@ def _():
         client.delete(f"/api/backends/{vbid1}")
         client.delete(f"/api/backends/{vbid2}")
         fake_voice2.stop()
+
+
+@test("call relay: turn_request → local LLM → push to /call/turn → persisted")
+def _():
+    # Full relay round-trip. The fake voice server scripts a turn_request on
+    # its events stream; MiniClosedAI's events proxy must intercept it (NOT
+    # forward it to the browser), run the turn on the fake Ollama, stream the
+    # reply to the fake's /call/turn/{id}, and persist the (user, assistant)
+    # pair into the conversation.
+    vbid = _add_voice_backend()
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "call-relay", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    turn_id = "relay-test-turn-1"
+    fake_voice.next_call_events = [
+        {"status": "transcribing"},
+        {"turn_request": {"turn_id": turn_id, "text": "hello there"}},
+    ]
+    try:
+        # Read the proxied events stream to the end.
+        seen = []
+        with client.stream(
+            "GET", f"/api/conversations/{c['id']}/call/events/wrtc-relay-1",
+        ) as r:
+            body = b"".join(r.iter_bytes())
+        seen = sse_events(body)
+        assert any(e.get("status") == "transcribing" for e in seen), seen
+        assert not any("turn_request" in e for e in seen), \
+            f"turn_request leaked to the browser: {seen}"
+        # The relay turn runs as a background task — poll for the push.
+        deadline = time.time() + 10
+        push = None
+        while time.time() < deadline:
+            pushes = [p for p in fake_voice.captured
+                      if p.get("path") == f"/call/turn/{turn_id}"]
+            if pushes:
+                push = pushes[-1]
+                break
+            time.sleep(0.1)
+        assert push, f"no /call/turn push arrived: {fake_voice.captured[-5:]}"
+        evs = push["events"]
+        chunks = "".join(e.get("chunk", "") for e in evs)
+        assert chunks.strip(), evs
+        assert any(e.get("end") for e in evs), evs
+        # Persisted: one user turn + one assistant turn, matching the push.
+        deadline = time.time() + 5
+        msgs = []
+        while time.time() < deadline:
+            msgs = client.get(f"/api/conversations/{c['id']}").json().get("messages") or []
+            if len(msgs) >= 2:
+                break
+            time.sleep(0.1)
+        assert len(msgs) == 2, msgs
+        assert msgs[0]["role"] == "user" and msgs[0]["content"] == "hello there", msgs[0]
+        assert msgs[1]["role"] == "assistant" and msgs[1]["content"].strip() == chunks.strip(), msgs[1]
+    finally:
+        fake_voice.next_call_events = None
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{vbid}")
+
+
+@test("call configure: relay-capable voice backend → relay=true, no callback URL")
+def _():
+    vbid = _add_voice_backend()          # fake_voice advertises relay_capable
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "call-local", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    # Pin voice+language so configure doesn't need a /voices round-trip.
+    client.patch(f"/api/conversations/{c['id']}", json={
+        "voice_settings": {"voice_id": "en_F_0", "language": "en"},
+    })
+    try:
+        r = client.post(f"/api/conversations/{c['id']}/call/configure", json={})
+        assert r.status_code == 200, r.text
+        cfg = [p["payload"] for p in fake_voice.captured if p.get("path") == "/call/configure"]
+        assert cfg, fake_voice.captured
+        assert cfg[-1].get("relay") is True, cfg[-1]
+        assert "miniclosedai_url" not in cfg[-1], cfg[-1]
+        assert cfg[-1]["voice"] == "en_F_0" and cfg[-1]["language"] == "en"
+
+        # Legacy voice server (no relay_capable) → browser-origin callback URL.
+        # TestClient origin is http://testserver — a private (dotless) name;
+        # for a LAN-local voice backend that's exactly what should be sent.
+        fake_voice.relay_capable = False
+        try:
+            r = client.post(f"/api/conversations/{c['id']}/call/configure", json={})
+            assert r.status_code == 200, r.text
+            cfg = [p["payload"] for p in fake_voice.captured if p.get("path") == "/call/configure"]
+            assert cfg[-1].get("miniclosedai_url") == "http://testserver", cfg[-1]
+            assert "relay" not in cfg[-1], cfg[-1]
+        finally:
+            fake_voice.relay_capable = True
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{vbid}")
+
+
+@test("call configure: REMOTE voice backend + private origin → 422 with fix-it hint")
+def _():
+    # Public-looking voice backend host; no request ever reaches it because
+    # the callback-URL resolution fails first (voice pinned → no /voices call).
+    r = client.post("/api/backends", json={
+        "name": "RemoteVoice", "kind": "voice", "base_url": "https://voice.example.com",
+    })
+    assert r.status_code == 200, r.text
+    vbid = r.json()["id"]
+    _reseed_builtin_to_fake_ollama()
+    c = client.post("/api/conversations", json={
+        "title": "call-remote", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    client.patch(f"/api/conversations/{c['id']}", json={
+        "voice_settings": {"voice_backend_id": vbid, "voice_id": "amber-king",
+                           "language": "en"},
+    })
+    # Make tunnel discovery deterministic: point the agent API at a dead port
+    # and defeat the 60s cache so no earlier probe result leaks in.
+    os.environ["MINICLOSEDAI_NGROK_API"] = "http://127.0.0.1:9"
+    app_mod._tunnel_cache.update({"url": None, "checked": 0.0})
+    try:
+        r = client.post(f"/api/conversations/{c['id']}/call/configure", json={})
+        assert r.status_code == 422, r.text
+        assert "MINICLOSEDAI_PUBLIC_URL" in r.text, r.text
+        # With the override set, the same call goes through to the (fake) backend.
+        # relay_capable=False mimics an OLD voice server so the legacy
+        # callback-URL path (which the env override belongs to) is exercised —
+        # a relay-capable server would take the relay path instead.
+        os.environ["MINICLOSEDAI_PUBLIC_URL"] = "https://mini.example.org"
+        fake_voice.relay_capable = False
+        # Re-point the remote backend at the reachable fake so configure lands.
+        client.patch(f"/api/backends/{vbid}", json={"base_url": fake_voice.base_url})
+        r = client.post(f"/api/conversations/{c['id']}/call/configure", json={})
+        assert r.status_code == 200, r.text
+        cfg = [p["payload"] for p in fake_voice.captured if p.get("path") == "/call/configure"]
+        assert cfg[-1]["miniclosedai_url"] == "https://mini.example.org", cfg[-1]
+    finally:
+        fake_voice.relay_capable = True
+        os.environ.pop("MINICLOSEDAI_PUBLIC_URL", None)
+        os.environ.pop("MINICLOSEDAI_NGROK_API", None)
+        app_mod._tunnel_cache.update({"url": None, "checked": 0.0})
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{vbid}")
 
 
 @test("PATCH conversation: voice_settings persists round-trip")

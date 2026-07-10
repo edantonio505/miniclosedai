@@ -153,6 +153,25 @@ async def call_offer(backend: dict, payload: dict) -> dict:
         return r.json()
 
 
+async def push_turn(backend: dict, turn_id: str, lines) -> None:
+    """Relay-mode egress: stream the LLM reply to the voice service.
+
+    `lines` is an async iterator of newline-terminated JSON byte strings
+    ({"chunk": ...} × N then {"end": true}, or {"error": ...}); they're sent
+    incrementally over ONE chunked POST to /call/turn/{turn_id}, so the voice
+    server's TTS starts on the first sentence while later tokens are still
+    being generated. Raises httpx errors on failure (404 = turn expired)."""
+    url = f"{_base_url(backend)}/call/turn/{turn_id}"
+    async with httpx.AsyncClient(
+        verify=False, timeout=httpx.Timeout(300.0, connect=10.0),
+    ) as client:
+        r = await client.post(
+            url, content=lines,
+            headers={**_headers(backend), "Content-Type": "application/x-ndjson"},
+        )
+        r.raise_for_status()
+
+
 async def call_events(backend: dict, webrtc_id: str) -> AsyncIterator[dict]:
     """Stream the voice service's /call/events/{webrtc_id} SSE. Yields each
     parsed event dict (the per-stage status / transcript / chunk / end / error

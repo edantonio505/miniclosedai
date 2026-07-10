@@ -10,6 +10,7 @@ import base64
 import csv
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -4384,12 +4385,98 @@ class CallOfferRequest(BaseModel):
     webrtc_id: str
 
 
-def _self_url_for_voice(request: Request) -> str:
-    """The base URL the voice container should use to call back into
-    MiniClosedAI for /chat/stream. We trust the incoming `Host` header: from
-    inside a Docker network the LAN IP works, and from a same-machine setup
-    the localhost form does. Strip a trailing slash so concatenation is clean."""
-    return str(request.base_url).rstrip("/")
+def _host_is_private(url: str) -> bool:
+    """True when `url`'s host is loopback / RFC-1918 / a dotless local name.
+
+    Used to decide whether a remote voice server could plausibly reach it.
+    IP literals are classified precisely; 'localhost' and bare single-label
+    names (docker service names, mDNS) count as private; anything with a dot
+    that isn't an IP (ngrok/RunPod/real domains) counts as public.
+    """
+    from urllib.parse import urlsplit
+    host = (urlsplit(url).hostname or "").strip("[]")
+    if not host:
+        return True
+    try:
+        import ipaddress
+        return ipaddress.ip_address(host).is_private or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        pass
+    return host == "localhost" or "." not in host
+
+
+# Cache for the ngrok-tunnel auto-discovery below — one probe per minute,
+# not one per call attempt (the local agent API answers in ms when present
+# and times out when not; either way don't hammer it).
+_tunnel_cache: dict = {"url": None, "checked": 0.0}
+
+
+async def _discover_public_tunnel() -> str | None:
+    """Best-effort: if an ngrok agent runs on this host, return the public
+    URL of the tunnel that forwards to our own port. Lets call mode work
+    with a REMOTE voice server automatically — no env var needed — whenever
+    the user already tunnels MiniClosedAI. Override the agent API location
+    with MINICLOSEDAI_NGROK_API; returns None when nothing is discovered."""
+    now = time.time()
+    if now - _tunnel_cache["checked"] < 60:
+        return _tunnel_cache["url"]
+    _tunnel_cache["checked"] = now
+    api = os.environ.get("MINICLOSEDAI_NGROK_API", "http://127.0.0.1:4040")
+    own_port = os.environ.get("MINICLOSEDAI_PORT", "8095")
+    found = None
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as client:
+            r = await client.get(f"{api}/api/tunnels")
+            r.raise_for_status()
+            for t in (r.json().get("tunnels") or []):
+                addr = str((t.get("config") or {}).get("addr") or "")
+                pub = t.get("public_url") or ""
+                if pub.startswith("https") and addr.rstrip("/").endswith(f":{own_port}"):
+                    found = pub.rstrip("/")
+                    break
+    except Exception:
+        pass
+    _tunnel_cache["url"] = found
+    return found
+
+
+async def _self_url_for_voice(request: Request, voice_backend: dict) -> str:
+    """The base URL the voice server should use to call back into MiniClosedAI
+    for /chat/stream. Call mode is the one voice flow that's REVERSED — the
+    voice server dials us — so this URL must be reachable FROM the voice
+    server's network, which differs by topology:
+
+      1. MINICLOSEDAI_PUBLIC_URL env, when set — explicit override, wins.
+      2. Voice backend on this LAN / same machine → the browser's origin
+         (Host header) works, exactly as before.
+      3. Remote voice backend (public host) + browser already on a public
+         origin (e.g. an ngrok domain) → that origin.
+      4. Remote voice backend + private origin → auto-discover a local ngrok
+         tunnel pointing at us and use its public URL.
+      5. Nothing reachable → 422 with a fix-it hint, so the call fails loudly
+         at setup instead of dying mid-call with a cryptic 'chat:' error.
+    """
+    override = os.environ.get("MINICLOSEDAI_PUBLIC_URL")
+    if override:
+        return override.rstrip("/")
+    origin = str(request.base_url).rstrip("/")
+    if _host_is_private(voice_backend.get("base_url") or ""):
+        return origin          # voice server is local/LAN — origin is reachable
+    if not _host_is_private(origin):
+        return origin          # already browsing via a public origin
+    tunnel = await _discover_public_tunnel()
+    if tunnel:
+        return tunnel
+    raise HTTPException(
+        422,
+        f"The voice backend '{voice_backend.get('name', '?')}' is remote "
+        f"({voice_backend.get('base_url')}), but this MiniClosedAI is only "
+        f"reachable at the private address {origin} — the voice server cannot "
+        "call back to run the LLM turn, so call mode can't start. Fix: open "
+        "the app via a public URL (e.g. your ngrok domain), or set "
+        "MINICLOSEDAI_PUBLIC_URL=<public https URL of this server> and restart. "
+        "Push-to-talk still works — it doesn't need the reverse connection.",
+    )
 
 
 @app.post("/api/conversations/{conv_id}/call/configure")
@@ -4404,10 +4491,24 @@ async def api_conv_call_configure(
     )
     payload = {
         "conv_id": conv_id,
-        "miniclosedai_url": _self_url_for_voice(request),
         "voice": voice_id,
         "language": language,
     }
+    # Relay mode when the voice server supports it: WE run the LLM turn and
+    # push the text to the voice server, so it never needs to dial back in —
+    # any reachable voice endpoint (local, LAN, RunPod, cloud) works with
+    # zero config. Old voice servers (no `relay_capable` in /health) keep the
+    # legacy direct-callback flow, which needs a URL they can reach.
+    relay_capable = False
+    try:
+        h = await voice.health(backend)
+        relay_capable = bool(isinstance(h, dict) and h.get("relay_capable"))
+    except Exception:
+        pass
+    if relay_capable:
+        payload["relay"] = True
+    else:
+        payload["miniclosedai_url"] = await _self_url_for_voice(request, backend)
     # Pre-warm the bot's LLM in the background — first-turn latency in call
     # mode is dominated by the model load (Ollama's default keep_alive expires
     # in 5 min). Fire-and-forget, never blocks the call setup.
@@ -4457,15 +4558,101 @@ async def api_conv_call_offer(conv_id: int, req: CallOfferRequest):
         raise HTTPException(502, f"Voice backend /webrtc/offer failed: {e}")
 
 
+async def _run_relay_turn(conv_id: int, voice_backend: dict,
+                          turn_id: str, transcript: str) -> None:
+    """Relay-mode call turn: run the LLM here and stream the reply text TO the
+    voice server (POST /call/turn/{turn_id}), then persist the turn locally.
+
+    This inverts call mode's one reverse connection — with it, every leg of a
+    call is outbound from MiniClosedAI, so remote voice servers (RunPod etc.)
+    work exactly like local ones. Errors are pushed to the voice server (it
+    surfaces them on the call) and logged, never raised — this runs as a
+    fire-and-forget task off the events proxy.
+    """
+    logger = logging.getLogger("uvicorn.error")
+    full: list[str] = []
+    eff = llm_backend = None
+    try:
+        chat_req = ConversationChatRequest(
+            message=transcript, include_history=True, persist=False,
+            voice_mode=True,
+        )
+        _, messages, eff, llm_backend = _resolve_conversation_chat(conv_id, chat_req)
+        await _augment_messages_with_knowledge(conv_id, messages, transcript, llm_backend)
+        llm_backend = await _maybe_override_to_relay(llm_backend, eff["model"])
+        conv = _conv_exists(conv_id)
+        mcp_servers = _enabled_mcp_servers(conv)
+    except Exception as e:
+        logger.warning("relay turn %s setup failed: %r", turn_id, e)
+        async def err_line():
+            yield (json.dumps({"error": f"LLM setup: {e}"}) + "\n").encode()
+        try:
+            await voice.push_turn(voice_backend, turn_id, err_line())
+        except Exception:
+            pass
+        return
+
+    async def lines():
+        try:
+            if mcp_servers:
+                # Tool loops can't stream token-by-token — same tradeoff as
+                # /chat/stream: run the loop, emit the final text as one chunk.
+                text = await _run_mcp_tool_loop(
+                    eff["model"], messages, eff, llm_backend, mcp_servers)
+                full.append(text)
+                yield (json.dumps({"chunk": text}) + "\n").encode()
+            else:
+                async for ev in llm.chat_stream(
+                    llm_backend, eff["model"], messages,
+                    temperature=eff["temperature"], max_tokens=eff["max_tokens"],
+                    top_p=eff["top_p"], top_k=eff["top_k"], think=eff["think"],
+                ):
+                    piece = ev.get("content")
+                    if piece:
+                        full.append(piece)
+                        yield (json.dumps({"chunk": piece}) + "\n").encode()
+            yield (json.dumps({"end": True}) + "\n").encode()
+        except Exception as e:
+            logger.warning("relay turn %s LLM stream failed: %r", turn_id, e)
+            yield (json.dumps({"error": str(e)[:300]}) + "\n").encode()
+
+    try:
+        await voice.push_turn(voice_backend, turn_id, lines())
+    except Exception as e:
+        logger.warning("relay turn %s push failed: %r", turn_id, e)
+        return
+    reply = "".join(full).strip()
+    if reply:
+        try:
+            _persist_conv_chat_turn(
+                conv_id, [{"role": "user", "content": transcript}],
+                reply, eff, llm_backend)
+        except Exception as e:
+            logger.warning("relay turn %s persist failed: %r", turn_id, e)
+
+
 @app.get("/api/conversations/{conv_id}/call/events/{webrtc_id}")
 async def api_conv_call_events(conv_id: int, webrtc_id: str):
-    """Proxy GET /call/events/{id} — forwards the SSE stream to the browser."""
+    """Proxy GET /call/events/{id} — forwards the SSE stream to the browser.
+
+    Also the relay-mode tap: when the voice server emits a
+    `{turn_request: {turn_id, text}}` event, WE run the LLM turn and stream
+    the reply back to it (see _run_relay_turn). The event itself is internal
+    plumbing and is not forwarded to the browser.
+    """
     conv = _load_conv_for_voice(conv_id)
     backend = _resolve_voice_backend(conv)
 
     async def gen():
         try:
             async for ev in voice.call_events(backend, webrtc_id):
+                tr = ev.get("turn_request") if isinstance(ev, dict) else None
+                if isinstance(tr, dict) and tr.get("turn_id"):
+                    asyncio.create_task(_run_relay_turn(
+                        conv_id, backend,
+                        str(tr["turn_id"]), str(tr.get("text") or ""),
+                    ))
+                    continue
                 yield f"data: {json.dumps(ev)}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
