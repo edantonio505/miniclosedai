@@ -233,6 +233,18 @@ def init_db() -> None:
         # via Settings → Add endpoint, same flow as Ollama / OpenAI-compat.
         _migrate_backends_kind_to_include_voice(conn)
 
+        # Additive migration: mark auto-discovered "companion" voice backends.
+        # A companion is a kind='voice' row the app creates automatically for a
+        # connected LLM endpoint (e.g. an Interdata relay) that ALSO proxies a
+        # /voices catalog — so the existing kind='voice' voice picker lights up
+        # without the user registering the voice endpoint by hand. NULL =
+        # user-created (never touched by the discovery reconcile); non-NULL =
+        # the source backend id this row mirrors.
+        if not _column_exists(conn, "backends", "auto_source_backend_id"):
+            conn.execute(
+                "ALTER TABLE backends ADD COLUMN auto_source_backend_id INTEGER"
+            )
+
         # Seed the built-in Ollama backend at id=1, but ONLY when the backends
         # table is completely empty. The looser `INSERT OR IGNORE` we used to
         # do here would resurrect the built-in on every restart after the

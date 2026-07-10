@@ -97,7 +97,18 @@ STATIC_DIR = Path(__file__).parent / "static"
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init_db()
-    yield
+    discovery_task = None
+    if _voice_autodiscovery_enabled():
+        discovery_task = asyncio.create_task(_voice_discovery_loop())
+    try:
+        yield
+    finally:
+        if discovery_task is not None:
+            discovery_task.cancel()
+            try:
+                await discovery_task
+            except BaseException:
+                pass
 
 
 app = FastAPI(title="MiniClosedAI", version="0.2.0", lifespan=lifespan)
@@ -508,6 +519,155 @@ def _normalize_base_url(url: str) -> str:
 
 def _backend_err(backend: dict) -> str:
     return f"Cannot reach '{backend.get('name','backend')}' at {backend.get('base_url','?')}"
+
+
+# ---------- Voice auto-discovery (companion backends) ----------
+#
+# A "companion" is a kind='voice' backend row this app creates automatically for
+# a connected LLM endpoint (Ollama / OpenAI-compat — e.g. an Interdata relay)
+# that ALSO proxies a miniclosedai-voice /voices catalog. It lets the existing
+# kind='voice' voice picker light up for centrally-managed voices without the
+# user registering the voice endpoint by hand in every install.
+#
+# Companions are marked by `auto_source_backend_id` (the source they mirror).
+# The reconcile NEVER modifies user-created rows (auto_source_backend_id NULL).
+
+_VOICE_DISCOVERY_INTERVAL_S = float(
+    os.environ.get("MINICLOSEDAI_VOICE_DISCOVERY_INTERVAL_S", "60")
+)
+
+
+def _voice_autodiscovery_enabled() -> bool:
+    return os.environ.get("MINICLOSEDAI_DISABLE_VOICE_AUTODISCOVERY", "").strip().lower() \
+        not in ("1", "true", "yes")
+
+
+async def _probe_voice_base_url(source: dict) -> str | None:
+    """Return the base URL at which `source` serves a /voices catalog, or None.
+
+    `/voices` lives at the voice service ROOT; an OpenAI-compat endpoint is
+    registered with a `/v1` suffix, so we also try the parent. The source's
+    api_key / headers are reused (same upstream auth)."""
+    base = _normalize_base_url(source.get("base_url"))
+    if not base:
+        return None
+    candidates = [base]
+    if base.endswith("/v1"):
+        candidates.append(_normalize_base_url(base[: -len("/v1")]))
+    headers: dict = {}
+    extra = source.get("headers") or {}
+    if isinstance(extra, dict):
+        headers.update(extra)
+    key = source.get("api_key")
+    if key:
+        headers.setdefault("Authorization", f"Bearer {key}")
+    timeout = httpx.Timeout(5.0, connect=3.0)
+    async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
+        for cand in candidates:
+            try:
+                r = await client.get(f"{cand}/voices", headers=headers)
+            except Exception:
+                continue
+            if r.status_code != 200:
+                continue
+            try:
+                cat = r.json()
+            except Exception:
+                continue
+            if isinstance(cat, dict) and any(
+                isinstance(v, list) and v for v in cat.values()
+            ):
+                return cand
+    return None
+
+
+async def _reconcile_discovered_voice_backends() -> None:
+    """Create / update / remove companion kind='voice' backends so any connected
+    LLM endpoint that also proxies /voices shows up in the voice picker
+    automatically. Idempotent; safe to run repeatedly.
+
+    Rules (companions = rows with auto_source_backend_id NOT NULL):
+      * A capable, enabled source with no companion → create one (base_url = the
+        URL that answered /voices; api_key/headers copied from the source).
+      * A source deleted or disabled → its companion is removed.
+      * A source whose URL/auth changed → its companion is updated in place.
+      * If the user MANUALLY added a kind='voice' backend for the same URL, no
+        companion is created and any stale companion for that URL is removed —
+        the user's own row wins.
+      * User-created rows (auto_source_backend_id NULL) are never modified.
+    """
+    with db.get_conn() as conn:
+        rows = [db.row_to_dict(r) for r in
+                conn.execute("SELECT * FROM backends ORDER BY id").fetchall()]
+
+    sources = [b for b in rows
+               if b.get("auto_source_backend_id") is None
+               and b.get("kind") in ("ollama", "openai")
+               and b.get("enabled")]
+    companions = [b for b in rows if b.get("auto_source_backend_id") is not None]
+    manual_voice_urls = {
+        _normalize_base_url(b["base_url"]) for b in rows
+        if b.get("kind") == "voice" and b.get("auto_source_backend_id") is None
+    }
+    enabled_source_ids = {b["id"] for b in sources}
+
+    async def _probe(b):
+        return b["id"], await _probe_voice_base_url(b)
+
+    capable = {sid: vurl for sid, vurl
+               in await asyncio.gather(*(_probe(b) for b in sources)) if vurl}
+
+    companion_by_source: dict = {}
+    for c in companions:
+        companion_by_source.setdefault(c["auto_source_backend_id"], c)
+
+    with db.get_conn() as conn:
+        # Remove companions whose source is gone/disabled, or whose URL a manual
+        # voice backend now covers.
+        for c in companions:
+            sid = c["auto_source_backend_id"]
+            if sid not in enabled_source_ids or \
+               _normalize_base_url(c["base_url"]) in manual_voice_urls:
+                conn.execute(
+                    "DELETE FROM backends WHERE id = ? AND auto_source_backend_id IS NOT NULL",
+                    (c["id"],),
+                )
+
+        # Create / update companions for capable sources.
+        for b in sources:
+            vurl = capable.get(b["id"])
+            if not vurl or _normalize_base_url(vurl) in manual_voice_urls:
+                continue
+            headers_json = json.dumps(b.get("headers") or {})
+            existing = companion_by_source.get(b["id"])
+            if existing is None:
+                conn.execute(
+                    """INSERT INTO backends
+                         (name, kind, base_url, api_key, headers, enabled,
+                          is_builtin, auto_source_backend_id)
+                       VALUES (?, 'voice', ?, ?, ?, 1, 0, ?)""",
+                    (f"{b['name']} (voice)", _normalize_base_url(vurl),
+                     b.get("api_key"), headers_json, b["id"]),
+                )
+            else:
+                conn.execute(
+                    """UPDATE backends
+                          SET base_url = ?, api_key = ?, headers = ?, enabled = 1
+                        WHERE id = ? AND auto_source_backend_id IS NOT NULL""",
+                    (_normalize_base_url(vurl), b.get("api_key"),
+                     headers_json, existing["id"]),
+                )
+        conn.commit()
+
+
+async def _voice_discovery_loop() -> None:
+    """Background reconcile: once shortly after startup, then every interval."""
+    while True:
+        try:
+            await _reconcile_discovered_voice_backends()
+        except Exception as e:  # never let discovery crash the loop
+            print(f"[voice-discovery] reconcile failed: {e}", file=sys.stderr)
+        await asyncio.sleep(_VOICE_DISCOVERY_INTERVAL_S)
 
 
 # ---------- Backends CRUD ----------
@@ -3766,6 +3926,11 @@ def _resolve_voice_backend(conv: dict) -> dict:
     to the first-enabled fallback instead of erroring: a leftover per-bot
     setting must not break speak/call. The picker self-heals the stale id on
     the next settings save.
+
+    Auto-discovered endpoints (an Interdata relay registered as an LLM endpoint
+    that also proxies /voices) surface here as companion kind='voice' rows
+    created by the discovery reconcile — so this resolver stays kind='voice'
+    only and needs no special-casing.
     """
     settings = conv.get("voice_settings") or {}
     explicit_id = settings.get("voice_backend_id")

@@ -595,6 +595,16 @@ Vertical-nav button (terminal icon, between Bots and Settings in the activity ba
 
 Self-hosted voice for any bot. **Push-to-talk** (🎤) for short turns, **call mode** (📞) for full-duplex WebRTC conversation. The voice service runs in its own process — and **its own GitHub repo**, [edantonio505/miniclosedai-voice](https://github.com/edantonio505/miniclosedai-voice) — so MiniClosedAI carries no GPU dependencies and the voice service can swap engines without touching MiniClosedAI's code.
 
+### Registering voices: direct-add or relay auto-discovery
+
+Voices reach the picker two ways:
+
+1. **Direct-add** — paste a voice service URL into **Settings → LLM Endpoints → + Add endpoint**, kind **Voice (ASR + TTS)**. This creates a `kind='voice'` backend row; the topbar picker aggregates `/voices` across all enabled voice backends and each bot pins the backend its chosen voice lives on.
+
+2. **Relay auto-discovery** — when a connected LLM endpoint (an [Interdata relay](https://github.com/edantonio505/interdatarcomputationrelay) that also reverse-proxies voice) exposes a `/voices` catalog, MiniClosedAI registers it for you. A background reconcile (`_reconcile_discovered_voice_backends` in `app.py`, run on startup and every `MINICLOSEDAI_VOICE_DISCOVERY_INTERVAL_S` seconds — default `60`) probes each enabled `ollama`/`openai` endpoint's `/voices` (normalizing a trailing `/v1` to the service root, reusing that endpoint's `api_key`/headers) and, on a hit, creates a **companion** `kind='voice'` row pointing at the URL that answered. Companions are marked by the `backends.auto_source_backend_id` column (the source backend they mirror); rows you added by hand have it `NULL` and are **never** modified or deleted by the reconcile. A companion is updated when its source's URL/auth changes and removed when the source is deleted or disabled — and none is created for a URL you already added manually (your row wins). Disable the whole mechanism with `MINICLOSEDAI_DISABLE_VOICE_AUTODISCOVERY=1`. The discovery loop starts at process boot, so **restart MiniClosedAI after upgrading** for it to take effect.
+
+Net effect: add a voice server once in the relay, and every MiniClosedAI connected to that relay surfaces it automatically — the same way connecting the relay surfaces its LLM models. The turn/architecture flows below are identical regardless of which way the voice backend was registered.
+
 ### Architecture
 
 **Push-to-talk turn:**
