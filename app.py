@@ -3757,38 +3757,83 @@ def _load_conv_for_voice(conv_id: int) -> dict:
     return db.row_to_dict(row)
 
 
-def _resolve_voice_backend(conv: dict) -> dict:
-    """Return the voice backend for this conv, or 404 if none is configured.
+async def _first_voice_capable_backend() -> dict | None:
+    """First enabled backend (any kind) that serves a non-empty /voices catalog.
+
+    This is what makes voice auto-discovery work: an endpoint registered as an
+    LLM backend (e.g. an Interdata relay) that ALSO proxies a voice service is
+    usable for TTS/ASR without a separate kind='voice' registration. Probed
+    best-effort and concurrently; endpoints that don't expose /voices (plain
+    Ollama / LM Studio return 404) are skipped. Order = backend id, so the
+    lowest-id voice-capable endpoint wins deterministically.
+    """
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM backends WHERE enabled = 1 ORDER BY id"
+        ).fetchall()
+    backends = [db.row_to_dict(r) for r in rows]
+
+    async def _probe(b: dict) -> dict | None:
+        try:
+            cat = await voice.list_voices(b)
+        except Exception:
+            return None
+        if isinstance(cat, dict) and any(
+            isinstance(v, list) and v for v in cat.values()
+        ):
+            return b
+        return None
+
+    for b in await asyncio.gather(*(_probe(b) for b in backends)):
+        if b is not None:
+            return b
+    return None
+
+
+async def _resolve_voice_backend(conv: dict) -> dict:
+    """Return the voice backend for this conv, or 404 if none is available.
 
     A conv's `voice_settings.voice_backend_id` pins its voice to a specific
     backend (written by the GUI's voice picker). If that pin has gone stale —
-    backend deleted, disabled, or repurposed to a non-voice kind — fall through
-    to the first-enabled fallback instead of erroring: a leftover per-bot
-    setting must not break speak/call. The picker self-heals the stale id on
-    the next settings save.
+    backend deleted or disabled — fall through instead of erroring: a leftover
+    per-bot setting must not break speak/call. The picker self-heals the stale
+    id on the next settings save.
+
+    Resolution order:
+      1. The pinned backend, if it still exists and is enabled. The picker only
+         ever pins voice-capable backends, so we don't re-check `kind` — the pin
+         may point at a dedicated kind='voice' backend OR an auto-discovered
+         endpoint (e.g. Interdata) that proxies /voices.
+      2. The first enabled dedicated kind='voice' backend (cheap — no probe).
+      3. Auto-discovery: the first enabled endpoint that serves a /voices
+         catalog (one probe round; only reached when there's no dedicated
+         voice backend and no valid pin).
     """
     settings = conv.get("voice_settings") or {}
     explicit_id = settings.get("voice_backend_id")
     if explicit_id is not None:
         try:
             b = _load_backend(explicit_id)
-            if b.get("kind") == "voice" and b.get("enabled"):
+            if b.get("enabled"):
                 return b
         except HTTPException:
             pass  # deleted — fall through
-    # Fallback: first enabled voice backend.
     with db.get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM backends WHERE kind = 'voice' AND enabled = 1 ORDER BY id LIMIT 1"
         ).fetchone()
-    if not row:
-        raise HTTPException(
-            404,
-            "No voice backend configured. In Settings → LLM Endpoints, click "
-            "'+ Add endpoint' and choose 'Voice (ASR + TTS)' with the URL of "
-            "your running voice service (e.g. http://localhost:8090).",
-        )
-    return db.row_to_dict(row)
+    if row:
+        return db.row_to_dict(row)
+    discovered = await _first_voice_capable_backend()
+    if discovered is not None:
+        return discovered
+    raise HTTPException(
+        404,
+        "No voice backend available. In Settings → LLM Endpoints, click "
+        "'+ Add endpoint' and choose 'Voice (ASR + TTS)' with the URL of your "
+        "voice service — or connect an endpoint that proxies a /voices catalog "
+        "(e.g. an Interdata relay with a voice backend attached).",
+    )
 
 
 async def _resolve_voice_choice(
@@ -3822,7 +3867,12 @@ async def _resolve_voice_choice(
 
 @app.get("/api/voices")
 async def api_list_voices():
-    """Flat catalog of every voice across ALL enabled voice backends.
+    """Flat catalog of every voice across all enabled endpoints that serve one.
+
+    Includes dedicated kind='voice' backends AND auto-discovered endpoints — any
+    enabled backend (e.g. an Interdata relay registered as an LLM endpoint) that
+    also proxies a /voices catalog. Non-voice endpoints that don't expose
+    /voices are probed and silently skipped.
 
     Powers the chat-topbar voice picker (mirrors the LLM model picker but
     only TTS voices, so the two pickers stay strictly separate). Returns
@@ -3847,7 +3897,7 @@ async def api_list_voices():
     """
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM backends WHERE kind = 'voice' AND enabled = 1 ORDER BY id"
+            "SELECT * FROM backends WHERE enabled = 1 ORDER BY id"
         ).fetchall()
     if not rows:
         raise HTTPException(404, "No voice backend configured.")
@@ -3870,8 +3920,13 @@ async def api_list_voices():
     first_ok: dict | None = None
     for b, cat, err in results:
         if cat is None:
-            report.append({"id": b["id"], "name": b["name"], "ok": False, "error": err})
-            errors.append(f"{b['name']}: {err}")
+            # A dedicated voice backend that failed to answer is a real error
+            # worth surfacing. A non-voice endpoint (Ollama / LM Studio / …)
+            # that simply doesn't expose /voices is skipped silently —
+            # auto-discovery only adds the endpoints that DO answer.
+            if b.get("kind") == "voice":
+                report.append({"id": b["id"], "name": b["name"], "ok": False, "error": err})
+                errors.append(f"{b['name']}: {err}")
             continue
         report.append({"id": b["id"], "name": b["name"], "ok": True})
         if first_ok is None:
@@ -3895,7 +3950,13 @@ async def api_list_voices():
                     "backend_name": b["name"],
                 })
     if first_ok is None:
-        raise HTTPException(502, "Could not query voices catalog: " + "; ".join(errors))
+        # Errors only accumulate for dedicated voice backends. If some voice
+        # backend failed, surface it (502). If nothing served voices at all
+        # (only non-voice endpoints, none of which proxy /voices), 404 so the
+        # frontend simply hides the picker.
+        if errors:
+            raise HTTPException(502, "Could not query voices catalog: " + "; ".join(errors))
+        raise HTTPException(404, "No voice backend configured.")
     return {
         "voices": out,
         "backends": report,
@@ -3912,7 +3973,7 @@ async def api_conv_voice_transcribe(
 ):
     """Proxy: audio in → text out. Uses the conv's voice backend."""
     conv = _load_conv_for_voice(conv_id)
-    backend = _resolve_voice_backend(conv)
+    backend = await _resolve_voice_backend(conv)
     audio_bytes = await audio.read()
     try:
         return await voice.transcribe(
@@ -3930,7 +3991,7 @@ async def api_conv_voice_speak(conv_id: int, req: VoiceSpeakRequest):
     """Proxy: text in → SSE audio chunks out. Uses the conv's voice + language
     (req fields override the saved voice_settings)."""
     conv = _load_conv_for_voice(conv_id)
-    backend = _resolve_voice_backend(conv)
+    backend = await _resolve_voice_backend(conv)
     voice_id, language = await _resolve_voice_choice(
         conv, backend, override_voice=req.voice, override_lang=req.language,
     )
@@ -3969,7 +4030,7 @@ async def api_conv_voice_turn(
     `{error: "..."}` event before the `{end}`.
     """
     conv = _load_conv_for_voice(conv_id)
-    voice_backend = _resolve_voice_backend(conv)
+    voice_backend = await _resolve_voice_backend(conv)
     audio_bytes = await audio.read()
     audio_name = audio.filename or "audio.wav"
     audio_ct = audio.content_type or "audio/wav"
@@ -4084,7 +4145,7 @@ async def api_conv_voice_say(conv_id: int, req: VoiceSayRequest):
       data: {end: true}
     """
     conv = _load_conv_for_voice(conv_id)
-    voice_backend = _resolve_voice_backend(conv)
+    voice_backend = await _resolve_voice_backend(conv)
     transcript = req.text.strip()
     if not transcript:
         raise HTTPException(400, "Empty text.")
@@ -4233,7 +4294,7 @@ async def api_conv_call_configure(
 ):
     """Proxy POST /call/configure — same-origin so the browser can stay on HTTPS."""
     conv = _load_conv_for_voice(conv_id)
-    backend = _resolve_voice_backend(conv)
+    backend = await _resolve_voice_backend(conv)
     voice_id, language = await _resolve_voice_choice(
         conv, backend, override_voice=req.voice, override_lang=req.language,
     )
@@ -4285,7 +4346,7 @@ async def _warmup_conv_model(conv_id: int) -> None:
 async def api_conv_call_offer(conv_id: int, req: CallOfferRequest):
     """Proxy POST /webrtc/offer — returns the SDP answer JSON from FastRTC."""
     conv = _load_conv_for_voice(conv_id)
-    backend = _resolve_voice_backend(conv)
+    backend = await _resolve_voice_backend(conv)
     try:
         return await voice.call_offer(backend, req.model_dump(exclude_none=True))
     except httpx.HTTPError as e:
@@ -4296,7 +4357,7 @@ async def api_conv_call_offer(conv_id: int, req: CallOfferRequest):
 async def api_conv_call_events(conv_id: int, webrtc_id: str):
     """Proxy GET /call/events/{id} — forwards the SSE stream to the browser."""
     conv = _load_conv_for_voice(conv_id)
-    backend = _resolve_voice_backend(conv)
+    backend = await _resolve_voice_backend(conv)
 
     async def gen():
         try:
