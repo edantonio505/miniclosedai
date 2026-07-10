@@ -51,8 +51,25 @@ import db as _db_mod  # noqa: E402
 _db_mod.DB_PATH = _TMP_DB
 _db_mod.init_db()     # fire schema + seed now, not lazily on first request
 
+# Disable the background voice-discovery reconcile loop so tests drive it
+# deterministically via _reconcile_discovered_voice_backends() (see _run).
+os.environ["MINICLOSEDAI_DISABLE_VOICE_AUTODISCOVERY"] = "1"
+
 import app as app_mod  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+
+
+def _run(coro):
+    """Drive an async app helper to completion from a sync test."""
+    import asyncio
+    return asyncio.run(coro)
+
+
+def _clear_companions() -> None:
+    """Delete any auto-discovered companion voice rows left in the shared DB."""
+    for b in client.get("/api/backends").json():
+        if b.get("auto_source_backend_id") is not None:
+            client.delete(f"/api/backends/{b['id']}")
 
 
 # ------------------------------------------------------------------
@@ -1193,6 +1210,131 @@ def _():
     for sym in ("loadVoices", "_renderVoicePicker", "_setVoiceSelectFromConv", "_buildVoiceSettingsPatch",
                 "_hasVoiceBackend", "_refreshVoicePickerAffordance", "_voiceKey"):
         assert sym in js, f"missing {sym} in served app.js"
+
+
+@test("voice discovery: reconcile creates a companion voice backend (with /v1 normalized)")
+def _():
+    # Interdata added as an OpenAI-compat LLM endpoint WITH a /v1 suffix. /voices
+    # lives at the service root, so the companion must strip the /v1.
+    src = client.post("/api/backends", json={
+        "name": "Interdata", "kind": "openai", "base_url": f"{fake_voice.base_url}/v1",
+    }).json()["id"]
+    try:
+        _run(app_mod._reconcile_discovered_voice_backends())
+        comps = [b for b in client.get("/api/backends").json()
+                 if b.get("auto_source_backend_id") == src]
+        assert len(comps) == 1, comps
+        comp = comps[0]
+        assert comp["kind"] == "voice"
+        assert comp["base_url"] == fake_voice.base_url          # /v1 stripped
+        assert comp["enabled"] in (1, True)
+        # The existing kind='voice' picker gate now sees a voice backend, and
+        # /api/voices lists the discovered voices tagged with the companion.
+        j = client.get("/api/voices").json()
+        assert {v["backend_id"] for v in j["voices"]} == {comp["id"]}, j
+        assert len(j["voices"]) == 4, j
+    finally:
+        client.delete(f"/api/backends/{src}")
+        _clear_companions()
+
+
+@test("voice discovery: a plain LLM endpoint (no /voices) gets no companion")
+def _():
+    bid = _add_openai_backend()   # FakeOpenAI: /v1 surface only, no /voices
+    try:
+        _run(app_mod._reconcile_discovered_voice_backends())
+        comps = [b for b in client.get("/api/backends").json()
+                 if b.get("auto_source_backend_id") is not None]
+        assert comps == [], comps
+        assert client.get("/api/voices").status_code == 404   # picker gate stays off
+    finally:
+        client.delete(f"/api/backends/{bid}")
+        _clear_companions()
+
+
+@test("voice discovery: reconcile is idempotent — no duplicate companions")
+def _():
+    src = client.post("/api/backends", json={
+        "name": "Interdata", "kind": "ollama", "base_url": fake_voice.base_url,
+    }).json()["id"]
+    try:
+        _run(app_mod._reconcile_discovered_voice_backends())
+        _run(app_mod._reconcile_discovered_voice_backends())
+        comps = [b for b in client.get("/api/backends").json()
+                 if b.get("auto_source_backend_id") == src]
+        assert len(comps) == 1, comps
+    finally:
+        client.delete(f"/api/backends/{src}")
+        _clear_companions()
+
+
+@test("voice discovery: disabling the source removes its companion; user rows untouched")
+def _():
+    fake_voice2 = FakeVoice()
+    manual = _add_voice_backend()   # user's own kind='voice' at a DIFFERENT url
+    src = client.post("/api/backends", json={
+        "name": "Interdata", "kind": "openai", "base_url": f"{fake_voice2.base_url}/v1",
+    }).json()["id"]
+    try:
+        _run(app_mod._reconcile_discovered_voice_backends())
+        after = client.get("/api/backends").json()
+        assert any(b.get("auto_source_backend_id") == src for b in after), after
+        assert any(b["id"] == manual and b.get("auto_source_backend_id") is None
+                   for b in after)
+        # Disable the source → its companion is removed; the user row survives.
+        client.patch(f"/api/backends/{src}", json={"enabled": False})
+        _run(app_mod._reconcile_discovered_voice_backends())
+        after = client.get("/api/backends").json()
+        assert not any(b.get("auto_source_backend_id") == src for b in after), after
+        assert any(b["id"] == manual for b in after), "user voice row was deleted!"
+    finally:
+        client.delete(f"/api/backends/{src}")
+        client.delete(f"/api/backends/{manual}")
+        _clear_companions()
+        fake_voice2.stop()
+
+
+@test("voice discovery: no companion when the user already added that voice URL manually")
+def _():
+    manual = _add_voice_backend()   # kind='voice' at fake_voice.base_url
+    src = client.post("/api/backends", json={
+        "name": "Interdata", "kind": "ollama", "base_url": fake_voice.base_url,
+    }).json()["id"]
+    try:
+        _run(app_mod._reconcile_discovered_voice_backends())
+        voice_rows = [b for b in client.get("/api/backends").json()
+                      if b.get("kind") == "voice"]
+        assert len(voice_rows) == 1 and voice_rows[0]["id"] == manual, voice_rows
+    finally:
+        client.delete(f"/api/backends/{src}")
+        client.delete(f"/api/backends/{manual}")
+        _clear_companions()
+
+
+@test("voice discovery: speak routes through the auto-created companion")
+def _():
+    _reseed_builtin_to_fake_ollama()
+    src = client.post("/api/backends", json={
+        "name": "Interdata", "kind": "openai", "base_url": f"{fake_voice.base_url}/v1",
+    }).json()["id"]
+    _run(app_mod._reconcile_discovered_voice_backends())
+    c = client.post("/api/conversations", json={
+        "title": "auto-voice", "model": "ollama-a:3b", "backend_id": 1,
+    }).json()
+    try:
+        fake_voice.captured.clear()
+        with client.stream("POST", f"/api/conversations/{c['id']}/voice/speak",
+                           json={"text": "Hola"}) as resp:
+            body = b"".join(resp.iter_bytes())
+            assert resp.status_code == 200, body
+        evts = sse_events(body)
+        assert any("chunk_b64" in e for e in evts), evts
+        speak = [p for p in fake_voice.captured if p.get("path") == "/speak/stream"]
+        assert speak, "speak did not route through the companion"
+    finally:
+        client.delete(f"/api/conversations/{c['id']}")
+        client.delete(f"/api/backends/{src}")
+        _clear_companions()
 
 
 @test("/api/models: aggregated shape + legacy back-compat keys")

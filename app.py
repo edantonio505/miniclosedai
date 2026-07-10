@@ -97,7 +97,18 @@ STATIC_DIR = Path(__file__).parent / "static"
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init_db()
-    yield
+    discovery_task = None
+    if _voice_autodiscovery_enabled():
+        discovery_task = asyncio.create_task(_voice_discovery_loop())
+    try:
+        yield
+    finally:
+        if discovery_task is not None:
+            discovery_task.cancel()
+            try:
+                await discovery_task
+            except BaseException:
+                pass
 
 
 app = FastAPI(title="MiniClosedAI", version="0.2.0", lifespan=lifespan)
@@ -508,6 +519,155 @@ def _normalize_base_url(url: str) -> str:
 
 def _backend_err(backend: dict) -> str:
     return f"Cannot reach '{backend.get('name','backend')}' at {backend.get('base_url','?')}"
+
+
+# ---------- Voice auto-discovery (companion backends) ----------
+#
+# A "companion" is a kind='voice' backend row this app creates automatically for
+# a connected LLM endpoint (Ollama / OpenAI-compat — e.g. an Interdata relay)
+# that ALSO proxies a miniclosedai-voice /voices catalog. It lets the existing
+# kind='voice' voice picker light up for centrally-managed voices without the
+# user registering the voice endpoint by hand in every install.
+#
+# Companions are marked by `auto_source_backend_id` (the source they mirror).
+# The reconcile NEVER modifies user-created rows (auto_source_backend_id NULL).
+
+_VOICE_DISCOVERY_INTERVAL_S = float(
+    os.environ.get("MINICLOSEDAI_VOICE_DISCOVERY_INTERVAL_S", "60")
+)
+
+
+def _voice_autodiscovery_enabled() -> bool:
+    return os.environ.get("MINICLOSEDAI_DISABLE_VOICE_AUTODISCOVERY", "").strip().lower() \
+        not in ("1", "true", "yes")
+
+
+async def _probe_voice_base_url(source: dict) -> str | None:
+    """Return the base URL at which `source` serves a /voices catalog, or None.
+
+    `/voices` lives at the voice service ROOT; an OpenAI-compat endpoint is
+    registered with a `/v1` suffix, so we also try the parent. The source's
+    api_key / headers are reused (same upstream auth)."""
+    base = _normalize_base_url(source.get("base_url"))
+    if not base:
+        return None
+    candidates = [base]
+    if base.endswith("/v1"):
+        candidates.append(_normalize_base_url(base[: -len("/v1")]))
+    headers: dict = {}
+    extra = source.get("headers") or {}
+    if isinstance(extra, dict):
+        headers.update(extra)
+    key = source.get("api_key")
+    if key:
+        headers.setdefault("Authorization", f"Bearer {key}")
+    timeout = httpx.Timeout(5.0, connect=3.0)
+    async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
+        for cand in candidates:
+            try:
+                r = await client.get(f"{cand}/voices", headers=headers)
+            except Exception:
+                continue
+            if r.status_code != 200:
+                continue
+            try:
+                cat = r.json()
+            except Exception:
+                continue
+            if isinstance(cat, dict) and any(
+                isinstance(v, list) and v for v in cat.values()
+            ):
+                return cand
+    return None
+
+
+async def _reconcile_discovered_voice_backends() -> None:
+    """Create / update / remove companion kind='voice' backends so any connected
+    LLM endpoint that also proxies /voices shows up in the voice picker
+    automatically. Idempotent; safe to run repeatedly.
+
+    Rules (companions = rows with auto_source_backend_id NOT NULL):
+      * A capable, enabled source with no companion → create one (base_url = the
+        URL that answered /voices; api_key/headers copied from the source).
+      * A source deleted or disabled → its companion is removed.
+      * A source whose URL/auth changed → its companion is updated in place.
+      * If the user MANUALLY added a kind='voice' backend for the same URL, no
+        companion is created and any stale companion for that URL is removed —
+        the user's own row wins.
+      * User-created rows (auto_source_backend_id NULL) are never modified.
+    """
+    with db.get_conn() as conn:
+        rows = [db.row_to_dict(r) for r in
+                conn.execute("SELECT * FROM backends ORDER BY id").fetchall()]
+
+    sources = [b for b in rows
+               if b.get("auto_source_backend_id") is None
+               and b.get("kind") in ("ollama", "openai")
+               and b.get("enabled")]
+    companions = [b for b in rows if b.get("auto_source_backend_id") is not None]
+    manual_voice_urls = {
+        _normalize_base_url(b["base_url"]) for b in rows
+        if b.get("kind") == "voice" and b.get("auto_source_backend_id") is None
+    }
+    enabled_source_ids = {b["id"] for b in sources}
+
+    async def _probe(b):
+        return b["id"], await _probe_voice_base_url(b)
+
+    capable = {sid: vurl for sid, vurl
+               in await asyncio.gather(*(_probe(b) for b in sources)) if vurl}
+
+    companion_by_source: dict = {}
+    for c in companions:
+        companion_by_source.setdefault(c["auto_source_backend_id"], c)
+
+    with db.get_conn() as conn:
+        # Remove companions whose source is gone/disabled, or whose URL a manual
+        # voice backend now covers.
+        for c in companions:
+            sid = c["auto_source_backend_id"]
+            if sid not in enabled_source_ids or \
+               _normalize_base_url(c["base_url"]) in manual_voice_urls:
+                conn.execute(
+                    "DELETE FROM backends WHERE id = ? AND auto_source_backend_id IS NOT NULL",
+                    (c["id"],),
+                )
+
+        # Create / update companions for capable sources.
+        for b in sources:
+            vurl = capable.get(b["id"])
+            if not vurl or _normalize_base_url(vurl) in manual_voice_urls:
+                continue
+            headers_json = json.dumps(b.get("headers") or {})
+            existing = companion_by_source.get(b["id"])
+            if existing is None:
+                conn.execute(
+                    """INSERT INTO backends
+                         (name, kind, base_url, api_key, headers, enabled,
+                          is_builtin, auto_source_backend_id)
+                       VALUES (?, 'voice', ?, ?, ?, 1, 0, ?)""",
+                    (f"{b['name']} (voice)", _normalize_base_url(vurl),
+                     b.get("api_key"), headers_json, b["id"]),
+                )
+            else:
+                conn.execute(
+                    """UPDATE backends
+                          SET base_url = ?, api_key = ?, headers = ?, enabled = 1
+                        WHERE id = ? AND auto_source_backend_id IS NOT NULL""",
+                    (_normalize_base_url(vurl), b.get("api_key"),
+                     headers_json, existing["id"]),
+                )
+        conn.commit()
+
+
+async def _voice_discovery_loop() -> None:
+    """Background reconcile: once shortly after startup, then every interval."""
+    while True:
+        try:
+            await _reconcile_discovered_voice_backends()
+        except Exception as e:  # never let discovery crash the loop
+            print(f"[voice-discovery] reconcile failed: {e}", file=sys.stderr)
+        await asyncio.sleep(_VOICE_DISCOVERY_INTERVAL_S)
 
 
 # ---------- Backends CRUD ----------
@@ -3757,83 +3917,43 @@ def _load_conv_for_voice(conv_id: int) -> dict:
     return db.row_to_dict(row)
 
 
-async def _first_voice_capable_backend() -> dict | None:
-    """First enabled backend (any kind) that serves a non-empty /voices catalog.
-
-    This is what makes voice auto-discovery work: an endpoint registered as an
-    LLM backend (e.g. an Interdata relay) that ALSO proxies a voice service is
-    usable for TTS/ASR without a separate kind='voice' registration. Probed
-    best-effort and concurrently; endpoints that don't expose /voices (plain
-    Ollama / LM Studio return 404) are skipped. Order = backend id, so the
-    lowest-id voice-capable endpoint wins deterministically.
-    """
-    with db.get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM backends WHERE enabled = 1 ORDER BY id"
-        ).fetchall()
-    backends = [db.row_to_dict(r) for r in rows]
-
-    async def _probe(b: dict) -> dict | None:
-        try:
-            cat = await voice.list_voices(b)
-        except Exception:
-            return None
-        if isinstance(cat, dict) and any(
-            isinstance(v, list) and v for v in cat.values()
-        ):
-            return b
-        return None
-
-    for b in await asyncio.gather(*(_probe(b) for b in backends)):
-        if b is not None:
-            return b
-    return None
-
-
-async def _resolve_voice_backend(conv: dict) -> dict:
-    """Return the voice backend for this conv, or 404 if none is available.
+def _resolve_voice_backend(conv: dict) -> dict:
+    """Return the voice backend for this conv, or 404 if none is configured.
 
     A conv's `voice_settings.voice_backend_id` pins its voice to a specific
     backend (written by the GUI's voice picker). If that pin has gone stale —
-    backend deleted or disabled — fall through instead of erroring: a leftover
-    per-bot setting must not break speak/call. The picker self-heals the stale
-    id on the next settings save.
+    backend deleted, disabled, or repurposed to a non-voice kind — fall through
+    to the first-enabled fallback instead of erroring: a leftover per-bot
+    setting must not break speak/call. The picker self-heals the stale id on
+    the next settings save.
 
-    Resolution order:
-      1. The pinned backend, if it still exists and is enabled. The picker only
-         ever pins voice-capable backends, so we don't re-check `kind` — the pin
-         may point at a dedicated kind='voice' backend OR an auto-discovered
-         endpoint (e.g. Interdata) that proxies /voices.
-      2. The first enabled dedicated kind='voice' backend (cheap — no probe).
-      3. Auto-discovery: the first enabled endpoint that serves a /voices
-         catalog (one probe round; only reached when there's no dedicated
-         voice backend and no valid pin).
+    Auto-discovered endpoints (an Interdata relay registered as an LLM endpoint
+    that also proxies /voices) surface here as companion kind='voice' rows
+    created by the discovery reconcile — so this resolver stays kind='voice'
+    only and needs no special-casing.
     """
     settings = conv.get("voice_settings") or {}
     explicit_id = settings.get("voice_backend_id")
     if explicit_id is not None:
         try:
             b = _load_backend(explicit_id)
-            if b.get("enabled"):
+            if b.get("kind") == "voice" and b.get("enabled"):
                 return b
         except HTTPException:
             pass  # deleted — fall through
+    # Fallback: first enabled voice backend.
     with db.get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM backends WHERE kind = 'voice' AND enabled = 1 ORDER BY id LIMIT 1"
         ).fetchone()
-    if row:
-        return db.row_to_dict(row)
-    discovered = await _first_voice_capable_backend()
-    if discovered is not None:
-        return discovered
-    raise HTTPException(
-        404,
-        "No voice backend available. In Settings → LLM Endpoints, click "
-        "'+ Add endpoint' and choose 'Voice (ASR + TTS)' with the URL of your "
-        "voice service — or connect an endpoint that proxies a /voices catalog "
-        "(e.g. an Interdata relay with a voice backend attached).",
-    )
+    if not row:
+        raise HTTPException(
+            404,
+            "No voice backend configured. In Settings → LLM Endpoints, click "
+            "'+ Add endpoint' and choose 'Voice (ASR + TTS)' with the URL of "
+            "your running voice service (e.g. http://localhost:8090).",
+        )
+    return db.row_to_dict(row)
 
 
 async def _resolve_voice_choice(
@@ -3867,12 +3987,7 @@ async def _resolve_voice_choice(
 
 @app.get("/api/voices")
 async def api_list_voices():
-    """Flat catalog of every voice across all enabled endpoints that serve one.
-
-    Includes dedicated kind='voice' backends AND auto-discovered endpoints — any
-    enabled backend (e.g. an Interdata relay registered as an LLM endpoint) that
-    also proxies a /voices catalog. Non-voice endpoints that don't expose
-    /voices are probed and silently skipped.
+    """Flat catalog of every voice across ALL enabled voice backends.
 
     Powers the chat-topbar voice picker (mirrors the LLM model picker but
     only TTS voices, so the two pickers stay strictly separate). Returns
@@ -3897,7 +4012,7 @@ async def api_list_voices():
     """
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM backends WHERE enabled = 1 ORDER BY id"
+            "SELECT * FROM backends WHERE kind = 'voice' AND enabled = 1 ORDER BY id"
         ).fetchall()
     if not rows:
         raise HTTPException(404, "No voice backend configured.")
@@ -3920,13 +4035,8 @@ async def api_list_voices():
     first_ok: dict | None = None
     for b, cat, err in results:
         if cat is None:
-            # A dedicated voice backend that failed to answer is a real error
-            # worth surfacing. A non-voice endpoint (Ollama / LM Studio / …)
-            # that simply doesn't expose /voices is skipped silently —
-            # auto-discovery only adds the endpoints that DO answer.
-            if b.get("kind") == "voice":
-                report.append({"id": b["id"], "name": b["name"], "ok": False, "error": err})
-                errors.append(f"{b['name']}: {err}")
+            report.append({"id": b["id"], "name": b["name"], "ok": False, "error": err})
+            errors.append(f"{b['name']}: {err}")
             continue
         report.append({"id": b["id"], "name": b["name"], "ok": True})
         if first_ok is None:
@@ -3950,13 +4060,7 @@ async def api_list_voices():
                     "backend_name": b["name"],
                 })
     if first_ok is None:
-        # Errors only accumulate for dedicated voice backends. If some voice
-        # backend failed, surface it (502). If nothing served voices at all
-        # (only non-voice endpoints, none of which proxy /voices), 404 so the
-        # frontend simply hides the picker.
-        if errors:
-            raise HTTPException(502, "Could not query voices catalog: " + "; ".join(errors))
-        raise HTTPException(404, "No voice backend configured.")
+        raise HTTPException(502, "Could not query voices catalog: " + "; ".join(errors))
     return {
         "voices": out,
         "backends": report,
@@ -3973,7 +4077,7 @@ async def api_conv_voice_transcribe(
 ):
     """Proxy: audio in → text out. Uses the conv's voice backend."""
     conv = _load_conv_for_voice(conv_id)
-    backend = await _resolve_voice_backend(conv)
+    backend = _resolve_voice_backend(conv)
     audio_bytes = await audio.read()
     try:
         return await voice.transcribe(
@@ -3991,7 +4095,7 @@ async def api_conv_voice_speak(conv_id: int, req: VoiceSpeakRequest):
     """Proxy: text in → SSE audio chunks out. Uses the conv's voice + language
     (req fields override the saved voice_settings)."""
     conv = _load_conv_for_voice(conv_id)
-    backend = await _resolve_voice_backend(conv)
+    backend = _resolve_voice_backend(conv)
     voice_id, language = await _resolve_voice_choice(
         conv, backend, override_voice=req.voice, override_lang=req.language,
     )
@@ -4030,7 +4134,7 @@ async def api_conv_voice_turn(
     `{error: "..."}` event before the `{end}`.
     """
     conv = _load_conv_for_voice(conv_id)
-    voice_backend = await _resolve_voice_backend(conv)
+    voice_backend = _resolve_voice_backend(conv)
     audio_bytes = await audio.read()
     audio_name = audio.filename or "audio.wav"
     audio_ct = audio.content_type or "audio/wav"
@@ -4145,7 +4249,7 @@ async def api_conv_voice_say(conv_id: int, req: VoiceSayRequest):
       data: {end: true}
     """
     conv = _load_conv_for_voice(conv_id)
-    voice_backend = await _resolve_voice_backend(conv)
+    voice_backend = _resolve_voice_backend(conv)
     transcript = req.text.strip()
     if not transcript:
         raise HTTPException(400, "Empty text.")
@@ -4294,7 +4398,7 @@ async def api_conv_call_configure(
 ):
     """Proxy POST /call/configure — same-origin so the browser can stay on HTTPS."""
     conv = _load_conv_for_voice(conv_id)
-    backend = await _resolve_voice_backend(conv)
+    backend = _resolve_voice_backend(conv)
     voice_id, language = await _resolve_voice_choice(
         conv, backend, override_voice=req.voice, override_lang=req.language,
     )
@@ -4346,7 +4450,7 @@ async def _warmup_conv_model(conv_id: int) -> None:
 async def api_conv_call_offer(conv_id: int, req: CallOfferRequest):
     """Proxy POST /webrtc/offer — returns the SDP answer JSON from FastRTC."""
     conv = _load_conv_for_voice(conv_id)
-    backend = await _resolve_voice_backend(conv)
+    backend = _resolve_voice_backend(conv)
     try:
         return await voice.call_offer(backend, req.model_dump(exclude_none=True))
     except httpx.HTTPError as e:
@@ -4357,7 +4461,7 @@ async def api_conv_call_offer(conv_id: int, req: CallOfferRequest):
 async def api_conv_call_events(conv_id: int, webrtc_id: str):
     """Proxy GET /call/events/{id} — forwards the SSE stream to the browser."""
     conv = _load_conv_for_voice(conv_id)
-    backend = await _resolve_voice_backend(conv)
+    backend = _resolve_voice_backend(conv)
 
     async def gen():
         try:
