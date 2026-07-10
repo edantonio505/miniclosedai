@@ -4572,6 +4572,11 @@ async def _run_relay_turn(conv_id: int, voice_backend: dict,
     logger = logging.getLogger("uvicorn.error")
     full: list[str] = []
     eff = llm_backend = None
+    # Stage trace: pinpoints where a relay turn stalls when a call hangs on
+    # "Thinking". Watch with: journalctl -u <miniclosedai> -f | grep 'relay turn'
+    #   start -> setup ok -> first token -> LLM done -> pushing -> push done
+    # Whichever line is MISSING is the stage that hung.
+    logger.info("relay turn %s: start transcript=%r", turn_id, (transcript or "")[:80])
     try:
         chat_req = ConversationChatRequest(
             message=transcript, include_history=True, persist=False,
@@ -4582,6 +4587,9 @@ async def _run_relay_turn(conv_id: int, voice_backend: dict,
         llm_backend = await _maybe_override_to_relay(llm_backend, eff["model"])
         conv = _conv_exists(conv_id)
         mcp_servers = _enabled_mcp_servers(conv)
+        logger.info("relay turn %s: setup ok model=%s backend=%s mcp=%d",
+                    turn_id, eff.get("model"),
+                    (llm_backend or {}).get("name"), len(mcp_servers))
     except Exception as e:
         logger.warning("relay turn %s setup failed: %r", turn_id, e)
         async def err_line():
@@ -4593,6 +4601,7 @@ async def _run_relay_turn(conv_id: int, voice_backend: dict,
         return
 
     async def lines():
+        first = True
         try:
             if mcp_servers:
                 # Tool loops can't stream token-by-token — same tradeoff as
@@ -4600,6 +4609,8 @@ async def _run_relay_turn(conv_id: int, voice_backend: dict,
                 text = await _run_mcp_tool_loop(
                     eff["model"], messages, eff, llm_backend, mcp_servers)
                 full.append(text)
+                logger.info("relay turn %s: LLM (mcp) done chars=%d",
+                            turn_id, len(text))
                 yield (json.dumps({"chunk": text}) + "\n").encode()
             else:
                 async for ev in llm.chat_stream(
@@ -4609,15 +4620,23 @@ async def _run_relay_turn(conv_id: int, voice_backend: dict,
                 ):
                     piece = ev.get("content")
                     if piece:
+                        if first:
+                            logger.info("relay turn %s: first token", turn_id)
+                            first = False
                         full.append(piece)
                         yield (json.dumps({"chunk": piece}) + "\n").encode()
+                logger.info("relay turn %s: LLM done chars=%d",
+                            turn_id, sum(len(x) for x in full))
             yield (json.dumps({"end": True}) + "\n").encode()
         except Exception as e:
             logger.warning("relay turn %s LLM stream failed: %r", turn_id, e)
             yield (json.dumps({"error": str(e)[:300]}) + "\n").encode()
 
     try:
+        logger.info("relay turn %s: pushing to %s", turn_id,
+                    voice_backend.get("base_url"))
         await voice.push_turn(voice_backend, turn_id, lines())
+        logger.info("relay turn %s: push done", turn_id)
     except Exception as e:
         logger.warning("relay turn %s push failed: %r", turn_id, e)
         return

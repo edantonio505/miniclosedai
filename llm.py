@@ -31,6 +31,24 @@ import httpx
 # Kept for backward compat + used by db.py's built-in seed.
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
+# Streaming chat timeout. `read` is the *inter-token* budget: how long we wait
+# for the NEXT chunk from the model. A generous default (env-tunable) so a slow
+# cold model-load still gets its first token, but a genuinely stalled or hung
+# upstream fails instead of hanging forever (the old `timeout=None`). This is
+# what kept relay-mode voice calls stuck on "Thinking": a stalled turn never
+# errored, so the reply was never pushed to the voice server. On timeout the
+# stream raises, the caller surfaces an error, and the call can recover.
+_STREAM_READ_TIMEOUT_S = float(os.environ.get("MINICLOSEDAI_STREAM_READ_TIMEOUT_S", "120"))
+_CHAT_STREAM_TIMEOUT = httpx.Timeout(
+    _STREAM_READ_TIMEOUT_S, connect=10.0, write=30.0, pool=30.0
+)
+# Non-streaming completions (MCP tool loops): the whole reply arrives in one
+# response, so this is a total budget rather than inter-token. Generous, but
+# bounded so a hung tool-call turn can't wedge a voice call forever.
+_CHAT_ONCE_TIMEOUT = httpx.Timeout(
+    float(os.environ.get("MINICLOSEDAI_CHAT_TIMEOUT_S", "300")), connect=10.0
+)
+
 # Model-specific end-of-turn tokens that sometimes leak into streamed output.
 # GGUF quantizations on LM Studio leak the same ones Ollama does, so we reuse
 # the list across both backends.
@@ -302,7 +320,7 @@ async def _ollama_chat_stream(
     }
     if think is not None:
         payload["think"] = think
-    async with httpx.AsyncClient(timeout=None) as client:
+    async with httpx.AsyncClient(timeout=_CHAT_STREAM_TIMEOUT) as client:
         async with client.stream(
             "POST",
             f"{_base_url(backend)}/api/chat",
@@ -449,7 +467,7 @@ async def _openai_chat_stream(
 
     headers = _openai_headers(backend)
 
-    async with httpx.AsyncClient(timeout=None) as client:
+    async with httpx.AsyncClient(timeout=_CHAT_STREAM_TIMEOUT) as client:
         async with client.stream(
             "POST",
             f"{_base_url(backend)}/chat/completions",
@@ -724,7 +742,7 @@ async def _ollama_chat_tools(backend, model, messages, tools, temperature, max_t
         payload["tools"] = tools
     if think is not None:
         payload["think"] = think
-    async with httpx.AsyncClient(timeout=None) as client:
+    async with httpx.AsyncClient(timeout=_CHAT_ONCE_TIMEOUT) as client:
         r = await client.post(
             f"{_base_url(backend)}/api/chat", json=payload, headers=_ollama_headers(backend)
         )
@@ -758,7 +776,7 @@ async def _openai_chat_tools(backend, model, messages, tools, temperature, max_t
         payload["max_tokens"] = max_tokens
     if tools:
         payload["tools"] = tools
-    async with httpx.AsyncClient(timeout=None) as client:
+    async with httpx.AsyncClient(timeout=_CHAT_ONCE_TIMEOUT) as client:
         r = await client.post(
             f"{_base_url(backend)}/chat/completions", json=payload, headers=_openai_headers(backend)
         )
