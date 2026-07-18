@@ -1160,6 +1160,18 @@ function renderBotsPage() {
       openEvalModal(c.id, c.title);
     });
 
+    const llmBtn = document.createElement("button");
+    llmBtn.type = "button";
+    llmBtn.className = "bot-card-action";
+    llmBtn.setAttribute("aria-label", `Change model for ${c.title}`);
+    llmBtn.dataset.tooltip = "Change model";
+    llmBtn.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>';
+    llmBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      openBotModelPicker(llmBtn, c);
+    });
+
     const delBtn = document.createElement("button");
     delBtn.type = "button";
     delBtn.className = "bot-card-action danger";
@@ -1176,6 +1188,7 @@ function renderBotsPage() {
     actions.appendChild(kbBtn);
     actions.appendChild(mcpBtn);
     actions.appendChild(evalBtn);
+    actions.appendChild(llmBtn);
     actions.appendChild(delBtn);
     card.appendChild(actions);
 
@@ -1212,6 +1225,178 @@ function renderBotsPage() {
     } else {
       els.botsEmpty.hidden = true;
     }
+  }
+}
+
+// =====================================================================
+// Per-card "Change model" popover (Bots page). One shared popover, anchored
+// to whichever bot card's chip button opened it. Reuses the topbar model
+// picker's CSS classes but is fully independent of the topbar <select> —
+// picking here PATCHes the bot's {model, backend_id} and re-renders the list.
+// =====================================================================
+let _botModelPop = null;      // lazily created singleton
+let _botModelPopOwner = null; // anchor button while open (aria bookkeeping)
+
+function _closeBotModelPicker() {
+  if (!_botModelPop || _botModelPop.hidden) return;
+  _botModelPop.hidden = true;
+  if (_botModelPopOwner) _botModelPopOwner.setAttribute("aria-expanded", "false");
+  _botModelPopOwner = null;
+}
+
+function _ensureBotModelPop() {
+  if (_botModelPop) return _botModelPop;
+  const pop = document.createElement("div");
+  pop.id = "bot-model-pop";
+  pop.className = "model-picker-pop";
+  pop.hidden = true;
+  pop.innerHTML =
+    '<input type="search" class="model-picker-search" placeholder="Search models…" aria-label="Search models" />' +
+    '<div class="model-picker-list"></div>';
+  document.body.appendChild(pop);
+  _botModelPop = pop;
+
+  // Clicks inside stay inside; any outside click closes. The opening click
+  // never reaches this listener (the card handler stopPropagation()s it).
+  pop.addEventListener("click", e => e.stopPropagation());
+  document.addEventListener("click", e => {
+    if (!pop.hidden && !pop.contains(e.target)) _closeBotModelPicker();
+  });
+
+  const search = pop.querySelector("input");
+  search.addEventListener("input", () => {
+    const q = search.value.trim().toLowerCase();
+    pop.querySelectorAll(".model-picker-item").forEach(it => {
+      it.hidden = !!q && !(it.dataset.key || "").toLowerCase().includes(q);
+    });
+    // Hide a group header when every item under it is hidden.
+    pop.querySelectorAll(".model-picker-group").forEach(g => {
+      let sib = g.nextElementSibling, any = false;
+      while (sib && !sib.classList.contains("model-picker-group")) {
+        if (sib.classList.contains("model-picker-item") && !sib.hidden) any = true;
+        sib = sib.nextElementSibling;
+      }
+      g.hidden = !any;
+    });
+  });
+  search.addEventListener("keydown", e => {
+    if (e.key === "Escape") {
+      // stopPropagation so the global bots hotkeys (Esc-to-bots) don't fire.
+      e.preventDefault(); e.stopPropagation();
+      _closeBotModelPicker();
+      return;
+    }
+    const items = [...pop.querySelectorAll(".model-picker-item:not([hidden])")];
+    if (!items.length) return;
+    let idx = items.findIndex(it => it.classList.contains("highlighted"));
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      idx = e.key === "ArrowDown"
+        ? Math.min(idx + 1, items.length - 1)
+        : Math.max(idx - 1, 0);
+      items.forEach(it => it.classList.remove("highlighted"));
+      items[idx].classList.add("highlighted");
+      items[idx].scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      (idx >= 0 ? items[idx] : items[0]).click();
+    }
+  });
+  return pop;
+}
+
+function _positionBotModelPop(anchorBtn) {
+  const pop = _botModelPop;
+  const r = anchorBtn.getBoundingClientRect();
+  const w = Math.max(pop.offsetWidth, 280);
+  const h = pop.offsetHeight;
+  let left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+  // Below the button by default; flip above when it would run off-screen.
+  let top = r.bottom + 4;
+  if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 4);
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+}
+
+async function openBotModelPicker(anchorBtn, conv) {
+  const pop = _ensureBotModelPop();
+  if (!pop.hidden && _botModelPopOwner === anchorBtn) {
+    _closeBotModelPicker();   // second click on the same button toggles closed
+    return;
+  }
+  _botModelPopOwner = anchorBtn;
+  anchorBtn.setAttribute("aria-expanded", "true");
+  const list = pop.querySelector(".model-picker-list");
+  const search = pop.querySelector("input");
+  search.value = "";
+  list.innerHTML = '<div class="model-picker-empty">Loading models…</div>';
+  pop.hidden = false;
+  _positionBotModelPop(anchorBtn);
+
+  let backends = [];
+  try {
+    const r = await fetch("/api/models");
+    backends = (await r.json()).backends || [];
+  } catch {
+    list.innerHTML = '<div class="model-picker-empty">Could not load models</div>';
+    return;
+  }
+  // The fetch is async — the user may have closed the pop or opened another
+  // card's picker meanwhile; only render if we still own it.
+  if (pop.hidden || _botModelPopOwner !== anchorBtn) return;
+
+  list.innerHTML = "";
+  let total = 0;
+  for (const b of backends) {
+    if (!b.enabled || !b.running || !(b.models || []).length) continue;
+    const grp = document.createElement("div");
+    grp.className = "model-picker-group";
+    grp.textContent = b.name;
+    list.appendChild(grp);
+    for (const m of b.models) {
+      const it = document.createElement("button");
+      it.type = "button";
+      it.className = "model-picker-item";
+      it.dataset.key = `${m.name}::${b.id}`;
+      it.textContent = m.name;
+      if (conv.model === m.name && conv.backend_id === b.id) {
+        it.classList.add("active");
+        it.textContent = `✓ ${m.name}`;
+      }
+      it.addEventListener("click", () => _chooseBotModel(conv, m.name, b.id));
+      list.appendChild(it);
+      total++;
+    }
+  }
+  if (!total) {
+    list.innerHTML =
+      '<div class="model-picker-empty">No models available — is a backend online?</div>';
+  }
+  _positionBotModelPop(anchorBtn);   // re-clamp now that height is real
+  search.focus();
+}
+
+async function _chooseBotModel(conv, model, backendId) {
+  _closeBotModelPicker();
+  try {
+    const r = await fetch(`/api/conversations/${conv.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, backend_id: backendId }),
+    });
+    if (!r.ok) {
+      let detail = `HTTP ${r.status}`;
+      try { detail = (await r.json()).detail || detail; } catch {}
+      alert(`Could not change model: ${detail}`);
+      return;
+    }
+    await loadConversations();   // re-renders the card meta (model · backend)
+    // If this bot is the currently open chat, keep the topbar picker in sync.
+    if (state.conversationId === conv.id) {
+      _selectModelOption(model, String(backendId));
+    }
+  } catch (e) {
+    alert(`Could not change model: ${e?.message || e}`);
   }
 }
 
@@ -6862,12 +7047,85 @@ function initGlobalTooltip() {
   });
 }
 
+// =====================================================================
+// Instance identity (Settings → Instance identity). Server-side per-install
+// name + description: the name becomes the browser-tab title, and because a
+// tab's hover card shows the full document.title, appending the description
+// makes it visible on hover — so multiple MiniClosedAI installs are tellable
+// apart in a crowded tab strip. Nothing else in the app touches
+// document.title, so this owns it outright.
+// =====================================================================
+let _instanceMeta = { name: "", description: "" };
+
+function _applyInstanceTitle() {
+  const name = (_instanceMeta.name || "").trim();
+  const desc = (_instanceMeta.description || "").trim();
+  const base = name || "MiniClosedAI";
+  document.title = desc ? `${base} — ${desc}` : base;
+}
+
+async function loadInstanceMeta() {
+  try {
+    const r = await fetch("/api/instance");
+    if (!r.ok) return;
+    const j = await r.json();
+    _instanceMeta = { name: j.name || "", description: j.description || "" };
+  } catch {
+    return;   // unreachable — keep the static <title> fallback
+  }
+  _applyInstanceTitle();
+  const nameEl = document.getElementById("instance-name");
+  const descEl = document.getElementById("instance-description");
+  if (nameEl) nameEl.value = _instanceMeta.name;
+  if (descEl) descEl.value = _instanceMeta.description;
+}
+
+function initInstanceMetaUI() {
+  const nameEl = document.getElementById("instance-name");
+  const descEl = document.getElementById("instance-description");
+  const statusEl = document.getElementById("instance-meta-status");
+  if (!nameEl || !descEl) return;
+
+  let saveTimer = null;
+  const save = async () => {
+    const body = { name: nameEl.value.trim(), description: descEl.value.trim() };
+    try {
+      const r = await fetch("/api/instance", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _instanceMeta = await r.json();
+      _applyInstanceTitle();   // tab renames the moment the save lands
+      if (statusEl) {
+        statusEl.textContent = "Saved.";
+        setTimeout(() => { if (statusEl.textContent === "Saved.") statusEl.textContent = ""; }, 1500);
+      }
+    } catch (e) {
+      if (statusEl) statusEl.textContent = `Could not save: ${e?.message || e}`;
+    }
+  };
+  const scheduleSave = () => {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(save, 500);   // debounce while typing
+  };
+  for (const el of [nameEl, descEl]) {
+    el.addEventListener("input", scheduleSave);
+    el.addEventListener("change", () => { clearTimeout(saveTimer); save(); });
+  }
+}
+
 async function init() {
   initGlobalTooltip();
   initTheme();
   initSidebarToggle();
   initActivityBar();
   loadSettings();
+  // Fire-and-forget: rename the tab from this server's saved identity as
+  // early as possible — independent of backend reachability below.
+  initInstanceMetaUI();
+  loadInstanceMeta().catch(() => {});
   bindParamDisplay();
   bindChat();
   bindAttachments();

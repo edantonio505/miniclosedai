@@ -1708,6 +1708,18 @@ body[data-page-transition="back"] .page {
 .model-picker-item.disabled:hover { background: transparent; }
 .model-picker-empty { color: var(--text-muted); font-size: 12px; padding: 8px; text-align: center; }
 
+/* Bots-page "Change model" popover — same look as the topbar picker, but
+   anchored to the clicked card button via fixed positioning (it lives on
+   <body>, not inside a relative wrapper), above the card hover states. */
+#bot-model-pop {
+  position: fixed;
+  top: auto;
+  left: auto;
+  right: auto;
+  width: 320px;
+  z-index: 1200;
+}
+
 /* =====================================================================
    Form elements
    ===================================================================== */

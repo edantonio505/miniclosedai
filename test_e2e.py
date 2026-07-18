@@ -1549,6 +1549,35 @@ def _():
         _clear_companions()
 
 
+@test("/api/instance: defaults + PUT round-trip + partial update")
+def _():
+    # Fresh DB → seeded blank identity.
+    r = client.get("/api/instance")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"name": "", "description": ""}, r.json()
+    try:
+        # Set both.
+        r = client.put("/api/instance", json={"name": "Lab A", "description": "RAG box"})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"name": "Lab A", "description": "RAG box"}
+        assert client.get("/api/instance").json()["name"] == "Lab A"
+        # Partial update: clearing name leaves description untouched.
+        r = client.put("/api/instance", json={"name": ""})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"name": "", "description": "RAG box"}, r.json()
+        # Whitespace is trimmed.
+        r = client.put("/api/instance", json={"name": "  Spark  "})
+        assert r.json()["name"] == "Spark"
+        # Unknown fields are rejected (extra='forbid').
+        r = client.put("/api/instance", json={"nope": 1})
+        assert r.status_code == 422, r.text
+        # Over-length name rejected.
+        r = client.put("/api/instance", json={"name": "x" * 81})
+        assert r.status_code == 422, r.text
+    finally:
+        client.put("/api/instance", json={"name": "", "description": ""})
+
+
 @test("/api/models: aggregated shape + legacy back-compat keys")
 def _():
     _reseed_builtin_to_fake_ollama()
@@ -2170,6 +2199,9 @@ def _():
     assert 'id="global-tooltip"' in body
     # Backend-picker modal is shared between bot and app import flows.
     assert 'id="import-modal-backdrop"' in body
+    # Settings → Instance identity (tab title + hover description).
+    assert 'id="instance-name"' in body
+    assert 'id="instance-description"' in body
 
 
 @test("static: app.js is served and contains recent helpers")
@@ -2203,6 +2235,10 @@ def _():
         "initEvalsUI", "initEvalModalUI",
         # Searchable model picker
         "initModelPicker", "_rebuildModelPicker", "_syncModelPickerLabel",
+        # Per-card "Change model" popover on the Bots page
+        "openBotModelPicker", "_chooseBotModel", "_positionBotModelPop",
+        # Instance identity (server-side tab title + hover description)
+        "loadInstanceMeta", "_applyInstanceTitle", "initInstanceMetaUI",
         # Application export / import — mirrors the bot pattern at the apps level.
         "_handleAppImportFile", "_runAppImport", "_downloadApp",
         "initAppsImportUI",

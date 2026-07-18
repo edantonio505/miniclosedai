@@ -1552,6 +1552,53 @@ def _app_row(conn, app_id: int):
     return row
 
 
+# ---------- Instance identity (Settings → Instance identity) ----------
+
+class InstanceUpdate(BaseModel):
+    """PUT /api/instance body. Both fields optional — only supplied keys are
+    updated; empty string explicitly clears a field."""
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(None, max_length=80)
+    description: str | None = Field(None, max_length=300)
+
+
+def _instance_row() -> dict:
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT name, description FROM instance_meta WHERE id = 1"
+        ).fetchone()
+    # init_db seeds the row, but be lenient with a hand-edited DB.
+    return dict(row) if row else {"name": "", "description": ""}
+
+
+@app.get("/api/instance")
+def api_get_instance():
+    """This installation's identity: `name` becomes the browser-tab title,
+    `description` rides along in document.title so hovering the tab shows it.
+    Server-side by design — the point is telling multiple MiniClosedAI
+    installations apart, so the identity belongs to the install, not the
+    browser."""
+    return _instance_row()
+
+
+@app.put("/api/instance")
+def api_update_instance(data: InstanceUpdate):
+    supplied = data.model_dump(exclude_unset=True)
+    fields, values = [], []
+    for col in ("name", "description"):
+        if col in supplied and supplied[col] is not None:
+            fields.append(f"{col} = ?")
+            values.append(supplied[col].strip())
+    if fields:
+        with db.get_conn() as conn:
+            conn.execute("INSERT OR IGNORE INTO instance_meta (id) VALUES (1)")
+            conn.execute(
+                f"UPDATE instance_meta SET {', '.join(fields)} WHERE id = 1", values
+            )
+            conn.commit()
+    return _instance_row()
+
+
 @app.get("/api/apps")
 def api_list_apps():
     """Every application with its bot count, newest-first."""
