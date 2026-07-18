@@ -1100,6 +1100,18 @@ Lists Ollama models available locally.
 }
 ```
 
+### Instance identity
+
+```
+GET /api/instance   → {"name": "...", "description": "..."}   (per-install identity)
+PUT /api/instance   → partial update {name?, description?}; trims whitespace; "" clears
+```
+
+Set in Settings → Instance identity. The frontend composes `document.title` as
+`name — description` so the browser tab shows the name and hovering the tab reveals the
+description — distinguishes multiple MiniClosedAI installs. Stored in the single-row
+`instance_meta` table (server-side, shared by every browser that opens this install).
+
 ### Backends
 
 ```

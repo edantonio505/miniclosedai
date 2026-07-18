@@ -486,7 +486,7 @@ Vertical nav with three icons — clicking swaps the main content area without u
 - **Bots** (top, message-square icon) — the home for everything chat-related. Shows a searchable list of every saved conversation; click a card to enter that chat. The icon stays highlighted whether you're on the list OR inside a chat (chats are children of Bots, not a sibling tab). A small **pulse dot** on this icon lights up when a bot has a streaming or unread reply you haven't seen yet.
 - **Logs** (middle, terminal icon) — live LM-Studio-style viewer of every chat request and response across all endpoints. See [Logs page](#logs-page) below.
 - **Theme toggle** (bottom, sits on top of the gear) — cycles System → Light → Dark → System. Respects `prefers-color-scheme` while on System.
-- **Settings** (bottom, gear icon) — register and manage LLM endpoints (see [Connecting LM Studio and other endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)).
+- **Settings** (bottom, gear icon) — register and manage LLM endpoints (see [Connecting LM Studio and other endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)). Also home to **Instance identity**: give this installation a name (becomes the browser-tab title) and a description (revealed when hovering the tab) — stored server-side, so multiple MiniClosedAI instances stay tellable apart from the tab strip alone.
 
 Your selection persists across reloads. Streaming chats keep playing when you flip between tabs — the DOM is never unmounted, and the Logs polling auto-pauses on the other tabs so it doesn't burn cycles when invisible.
 

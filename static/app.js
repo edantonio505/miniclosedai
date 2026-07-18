@@ -7047,12 +7047,85 @@ function initGlobalTooltip() {
   });
 }
 
+// =====================================================================
+// Instance identity (Settings → Instance identity). Server-side per-install
+// name + description: the name becomes the browser-tab title, and because a
+// tab's hover card shows the full document.title, appending the description
+// makes it visible on hover — so multiple MiniClosedAI installs are tellable
+// apart in a crowded tab strip. Nothing else in the app touches
+// document.title, so this owns it outright.
+// =====================================================================
+let _instanceMeta = { name: "", description: "" };
+
+function _applyInstanceTitle() {
+  const name = (_instanceMeta.name || "").trim();
+  const desc = (_instanceMeta.description || "").trim();
+  const base = name || "MiniClosedAI";
+  document.title = desc ? `${base} — ${desc}` : base;
+}
+
+async function loadInstanceMeta() {
+  try {
+    const r = await fetch("/api/instance");
+    if (!r.ok) return;
+    const j = await r.json();
+    _instanceMeta = { name: j.name || "", description: j.description || "" };
+  } catch {
+    return;   // unreachable — keep the static <title> fallback
+  }
+  _applyInstanceTitle();
+  const nameEl = document.getElementById("instance-name");
+  const descEl = document.getElementById("instance-description");
+  if (nameEl) nameEl.value = _instanceMeta.name;
+  if (descEl) descEl.value = _instanceMeta.description;
+}
+
+function initInstanceMetaUI() {
+  const nameEl = document.getElementById("instance-name");
+  const descEl = document.getElementById("instance-description");
+  const statusEl = document.getElementById("instance-meta-status");
+  if (!nameEl || !descEl) return;
+
+  let saveTimer = null;
+  const save = async () => {
+    const body = { name: nameEl.value.trim(), description: descEl.value.trim() };
+    try {
+      const r = await fetch("/api/instance", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _instanceMeta = await r.json();
+      _applyInstanceTitle();   // tab renames the moment the save lands
+      if (statusEl) {
+        statusEl.textContent = "Saved.";
+        setTimeout(() => { if (statusEl.textContent === "Saved.") statusEl.textContent = ""; }, 1500);
+      }
+    } catch (e) {
+      if (statusEl) statusEl.textContent = `Could not save: ${e?.message || e}`;
+    }
+  };
+  const scheduleSave = () => {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(save, 500);   // debounce while typing
+  };
+  for (const el of [nameEl, descEl]) {
+    el.addEventListener("input", scheduleSave);
+    el.addEventListener("change", () => { clearTimeout(saveTimer); save(); });
+  }
+}
+
 async function init() {
   initGlobalTooltip();
   initTheme();
   initSidebarToggle();
   initActivityBar();
   loadSettings();
+  // Fire-and-forget: rename the tab from this server's saved identity as
+  // early as possible — independent of backend reachability below.
+  initInstanceMetaUI();
+  loadInstanceMeta().catch(() => {});
   bindParamDisplay();
   bindChat();
   bindAttachments();

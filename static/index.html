@@ -487,6 +487,22 @@
         </div>
         <p class="settings-hint" id="prompt-gen-model-hint">The first model on the matched backend is used by default. Pick a larger or instruction-tuned model for better-quality prompts.</p>
       </section>
+
+      <section class="settings-section" id="instance-settings-section">
+        <div class="settings-section-header">
+          <h2>Instance identity</h2>
+        </div>
+        <p class="settings-hint">Name this MiniClosedAI — the name becomes the browser-tab title, and the description shows when you hover the tab. Handy when you run several instances. Stored on this server, so every browser sees the same identity.</p>
+        <div class="settings-row">
+          <label for="instance-name">Name</label>
+          <input type="text" id="instance-name" class="settings-select" maxlength="80" placeholder="MiniClosedAI" />
+        </div>
+        <div class="settings-row">
+          <label for="instance-description">Description</label>
+          <input type="text" id="instance-description" class="settings-select" maxlength="300" placeholder="e.g. lab server — RAG experiments" />
+        </div>
+        <p class="settings-hint" id="instance-meta-status"></p>
+      </section>
     </div>
   </div>
   </div> <!-- /.main-area -->

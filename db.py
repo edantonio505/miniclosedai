@@ -118,6 +118,17 @@ CREATE TABLE IF NOT EXISTS apps (
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Per-installation identity, set in Settings → Instance identity. Single row
+-- (id=1, seeded in init_db). `name` becomes the browser-tab title; the
+-- description is appended to document.title so hovering the tab reveals it —
+-- lets a user running several MiniClosedAI instances tell the tabs apart.
+-- Empty name = unconfigured → the frontend falls back to "MiniClosedAI".
+CREATE TABLE IF NOT EXISTS instance_meta (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    name        TEXT    NOT NULL DEFAULT '',
+    description TEXT    NOT NULL DEFAULT ''
+);
 """
 
 
@@ -271,6 +282,10 @@ def init_db() -> None:
                    VALUES (1, 'Ollama (built-in)', 'ollama', ?, 1, 1)""",
                 (_DEFAULT_OLLAMA_URL,),
             )
+
+        # Instance-identity singleton (Settings → Instance identity). Blank
+        # defaults; the row must exist so GET/PUT /api/instance never 404s.
+        conn.execute("INSERT OR IGNORE INTO instance_meta (id) VALUES (1)")
 
         conn.commit()
 
