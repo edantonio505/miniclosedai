@@ -2203,6 +2203,8 @@ def _():
         "initEvalsUI", "initEvalModalUI",
         # Searchable model picker
         "initModelPicker", "_rebuildModelPicker", "_syncModelPickerLabel",
+        # Per-card "Change model" popover on the Bots page
+        "openBotModelPicker", "_chooseBotModel", "_positionBotModelPop",
         # Application export / import — mirrors the bot pattern at the apps level.
         "_handleAppImportFile", "_runAppImport", "_downloadApp",
         "initAppsImportUI",
