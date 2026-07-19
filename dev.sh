@@ -32,6 +32,18 @@ KEY=.devcerts/dev-key.pem
 # with MINICLOSEDAI_VOICE_DIR for non-default checkouts (e.g., on RunPod).
 VOICE_DIR="${MINICLOSEDAI_VOICE_DIR:-$(cd "$(dirname "$0")" && cd .. && pwd)/miniclosedai-voice}"
 
+# LLM model manager (miniclosedai-llm) — sibling repo, same convention. On a
+# CUDA-capable box, `up` brings all THREE systems online: voice (ASR+TTS),
+# the LLM manager, and MiniClosedAI itself. The manager's own dev.sh
+# auto-detects the launch engine (docker vs native vllm) and the GPU.
+LLM_DIR="${MINICLOSEDAI_LLM_DIR:-$(cd "$(dirname "$0")" && cd .. && pwd)/miniclosedai-llm}"
+PORT_LLM=8099
+LLM_LOG=/tmp/miniclosedai-llm.log
+
+llm_pid()    { pgrep -f "uvicorn app:app.*${PORT_LLM}" | head -1; }
+llm_alive()  { [[ -n "$(llm_pid)" ]]; }
+llm_health() { curl -fsS --max-time 2 "http://localhost:${PORT_LLM}/api/health" >/dev/null 2>&1; }
+
 c_blue=$'\e[1;34m'; c_green=$'\e[1;32m'; c_red=$'\e[1;31m'; c_yellow=$'\e[1;33m'; c_dim=$'\e[2m'; c_off=$'\e[0m'
 step() { printf "\n%s▶ %s%s\n" "$c_blue"   "$1" "$c_off"; }
 ok()   { printf   "%s✓ %s%s\n" "$c_green"  "$1" "$c_off"; }
@@ -198,11 +210,44 @@ cmd_voice_purge() {
   ok "Voice service removed"
 }
 
-# By design `down` leaves the voice container running so models stay warm
-# across MiniClosedAI restarts. Add `voice-purge` if you actually want to
-# nuke it (e.g., after a Dockerfile change).
-cmd_up()      { start_voice; start_app; }
-cmd_down()    { stop_app; ok "Voice service left running (use '$0 voice-purge' to stop)"; }
+start_llm() {
+  if llm_alive && llm_health; then
+    ok "LLM manager already running (pid $(llm_pid))   ${c_dim}http://localhost:${PORT_LLM}/${c_off}"
+    return
+  fi
+  if [[ ! -x "$LLM_DIR/dev.sh" ]]; then
+    warn "miniclosedai-llm not found at $LLM_DIR — Models tab will show 'not running' (set MINICLOSEDAI_LLM_DIR)"
+    return
+  fi
+  step "Starting LLM manager (miniclosedai-llm on :${PORT_LLM})"
+  ( cd "$LLM_DIR" && nohup ./dev.sh > "$LLM_LOG" 2>&1 & disown ) || true
+  for _ in $(seq 1 30); do
+    if llm_health; then
+      ok "LLM manager ready (pid $(llm_pid))   ${c_dim}http://localhost:${PORT_LLM}/  → log: $LLM_LOG${c_off}"
+      return
+    fi
+    sleep 1
+  done
+  warn "LLM manager didn't respond in 30s. Last 15 lines of $LLM_LOG:"
+  tail -15 "$LLM_LOG" 2>/dev/null || true
+  warn "Continuing without it — the Models tab will show 'not running'."
+}
+
+stop_llm() {
+  if llm_alive; then
+    step "Stopping LLM manager (pid $(llm_pid))"
+    kill "$(llm_pid)" 2>/dev/null || true
+    ok "LLM manager stopped"
+  else
+    ok "LLM manager not running"
+  fi
+}
+
+# By design `down` leaves the voice container AND the LLM manager running so
+# models stay warm across MiniClosedAI restarts. Use `voice-purge` /
+# `llm-stop` to actually stop them.
+cmd_up()      { start_voice; start_llm; start_app; }
+cmd_down()    { stop_app; ok "Voice service + LLM manager left running (use '$0 voice-purge' / '$0 llm-stop')"; }
 cmd_restart() { cmd_down; cmd_up; }
 
 cmd_status() {
@@ -226,6 +271,16 @@ cmd_status() {
       ok "${scheme}://localhost:${PORT_VOICE}/   $(voice_health_body)"
     else
       warn "running but /health not responding"
+    fi
+  else
+    warn "not running"
+  fi
+  step "LLM manager (miniclosedai-llm)"
+  if llm_alive; then
+    if llm_health; then
+      ok "pid $(llm_pid)  http://localhost:${PORT_LLM}/  ✓"
+    else
+      warn "pid $(llm_pid)  but /api/health is not responding"
     fi
   else
     warn "not running"
@@ -254,7 +309,8 @@ cmd_logs() {
   case "${1:-app}" in
     app)   tail -f "$APP_LOG" ;;
     voice) ( cd "$VOICE_DIR" && docker compose logs -f voice ) ;;
-    *)     die "logs target must be 'app' or 'voice'" ;;
+    llm)   tail -f "$LLM_LOG" ;;
+    *)     die "logs target must be 'app', 'voice', or 'llm'" ;;
   esac
 }
 
@@ -266,6 +322,7 @@ case "${1:-up}" in
   test)        shift; cmd_test "$@" ;;
   logs)        shift; cmd_logs "$@" ;;
   voice-purge) cmd_voice_purge ;;
+  llm-stop)    stop_llm ;;
   -h|--help|help) grep '^#' "$0" | sed 's/^# \{0,1\}//; 1d' ;;
-  *)           die "Unknown command: $1 (try up | down | restart | status | test | logs | voice-purge | help)" ;;
+  *)           die "Unknown command: $1 (try up | down | restart | status | test | logs | voice-purge | llm-stop | help)" ;;
 esac

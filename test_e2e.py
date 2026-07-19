@@ -369,9 +369,37 @@ class FakeVoice(_FakeServer):
                     self._reply(200, body, "application/json"); return
                 self._reply(404, b"not found", "text/plain")
 
+            def do_DELETE(self):
+                if outer.fail:
+                    self._reply(503, b"down", "text/plain"); return
+                if self.path.startswith("/voices/"):
+                    vid = self.path.split("/voices/", 1)[1]
+                    captured.append({"path": self.path, "method": "DELETE",
+                                     "auth": self.headers.get("Authorization")})
+                    if vid == "default":
+                        self._reply(403, json.dumps({"detail": "reserved"}).encode(),
+                                    "application/json")
+                    else:
+                        self._reply(200, json.dumps({"ok": True, "voice_id": vid}).encode(),
+                                    "application/json")
+                    return
+                self._reply(404, b"not found", "text/plain")
+
             def do_POST(self):
                 if outer.fail:
                     self._reply(503, b"down", "text/plain"); return
+                if self.path == "/voices":
+                    raw = self._read_body()
+                    captured.append({"path": self.path, "method": "POST",
+                                     "auth": self.headers.get("Authorization"),
+                                     "content_type": self.headers.get("Content-Type", ""),
+                                     "body_len": len(raw),
+                                     "body_head": raw[:2000].decode(errors="replace")})
+                    self._reply(201, json.dumps({
+                        "voice_id": "cloned-1", "name": "Cloned", "language": "en",
+                        "duration_sec": 2.0, "sample_rate": 24000,
+                    }).encode(), "application/json")
+                    return
                 if self.path == "/call/configure":
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length)) if length else {}
@@ -1549,6 +1577,85 @@ def _():
         _clear_companions()
 
 
+@test("/api/llm proxy: round-trip + bearer injection + allowlist + llm-info")
+def _():
+    orig_url, orig_key = app_mod.LLM_MANAGER_URL, app_mod._LLM_MANAGER_KEY
+    app_mod.LLM_MANAGER_URL = fake_manager.base_url
+    app_mod._LLM_MANAGER_KEY = "sekret"
+    fake_manager.captured.clear()
+    try:
+        # GET round-trip through the proxy, bearer injected server-side.
+        r = client.get("/api/llm/models")
+        assert r.status_code == 200, r.text
+        assert r.json()["models"][0]["id"] == "qwen3-vl-8b"
+        assert fake_manager.captured[-1]["auth"] == "Bearer sekret", fake_manager.captured[-1]
+        # POST passthrough (JSON body).
+        r = client.post("/api/llm/models/qwen3-vl-8b/stop")
+        assert r.status_code == 200, r.text
+        assert fake_manager.captured[-1]["path"] == "/api/models/qwen3-vl-8b/stop"
+        # Allowlist: unknown prefixes are NOT proxied.
+        r = client.get("/api/llm/secrets")
+        assert r.status_code == 404, r.text
+        # llm-info: reachable against the fake.
+        r = client.get("/api/llm-info")
+        assert r.status_code == 200
+        j = r.json()
+        assert j["manager_url"] == fake_manager.base_url and j["reachable"] is True, j
+        # Unreachable manager → 502 with the dev.sh hint.
+        app_mod.LLM_MANAGER_URL = "http://127.0.0.1:9"
+        r = client.get("/api/llm/models")
+        assert r.status_code == 502, r.text
+        assert "dev.sh" in r.text
+        r = client.get("/api/llm-info")
+        assert r.json()["reachable"] is False
+    finally:
+        app_mod.LLM_MANAGER_URL, app_mod._LLM_MANAGER_KEY = orig_url, orig_key
+
+
+@test("/api/voicestudio proxy: catalog + upload passthrough + bearer + guards")
+def _():
+    # Register the fake voice service WITH an api_key — the proxy must inject
+    # it as a bearer on every forwarded call.
+    r = client.post("/api/backends", json={
+        "name": "StudioVoice", "kind": "voice",
+        "base_url": fake_voice.base_url, "api_key": "vkey",
+    })
+    assert r.status_code == 200, r.text
+    vbid = r.json()["id"]
+    fake_voice.captured.clear()
+    try:
+        # Catalog via proxy.
+        r = client.get(f"/api/voicestudio/{vbid}/voices")
+        assert r.status_code == 200, r.text
+        assert "en" in r.json()
+        # Health via proxy.
+        assert client.get(f"/api/voicestudio/{vbid}/health").json()["ok"] is True
+        # Multipart clone-upload passthrough: fields + bytes arrive intact.
+        r = client.post(
+            f"/api/voicestudio/{vbid}/voices",
+            files={"audio": ("sample.wav", b"RIFF" + b"\x00" * 64, "audio/wav")},
+            data={"name": "Test Clone", "language": "en"},
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["voice_id"] == "cloned-1"
+        up = [c for c in fake_voice.captured if c.get("path") == "/voices"][-1]
+        assert up["auth"] == "Bearer vkey", up
+        assert "multipart/form-data" in up["content_type"], up
+        assert "Test Clone" in up["body_head"] and "RIFF" in up["body_head"], up
+        # DELETE via proxy.
+        r = client.delete(f"/api/voicestudio/{vbid}/voices/cloned-1")
+        assert r.status_code == 200, r.text
+        # Reserved voice refusal passes through.
+        assert client.delete(f"/api/voicestudio/{vbid}/voices/default").status_code == 403
+        # Guards: allowlist + non-voice backend + disabled backend.
+        assert client.get(f"/api/voicestudio/{vbid}/transcribe").status_code == 404
+        assert client.get("/api/voicestudio/1/health").status_code == 400  # backend 1 = ollama
+        client.patch(f"/api/backends/{vbid}", json={"enabled": False})
+        assert client.get(f"/api/voicestudio/{vbid}/health").status_code == 400
+    finally:
+        client.delete(f"/api/backends/{vbid}?force=true")
+
+
 @test("/api/instance: defaults + PUT round-trip + partial update")
 def _():
     # Fresh DB → seeded blank identity.
@@ -2202,6 +2309,15 @@ def _():
     # Settings → Instance identity (tab title + hover description).
     assert 'id="instance-name"' in body
     assert 'id="instance-description"' in body
+    # Models + Voice Studio tabs (the three-app merge): nav buttons + pages.
+    assert 'data-page="models"' in body
+    assert 'data-page="voice-studio"' in body
+    assert 'class="page page-models"' in body
+    assert 'class="page page-voice-studio"' in body
+    assert 'id="mp-add-form"' in body
+    assert 'id="mp-card-tpl"' in body
+    assert 'id="vs-backend-select"' in body
+    assert 'id="vs-record-btn"' in body
 
 
 @test("static: app.js is served and contains recent helpers")
@@ -2239,6 +2355,12 @@ def _():
         "openBotModelPicker", "_chooseBotModel", "_positionBotModelPop",
         # Instance identity (server-side tab title + hover description)
         "loadInstanceMeta", "_applyInstanceTitle", "initInstanceMetaUI",
+        # Models tab (native miniclosedai-llm port)
+        "initModelsPage", "onModelsPageEntered", "onModelsPageLeft",
+        "mpLoadModels", "mpAnalyze", "_mpOpenLogs",
+        # Voice Studio tab (native miniclosedai-voice port)
+        "initVoiceStudioPage", "onVoiceStudioPageEntered", "onVoiceStudioPageLeft",
+        "vsLoadVoices", "vsSaveVoice", "_vsEncodeWav",
         # Application export / import — mirrors the bot pattern at the apps level.
         "_handleAppImportFile", "_runAppImport", "_downloadApp",
         "initAppsImportUI",
@@ -5113,21 +5235,40 @@ def _():
 # ----- Auto-register against a fake miniclosedai-llm manager -----
 
 class FakeManager(_FakeServer):
-    """Speaks just enough of miniclosedai-llm's /api/models for the
-    auto-register endpoint to find a served model."""
+    """Speaks enough of the miniclosedai-llm manager API for BOTH the
+    auto-register flow and the /api/llm/* proxy: /api/models (modern
+    {"models": [...]} shape), /api/health, /api/gpu, /api/cache, plus a
+    capture-all for POSTs. Records the Authorization header so the proxy's
+    server-side bearer injection is assertable."""
 
     def _handler_class(self):
+        captured = self.captured
         outer = self
+
         class H(BaseHTTPRequestHandler):
             def log_message(self, *a, **kw): pass
+
+            def _reply(self, status, body, ct="application/json"):
+                self.send_response(status)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
-                if self.path == "/api/models":
-                    body = json.dumps([
+                captured.append({"path": self.path, "method": "GET",
+                                 "auth": self.headers.get("Authorization")})
+                routes = {
+                    "/api/models": {"models": [
                         {
                             "id": "qwen3-vl-8b",
                             "served_name": "qwen3-vl-8b",
                             "hf_id": "Qwen/Qwen3-VL-8B-Instruct",
                             "status": "running",
+                            "ready": True,
+                            "multimodal": True,
+                            "port": 8001,
+                            "source": "custom",
                             "base_url": "http://localhost:8001/v1",
                             "alt_base_url": "http://host.docker.internal:8001/v1",
                         },
@@ -5136,17 +5277,34 @@ class FakeManager(_FakeServer):
                             "served_name": "stopped-model",
                             "hf_id": "Foo/Bar",
                             "status": "stopped",
+                            "ready": False,
+                            "multimodal": False,
+                            "port": 8002,
+                            "source": "custom",
                             "base_url": "http://localhost:8002/v1",
                             "alt_base_url": "http://host.docker.internal:8002/v1",
                         },
-                    ]).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                    return
-                self.send_response(404); self.end_headers()
+                    ]},
+                    "/api/health": {"engine": "docker", "gpu_ok": True,
+                                    "dashboard_url": outer.base_url},
+                    "/api/gpu": {"gpus": [{"index": 0, "name": "FakeGPU",
+                                           "mem_total_mb": 1000, "mem_used_mb": 100,
+                                           "util_pct": 5}]},
+                    "/api/cache": {"models": [], "total_gb": 0, "hf_home": "/tmp/hf"},
+                }
+                body = routes.get(self.path)
+                if body is None:
+                    self._reply(404, b'{"detail": "nope"}'); return
+                self._reply(200, json.dumps(body).encode())
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b""
+                captured.append({"path": self.path, "method": "POST",
+                                 "auth": self.headers.get("Authorization"),
+                                 "body": raw.decode(errors="replace")})
+                self._reply(200, json.dumps({"ok": True}).encode())
+
         return H
 
 

@@ -339,6 +339,14 @@ uvicorn app:app --host 127.0.0.1 --port 8095
 
 Open **http://localhost:8095**.
 
+**One command for the whole stack:** on a machine with an NVIDIA GPU + CUDA, `./dev.sh up`
+brings all three systems online together — the **voice service** (ASR + TTS,
+sibling repo `miniclosedai-voice`), the **LLM model server** (`miniclosedai-llm`,
+engine auto-detected), and **MiniClosedAI** itself. `./dev.sh status` shows all three;
+`./dev.sh down` stops only the app (voice + models stay warm). The Models and Voice
+Studio tabs in the activity bar are the GUIs for the two siblings — no separate
+dashboards needed.
+
 ---
 
 ## Your first bot — 60 seconds
@@ -485,6 +493,8 @@ Vertical nav with three icons — clicking swaps the main content area without u
 
 - **Bots** (top, message-square icon) — the home for everything chat-related. Shows a searchable list of every saved conversation; click a card to enter that chat. The icon stays highlighted whether you're on the list OR inside a chat (chats are children of Bots, not a sibling tab). A small **pulse dot** on this icon lights up when a bot has a streaming or unread reply you haven't seen yet.
 - **Logs** (middle, terminal icon) — live LM-Studio-style viewer of every chat request and response across all endpoints. See [Logs page](#logs-page) below.
+- **Models** (CPU-chip icon) — the **miniclosedai-llm** model server as a first-class page: analyze any HuggingFace model (type/size/fits verdict), download & run it with vLLM (11 advanced fields), watch per-model live logs, quick-test it (text or vision), manage the on-disk weight cache, and **register a ready model as a backend in one click** — it appears in every model picker immediately. All traffic flows through a same-origin `/api/llm/*` proxy, so the manager stays its own process (auto-started by `./dev.sh up` on a CUDA machine); when it's down the tab shows a friendly hint instead of errors.
+- **Voice Studio** (mic icon) — the **miniclosedai-voice** voice manager as a first-class page: pick any registered voice service (local or remote/RunPod), see its health (ASR/TTS models, device, relay capability), browse the voice catalog per language, **clone a new voice** by recording a sample in the browser (or uploading audio — decoded, downmixed, and WAV-encoded client-side), and delete clones. New voices appear in the chat voice picker instantly. Proxied via `/api/voicestudio/{backend}/*` with the backend's API key injected server-side.
 - **Theme toggle** (bottom, sits on top of the gear) — cycles System → Light → Dark → System. Respects `prefers-color-scheme` while on System.
 - **Settings** (bottom, gear icon) — register and manage LLM endpoints (see [Connecting LM Studio and other endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)). Also home to **Instance identity**: give this installation a name (becomes the browser-tab title) and a description (revealed when hovering the tab) — stored server-side, so multiple MiniClosedAI instances stay tellable apart from the tab strip alone.
 

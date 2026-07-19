@@ -1100,6 +1100,26 @@ Lists Ollama models available locally.
 }
 ```
 
+### Sibling-service proxies (Models tab + Voice Studio tab)
+
+The Models and Voice Studio pages are native UIs for the sibling services; the browser
+only ever talks to this origin. Both proxies stream (JSON, SSE, multipart) and inject
+auth server-side.
+
+```
+GET/POST/DELETE /api/llm/{path}                → miniclosedai-llm manager /api/{path}
+                                                 (allowlist: health, gpu, models, analyze,
+                                                  cache, test-image; SSE logs pass through)
+GET             /api/llm-info                  → {manager_url, reachable}
+GET/POST/DELETE /api/voicestudio/{bid}/{path}  → registered kind='voice' backend {bid}
+                                                 (allowlist: health, voices, api/connect-info;
+                                                  row's api_key injected as Bearer)
+```
+
+Manager location: `MINICLOSEDAI_LLM_MANAGER_URL` (default `http://localhost:8099`),
+optional `MINICLOSEDAI_LLM_MANAGER_KEY` bearer. Unreachable manager → 502 with a
+`./dev.sh up` hint (`dev.sh up` starts voice + LLM manager + app together on a CUDA box).
+
 ### Instance identity
 
 ```

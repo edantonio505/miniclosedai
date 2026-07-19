@@ -740,8 +740,12 @@ async def api_auto_register_backend(data: BackendAutoRegister):
             f"miniclosedai-llm returned HTTP {e.response.status_code} on /api/models",
         )
 
+    # Accept both manager response shapes: current builds return
+    # {"models": [...]}; older ones returned a bare list.
+    if isinstance(models, dict):
+        models = models.get("models")
     if not isinstance(models, list):
-        raise HTTPException(502, "miniclosedai-llm /api/models response was not a list")
+        raise HTTPException(502, "miniclosedai-llm /api/models response was not a model list")
 
     # Match by served_name first (what users actually pass on the CLI), then
     # fall back to hf_id (so `Qwen/Qwen3-VL-8B-Instruct` works without knowing
@@ -794,6 +798,134 @@ async def api_auto_register_backend(data: BackendAutoRegister):
     # Echo the served-model name so the caller can use it as the bot's `model`.
     out["served_model"] = match.get("served_name") or data.model_id
     return out
+
+
+# ---------- Sibling-service proxies (Models tab + Voice Studio tab) ----------
+#
+# The Models and Voice Studio pages are native ports of the miniclosedai-llm
+# dashboard and miniclosedai-voice "Voice Studio" — the sibling services stay
+# separate processes, but their UIs live HERE. The browser only ever talks to
+# this origin; these proxies forward to the sibling and solve, server-side,
+# everything an iframe/cross-origin approach would trip on: mixed content
+# (this app is https, the manager is http), self-signed certs on remote voice
+# pods, and bearer-token injection (the browser never sees sibling API keys).
+
+LLM_MANAGER_URL = os.environ.get(
+    "MINICLOSEDAI_LLM_MANAGER_URL", "http://localhost:8099"
+).rstrip("/")
+_LLM_MANAGER_KEY = os.environ.get("MINICLOSEDAI_LLM_MANAGER_KEY", "").strip()
+
+# Only the manager endpoints the Models page actually uses — a proxy, not an
+# open relay. Prefix match on the first path segment(s).
+_LLM_PROXY_ALLOWED = ("health", "gpu", "models", "analyze", "cache", "test-image")
+
+_VOICESTUDIO_ALLOWED = ("health", "voices", "api/connect-info")
+
+
+def _proxy_path_allowed(path: str, allowed: tuple) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in allowed)
+
+
+async def _proxy_stream(request: Request, upstream_url: str, *, headers: dict,
+                        verify: bool, unreachable_hint: str):
+    """Forward `request` to `upstream_url` and stream the response back.
+
+    One code path covers JSON, SSE (model logs), and binary (test-image):
+    the upstream response is re-yielded chunk-by-chunk with buffering off.
+    Request bodies (JSON or multipart uploads) are streamed through untouched
+    with the original Content-Type. The client for streaming responses must
+    outlive this function's scope, so it's closed in the generator's finally.
+    """
+    fwd_headers = dict(headers)
+    for h in ("content-type",):
+        v = request.headers.get(h)
+        if v:
+            fwd_headers[h] = v
+    client = httpx.AsyncClient(verify=verify, timeout=httpx.Timeout(300.0, connect=10.0))
+    try:
+        body = request.stream() if request.method in ("POST", "PUT", "PATCH") else None
+        req = client.build_request(request.method, upstream_url,
+                                   headers=fwd_headers, content=body)
+        resp = await client.send(req, stream=True)
+    except httpx.HTTPError:
+        await client.aclose()
+        raise HTTPException(502, unreachable_hint)
+
+    async def gen():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    passthrough = {
+        k: v for k, v in resp.headers.items()
+        if k.lower() in ("content-type", "content-disposition")
+    }
+    passthrough.setdefault("Cache-Control", "no-cache")
+    passthrough["X-Accel-Buffering"] = "no"
+    return StreamingResponse(gen(), status_code=resp.status_code, headers=passthrough)
+
+
+@app.api_route("/api/llm/{path:path}", methods=["GET", "POST", "DELETE"])
+async def api_llm_proxy(path: str, request: Request):
+    """Same-origin proxy to the miniclosedai-llm manager (Models tab)."""
+    if not _proxy_path_allowed(path, _LLM_PROXY_ALLOWED):
+        raise HTTPException(404, f"path not proxied: {path!r}")
+    headers = {}
+    if _LLM_MANAGER_KEY:
+        headers["Authorization"] = f"Bearer {_LLM_MANAGER_KEY}"
+    return await _proxy_stream(
+        request, f"{LLM_MANAGER_URL}/api/{path}",
+        headers=headers, verify=True,
+        unreachable_hint=(
+            f"Model manager not running at {LLM_MANAGER_URL} — start it with "
+            "./dev.sh up (or set MINICLOSEDAI_LLM_MANAGER_URL)."
+        ),
+    )
+
+
+@app.get("/api/llm-info")
+async def api_llm_info():
+    """Models-tab bootstrap: where the manager lives + whether it's up.
+    The manager URL is also what the Register-as-backend flow passes to
+    /api/backends/auto-register."""
+    reachable = False
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{LLM_MANAGER_URL}/api/health",
+                                 headers={"Authorization": f"Bearer {_LLM_MANAGER_KEY}"}
+                                 if _LLM_MANAGER_KEY else {})
+            reachable = r.status_code == 200
+    except httpx.HTTPError:
+        pass
+    return {"manager_url": LLM_MANAGER_URL, "reachable": reachable}
+
+
+@app.api_route("/api/voicestudio/{backend_id}/{path:path}", methods=["GET", "POST", "DELETE"])
+async def api_voicestudio_proxy(backend_id: int, path: str, request: Request):
+    """Same-origin proxy to a REGISTERED voice backend (Voice Studio tab).
+
+    Targets whichever kind='voice' backend row the tab has selected — so the
+    catalog of a remote RunPod voice pod is manageable from here exactly like
+    the local one. The row's api_key (if any) is injected server-side."""
+    if not _proxy_path_allowed(path, _VOICESTUDIO_ALLOWED):
+        raise HTTPException(404, f"path not proxied: {path!r}")
+    backend = _load_backend(backend_id)
+    if backend.get("kind") != "voice":
+        raise HTTPException(400, f"Backend #{backend_id} is not a voice backend.")
+    if not backend.get("enabled"):
+        raise HTTPException(400, f"Voice backend #{backend_id} is disabled.")
+    headers = {}
+    if backend.get("api_key"):
+        headers["Authorization"] = f"Bearer {backend['api_key']}"
+    base = (backend.get("base_url") or "").rstrip("/")
+    return await _proxy_stream(
+        request, f"{base}/{path}",
+        headers=headers, verify=False,   # self-signed certs on voice services
+        unreachable_hint=f"Voice service '{backend.get('name')}' not reachable at {base}.",
+    )
 
 
 @app.patch("/api/backends/{backend_id}")
