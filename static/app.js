@@ -4575,6 +4575,24 @@ function initCallButton() {
 // when the modal was opened from a bot card's `</>` button on the Bots list.
 // Cleared in closeModal so a subsequent topbar open uses the live conversation.
 let _modalConvId = null;
+
+// API token baked into copied snippets when authentication is enabled — so a
+// pasted snippet works immediately instead of landing in the "connections
+// needing attention" list. Refreshed on every modal open (cheap, and stays
+// correct across token regeneration). null = auth off → snippets unchanged.
+let _apiCodeToken = null;
+async function _refreshApiCodeToken() {
+  const before = _apiCodeToken;
+  _apiCodeToken = null;
+  try {
+    if (_authState.enabled && _authState.loggedIn) {
+      const r = await fetch("/api/auth/token");
+      if (r.ok) _apiCodeToken = (await r.json()).api_token || null;
+    }
+  } catch (e) {}
+  if (_apiCodeToken !== before) paintSnippet();   // repaint if it changed mid-open
+}
+
 function buildCodeSnippet(tab, mode, style) {
   const base = window.location.origin;
   const convId = _modalConvId != null ? _modalConvId : state.conversationId;
@@ -4596,25 +4614,33 @@ async function openApiCodeForConv(convId) {
   _modalConvId = convId;
   paintSnippet();
   els.modalBackdrop.classList.remove("hidden");
+  _refreshApiCodeToken();   // repaints with the bearer once fetched (auth on)
 }
 
 function buildNativeSnippet(tab, mode, base, convId) {
   const msg = "Hello!";
+  const tok = _apiCodeToken;
   const streamUrl = `${base}/api/conversations/${convId}/chat/stream`;
   const syncUrl = `${base}/api/conversations/${convId}/chat`;
   const header = `# Chat #${convId}. Config (model, system prompt, temperature, max_tokens,\n# top_p, top_k, thinking) is set in the GUI — this call only supplies the message.`;
+  // Auth (when enabled): the copied code carries the instance's API token so
+  // it authenticates immediately instead of tripping the grace-mode alerts.
+  const curlAuth = tok ? `\n  -H "Authorization: Bearer ${tok}" \\` : "";
+  const pyHeaders = tok ? `\nHEADERS = {"Authorization": "Bearer ${tok}"}` : "";
+  const pyKw = tok ? ", headers=HEADERS" : "";
+  const jsAuth = tok ? `, "Authorization": "Bearer ${tok}"` : "";
 
   // ---- cURL ----
   if (tab === "curl") {
     if (mode === "stream") {
       return `${header}
 curl -N -X POST ${streamUrl} \\
-  -H "Content-Type: application/json" \\
+  -H "Content-Type: application/json" \\${curlAuth}
   -d '{"message": "${msg}"}'`;
     }
     return `${header}
 curl -X POST ${syncUrl} \\
-  -H "Content-Type: application/json" \\
+  -H "Content-Type: application/json" \\${curlAuth}
   -d '{"message": "${msg}"}'`;
   }
 
@@ -4624,9 +4650,9 @@ curl -X POST ${syncUrl} \\
       return `import json
 import requests
 
-URL = "${streamUrl}"
+URL = "${streamUrl}"${pyHeaders}
 
-with requests.post(URL, json={"message": "${msg}"}, stream=True, timeout=None) as r:
+with requests.post(URL, json={"message": "${msg}"}, stream=True, timeout=None${pyKw}) as r:
     for line in r.iter_lines(decode_unicode=True):
         if not line:
             continue  # SSE keep-alives are empty lines
@@ -4639,9 +4665,9 @@ with requests.post(URL, json={"message": "${msg}"}, stream=True, timeout=None) a
     }
     return `import requests
 
-URL = "${syncUrl}"
+URL = "${syncUrl}"${pyHeaders}
 
-response = requests.post(URL, json={"message": "${msg}"}, timeout=120).json()
+response = requests.post(URL, json={"message": "${msg}"}, timeout=120${pyKw}).json()
 print(response["response"])`;
   }
 
@@ -4650,7 +4676,7 @@ print(response["response"])`;
     if (mode === "stream") {
       return `const res = await fetch("${streamUrl}", {
   method: "POST",
-  headers: { "Content-Type": "application/json" },
+  headers: { "Content-Type": "application/json"${jsAuth} },
   body: JSON.stringify({ message: "${msg}" }),
 });
 
@@ -4673,7 +4699,7 @@ while (true) {
     }
     return `const { response } = await fetch("${syncUrl}", {
   method: "POST",
-  headers: { "Content-Type": "application/json" },
+  headers: { "Content-Type": "application/json"${jsAuth} },
   body: JSON.stringify({ message: "${msg}" }),
 }).then(r => r.json());
 
@@ -4688,17 +4714,21 @@ console.log(response);`;
 // the server in favor of the bot's GUI-saved config.
 function buildOpenAISnippet(tab, mode, base, convId) {
   const msg = "Hello!";
+  const tok = _apiCodeToken;
   const url = `${base}/v1/chat/completions`;
   const header = `# OpenAI-compatible. Use the conversation ID as 'model'. The bot's saved
 # config (model, system prompt, temperature, etc.) is the source of truth —
 # any caller-provided sampling params are ignored by the server.`;
+  const curlAuth = tok ? `\n  -H "Authorization: Bearer ${tok}" \\` : "";
+  // With auth enabled the token IS the OpenAI api_key; otherwise any string works.
+  const sdkKey = tok || "not-required";
 
   // ---- cURL ----
   if (tab === "curl") {
     if (mode === "stream") {
       return `${header}
 curl -N -X POST ${url} \\
-  -H "Content-Type: application/json" \\
+  -H "Content-Type: application/json" \\${curlAuth}
   -d '{
     "model": "${convId}",
     "messages": [{"role":"user","content":"${msg}"}],
@@ -4707,7 +4737,7 @@ curl -N -X POST ${url} \\
     }
     return `${header}
 curl -X POST ${url} \\
-  -H "Content-Type: application/json" \\
+  -H "Content-Type: application/json" \\${curlAuth}
   -d '{
     "model": "${convId}",
     "messages": [{"role":"user","content":"${msg}"}]
@@ -4721,7 +4751,7 @@ curl -X POST ${url} \\
 from openai import OpenAI
 
 # Drop-in for OpenAI: point base_url at MiniClosedAI, use chat id as 'model'.
-client = OpenAI(base_url="${base}/v1", api_key="not-required")
+client = OpenAI(base_url="${base}/v1", api_key="${sdkKey}")
 
 stream = client.chat.completions.create(
     model="${convId}",
@@ -4736,7 +4766,7 @@ for chunk in stream:
     return `# pip install openai
 from openai import OpenAI
 
-client = OpenAI(base_url="${base}/v1", api_key="not-required")
+client = OpenAI(base_url="${base}/v1", api_key="${sdkKey}")
 
 response = client.chat.completions.create(
     model="${convId}",
@@ -4753,7 +4783,7 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   baseURL: "${base}/v1",
-  apiKey: "not-required",
+  apiKey: "${sdkKey}",
 });
 
 const stream = await client.chat.completions.create({
@@ -4772,7 +4802,7 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   baseURL: "${base}/v1",
-  apiKey: "not-required",
+  apiKey: "${sdkKey}",
 });
 
 const response = await client.chat.completions.create({
@@ -4823,6 +4853,7 @@ async function openModal() {
   await flushPendingSave();
   paintSnippet();
   els.modalBackdrop.classList.remove("hidden");
+  _refreshApiCodeToken();   // repaints with the bearer once fetched (auth on)
 }
 function closeModal() {
   els.modalBackdrop.classList.add("hidden");

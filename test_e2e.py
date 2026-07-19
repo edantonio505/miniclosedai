@@ -2459,6 +2459,7 @@ def _():
         "vsLoadVoices", "vsSaveVoice", "_vsEncodeWav",
         # Security (opt-in auth + grace-mode alerts)
         "initSecurityUI", "loadAuthState", "_loadAuthAlerts", "_refreshAuthAlertDot",
+        "_refreshApiCodeToken",   # token baked into the API-code snippets
         # Application export / import — mirrors the bot pattern at the apps level.
         "_handleAppImportFile", "_runAppImport", "_downloadApp",
         "initAppsImportUI",
