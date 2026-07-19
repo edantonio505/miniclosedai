@@ -8,10 +8,13 @@ lives in llm.py — this module is HTTP routing + persistence.
 import asyncio
 import base64
 import csv
+import hashlib
+import hmac
 import io
 import json
 import logging
 import os
+import secrets
 import re
 import subprocess
 import sys
@@ -121,6 +124,321 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------- Authentication (opt-in, grace-mode API enforcement) ----------
+#
+# Auth is OFF until an account is created in Settings → Security (users table
+# empty = app wide open, exactly as before). Once enabled:
+#   - The browser gets a session cookie; `/` serves the landing page without one.
+#   - Programmatic clients send `Authorization: Bearer <api_token>`.
+#   - Requests with NEITHER are **not blocked** — they're recorded in
+#     auth_alerts ("connections needing attention" in Settings) so software
+#     already wired to this instance keeps working while it's migrated.
+
+_SESSION_COOKIE = "mca_session"
+_SESSION_IDLE_DAYS = 30
+_auth_state_cache: dict = {"enabled": None}   # None = unknown, recheck
+
+
+def _auth_invalidate_cache() -> None:
+    _auth_state_cache["enabled"] = None
+
+
+def _auth_enabled() -> bool:
+    if _auth_state_cache["enabled"] is None:
+        with db.get_conn() as conn:
+            row = conn.execute("SELECT 1 FROM users WHERE id = 1").fetchone()
+        _auth_state_cache["enabled"] = row is not None
+    return _auth_state_cache["enabled"]
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    h = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
+    return f"{salt.hex()}${h.hex()}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        salt_hex, hash_hex = stored.split("$", 1)
+        h = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex),
+                           n=2**14, r=8, p=1)
+        return hmac.compare_digest(h.hex(), hash_hex)
+    except (ValueError, TypeError):
+        return False
+
+
+def _load_user() -> dict | None:
+    with db.get_conn() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = 1").fetchone()
+    return dict(row) if row else None
+
+
+def _session_valid(request: Request) -> bool:
+    token = request.cookies.get(_SESSION_COOKIE)
+    if not token:
+        return False
+    with db.get_conn() as conn:
+        row = conn.execute("SELECT token FROM sessions WHERE token = ?", (token,)).fetchone()
+        if not row:
+            return False
+        conn.execute("UPDATE sessions SET last_seen = datetime('now') WHERE token = ?", (token,))
+        # Lazy prune of long-idle sessions.
+        conn.execute(
+            f"DELETE FROM sessions WHERE last_seen < datetime('now', '-{_SESSION_IDLE_DAYS} days')"
+        )
+        conn.commit()
+    return True
+
+
+def _bearer_valid(request: Request) -> bool:
+    auth = request.headers.get("Authorization") or ""
+    if not auth.startswith("Bearer "):
+        return False
+    user = _load_user()
+    if not user:
+        return False
+    return hmac.compare_digest(auth[7:].strip(), user["api_token"])
+
+
+def _record_auth_alert(request: Request) -> None:
+    """Grace mode: note an unauthenticated API request so Settings can surface
+    "this connection needs attention". Deduped by (ip, method, path); repeats
+    bump count/last_seen. Never raises — alerting must not break the request."""
+    try:
+        ip = request.client.host if request.client else "?"
+        path = request.url.path
+        method = request.method
+        fp = f"{ip}|{method}|{path}"
+        ua = (request.headers.get("User-Agent") or "")[:200]
+        with db.get_conn() as conn:
+            conn.execute(
+                """INSERT INTO auth_alerts
+                     (fingerprint, method, path, ip, user_agent, first_seen, last_seen)
+                   VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+                   ON CONFLICT(fingerprint) DO UPDATE SET
+                     count = count + 1,
+                     last_seen = datetime('now'),
+                     user_agent = excluded.user_agent,
+                     dismissed = 0""",
+                (fp, method, path, ip, ua),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+# Paths the middleware never touches: the auth endpoints themselves, the page
+# shells + assets (the landing/index branch lives in index()), and docs.
+_AUTH_EXEMPT_PREFIXES = ("/api/auth/", "/static/", "/docs", "/openapi.json")
+_AUTH_EXEMPT_EXACT = ("/", "/favicon.svg", "/favicon.ico")
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    if not _auth_enabled():
+        return await call_next(request)
+    path = request.url.path
+    if path in _AUTH_EXEMPT_EXACT or any(path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES):
+        return await call_next(request)
+    if _session_valid(request):
+        request.state.auth = "session"
+    elif _bearer_valid(request):
+        request.state.auth = "token"
+    else:
+        request.state.auth = None
+        if path.startswith("/api/") or path.startswith("/v1/"):
+            _record_auth_alert(request)
+    return await call_next(request)
+
+
+def _require_session(request: Request) -> None:
+    """Hard gate for the auth-management endpoints themselves (token reveal,
+    regenerate, disable, alerts) — these must never ride grace mode."""
+    if not _auth_enabled():
+        raise HTTPException(400, "Authentication is not enabled.")
+    if not _session_valid(request):
+        raise HTTPException(401, "Sign in required.")
+
+
+class AuthSetup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    username: str = Field(..., min_length=1, max_length=60)
+    password: str = Field(..., min_length=6, max_length=200)
+
+
+class AuthLogin(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    username: str
+    password: str
+
+
+class AuthPassword(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    password: str
+
+
+class AuthChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    current_password: str
+    new_password: str = Field(..., min_length=6, max_length=200)
+
+
+class AuthDismiss(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fingerprint: str
+
+
+def _start_session(response: Response, request: Request) -> None:
+    token = secrets.token_urlsafe(32)
+    with db.get_conn() as conn:
+        conn.execute("INSERT INTO sessions (token) VALUES (?)", (token,))
+        conn.commit()
+    response.set_cookie(
+        _SESSION_COOKIE, token,
+        httponly=True, samesite="lax",
+        secure=(request.url.scheme == "https"),
+        # No max_age → browser-session cookie: survives refreshes, dies when
+        # the browser closes (the chosen sign-in lifetime).
+    )
+
+
+@app.get("/api/auth/state")
+def api_auth_state(request: Request):
+    """Lightweight bootstrap: is auth enabled, and is THIS caller signed in?"""
+    enabled = _auth_enabled()
+    logged_in = enabled and _session_valid(request)
+    out = {"enabled": enabled, "logged_in": logged_in}
+    if logged_in:
+        user = _load_user()
+        out["username"] = user["username"] if user else None
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM auth_alerts WHERE dismissed = 0"
+            ).fetchone()
+        out["alert_count"] = row[0]
+    return out
+
+
+@app.post("/api/auth/setup", status_code=201)
+def api_auth_setup(data: AuthSetup, request: Request, response: Response):
+    """Create THE account (single-user). Starts a session immediately so
+    enabling auth doesn't lock the user out of their own tab. Returns the API
+    token once — Settings shows it with a 'copy it now'."""
+    if _auth_enabled():
+        raise HTTPException(409, "An account already exists. Sign in instead.")
+    api_token = secrets.token_urlsafe(32)
+    with db.get_conn() as conn:
+        conn.execute(
+            "INSERT INTO users (id, username, password_hash, api_token) VALUES (1, ?, ?, ?)",
+            (data.username.strip(), _hash_password(data.password), api_token),
+        )
+        conn.commit()
+    _auth_invalidate_cache()
+    _start_session(response, request)
+    return {"ok": True, "username": data.username.strip(), "api_token": api_token}
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(data: AuthLogin, request: Request, response: Response):
+    user = _load_user()
+    if (not user or user["username"] != data.username.strip()
+            or not _verify_password(data.password, user["password_hash"])):
+        await asyncio.sleep(0.5)   # blunt brute-force throttle
+        raise HTTPException(401, "Wrong username or password.")
+    _start_session(response, request)
+    return {"ok": True, "username": user["username"]}
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout(request: Request, response: Response):
+    token = request.cookies.get(_SESSION_COOKIE)
+    if token:
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            conn.commit()
+    response.delete_cookie(_SESSION_COOKIE)
+    return {"ok": True}
+
+
+@app.get("/api/auth/token")
+def api_auth_token(request: Request):
+    _require_session(request)
+    user = _load_user()
+    return {"api_token": user["api_token"]}
+
+
+@app.post("/api/auth/token/regenerate")
+def api_auth_token_regenerate(request: Request):
+    _require_session(request)
+    token = secrets.token_urlsafe(32)
+    with db.get_conn() as conn:
+        conn.execute("UPDATE users SET api_token = ? WHERE id = 1", (token,))
+        conn.commit()
+    return {"api_token": token}
+
+
+@app.post("/api/auth/change")
+def api_auth_change(data: AuthChange, request: Request):
+    _require_session(request)
+    user = _load_user()
+    if not _verify_password(data.current_password, user["password_hash"]):
+        raise HTTPException(401, "Current password is wrong.")
+    with db.get_conn() as conn:
+        conn.execute("UPDATE users SET password_hash = ? WHERE id = 1",
+                     (_hash_password(data.new_password),))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/auth/disable")
+def api_auth_disable(data: AuthPassword, request: Request, response: Response):
+    """Turn auth off entirely (password-confirmed) — back to the open app."""
+    _require_session(request)
+    user = _load_user()
+    if not _verify_password(data.password, user["password_hash"]):
+        raise HTTPException(401, "Password is wrong.")
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM users")
+        conn.execute("DELETE FROM sessions")
+        conn.execute("DELETE FROM auth_alerts")
+        conn.commit()
+    _auth_invalidate_cache()
+    response.delete_cookie(_SESSION_COOKIE)
+    return {"ok": True}
+
+
+@app.get("/api/auth/alerts")
+def api_auth_alerts(request: Request):
+    _require_session(request)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT fingerprint, method, path, ip, user_agent,
+                      first_seen, last_seen, count
+               FROM auth_alerts WHERE dismissed = 0
+               ORDER BY last_seen DESC LIMIT 200"""
+        ).fetchall()
+    return {"alerts": [dict(r) for r in rows]}
+
+
+@app.post("/api/auth/alerts/dismiss")
+def api_auth_alerts_dismiss(data: AuthDismiss, request: Request):
+    _require_session(request)
+    with db.get_conn() as conn:
+        conn.execute("UPDATE auth_alerts SET dismissed = 1 WHERE fingerprint = ?",
+                     (data.fingerprint,))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/auth/alerts/clear")
+def api_auth_alerts_clear(request: Request):
+    _require_session(request)
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM auth_alerts")
+        conn.commit()
+    return {"ok": True}
 
 
 # ---------- Schemas ----------
@@ -5576,8 +5894,15 @@ app.mount("/static", _NoCacheStatics(directory=STATIC_DIR), name="static")
 
 
 @app.get("/")
-def index():
-    resp = FileResponse(STATIC_DIR / "index.html")
+def index(request: Request):
+    # Auth gate for the app shell: with an account created and no valid
+    # session, serve the landing page (project blurb + sign-in) INSTEAD of the
+    # SPA — no flash of the real UI, no client-side redirect dance. With auth
+    # disabled (default), this is exactly the old open behavior.
+    page = "index.html"
+    if _auth_enabled() and not _session_valid(request):
+        page = "landing.html"
+    resp = FileResponse(STATIC_DIR / page)
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
 

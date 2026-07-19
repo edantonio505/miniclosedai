@@ -136,12 +136,25 @@ function trimSlash(u: string): string {
   return u.replace(/\\/+$/, "");
 }
 
+/** Optional bearer for MiniClosedAI installs with authentication enabled
+ *  (Settings → Security). Unset = requests are sent without auth, which the
+ *  server allows in grace mode (they show up as "connections needing
+ *  attention" for the instance owner). */
+export let API_KEY: string | undefined;
+export function setApiKey(key: string | undefined): void { API_KEY = key; }
+
+function authHeaders(): Record<string, string> {
+  const h: Record<string, string> = { "Content-Type": "application/json" };
+  if (API_KEY) h["Authorization"] = `Bearer ${API_KEY}`;
+  return h;
+}
+
 async function request<T = any>(method: string, url: string, payload?: unknown): Promise<T> {
   let res: Response;
   try {
     res = await fetch(url, {
       method,
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: payload !== undefined ? JSON.stringify(payload) : undefined,
     });
   } catch (e) {
@@ -187,7 +200,7 @@ export class Bot {
     try {
       res = await fetch(`${base}/api/conversations/${this.id}/chat/stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify({
           message,
           include_history: opts.history ?? true,
@@ -427,12 +440,23 @@ function trimSlash(u) {
   return u.replace(/\\/+$/, "");
 }
 
+/** Optional bearer for MiniClosedAI installs with authentication enabled
+ *  (Settings → Security). Unset = grace mode on the server side. */
+export let API_KEY = process?.env?.MINICLOSEDAI_API_KEY || undefined;
+export function setApiKey(key) { API_KEY = key; }
+
+function authHeaders() {
+  const h = { "Content-Type": "application/json" };
+  if (API_KEY) h["Authorization"] = `Bearer ${API_KEY}`;
+  return h;
+}
+
 async function request(method, url, payload) {
   let res;
   try {
     res = await fetch(url, {
       method,
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: payload !== undefined ? JSON.stringify(payload) : undefined,
     });
   } catch (e) {
@@ -475,7 +499,7 @@ export class Bot {
     try {
       res = await fetch(`${base}/api/conversations/${this.id}/chat/stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify({
           message,
           include_history: opts.history ?? true,
@@ -756,10 +780,28 @@ class MiniClosedAIError(RuntimeError):
     """Raised on a non-2xx response or an unreachable server."""
 
 
+# Optional bearer for MiniClosedAI installs with authentication enabled
+# (Settings -> Security). Falls back to the MINICLOSEDAI_API_KEY env var.
+# Unset = requests go without auth; the server allows them in grace mode.
+API_KEY = os.environ.get("MINICLOSEDAI_API_KEY") or None
+
+
+def set_api_key(key):
+    global API_KEY
+    API_KEY = key
+
+
+def _headers():
+    h = {"Content-Type": "application/json"}
+    if API_KEY:
+        h["Authorization"] = f"Bearer {API_KEY}"
+    return h
+
+
 def _request(method, url, payload=None, timeout=300.0):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
-        url, data=data, method=method, headers={"Content-Type": "application/json"}
+        url, data=data, method=method, headers=_headers()
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -812,7 +854,7 @@ class Bot:
         ).encode()
         req = urllib.request.Request(
             f"{self.base_url}/api/conversations/{self.id}/chat/stream",
-            data=payload, method="POST", headers={"Content-Type": "application/json"},
+            data=payload, method="POST", headers=_headers(),
         )
         with urllib.request.urlopen(req, timeout=300) as r:
             for raw in r:

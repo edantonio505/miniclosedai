@@ -5962,6 +5962,7 @@ function applyActivePage(page) {
   if (typeof _refreshUnreadUI === "function") _refreshUnreadUI();
   if (p === "settings" && typeof renderSettingsPage === "function") {
     renderSettingsPage();
+    if (typeof loadAuthState === "function") loadAuthState();
   }
   if (p === "bots" && typeof onBotsPageEntered === "function") {
     onBotsPageEntered();
@@ -7963,6 +7964,210 @@ function initVoiceStudioPage() {
 }
 
 // =====================================================================
+// Security (Settings → Security). Opt-in auth: create the account here;
+// afterwards the server serves the landing page to signed-out visitors and
+// expects a bearer token on the API — in GRACE MODE: unauthenticated API
+// requests still work but land in the "connections needing attention" list.
+// =====================================================================
+const _authState = { enabled: false, loggedIn: false, alertCount: 0, pollTimer: null };
+
+function _setText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+function _refreshAuthAlertDot() {
+  const dot = document.getElementById("settings-alert-dot");
+  if (dot) dot.hidden = !(_authState.enabled && _authState.alertCount > 0);
+}
+
+async function loadAuthState() {
+  try {
+    const r = await fetch("/api/auth/state");
+    if (!r.ok) return;
+    const j = await r.json();
+    _authState.enabled = !!j.enabled;
+    _authState.loggedIn = !!j.logged_in;
+    _authState.alertCount = j.alert_count || 0;
+    _authState.username = j.username || "";
+  } catch (e) { return; }
+  _refreshAuthAlertDot();
+  _renderSecuritySection();
+}
+
+function _renderSecuritySection() {
+  const setup = document.getElementById("auth-setup-box");
+  const manage = document.getElementById("auth-manage-box");
+  const signout = document.getElementById("auth-signout-btn");
+  if (!setup || !manage) return;
+  setup.hidden = _authState.enabled;
+  manage.hidden = !(_authState.enabled && _authState.loggedIn);
+  if (signout) signout.hidden = !(_authState.enabled && _authState.loggedIn);
+  if (_authState.loggedIn) {
+    _setText("auth-username", _authState.username || "");
+    _loadAuthAlerts();
+  }
+}
+
+async function _loadAuthAlerts() {
+  const list = document.getElementById("auth-alerts-list");
+  const empty = document.getElementById("auth-alerts-empty");
+  if (!list) return;
+  let alerts = [];
+  try {
+    const r = await fetch("/api/auth/alerts");
+    if (r.ok) alerts = (await r.json()).alerts || [];
+  } catch (e) {}
+  _authState.alertCount = alerts.length;
+  _refreshAuthAlertDot();
+  _setText("auth-alert-count", alerts.length ? `· ${alerts.length}` : "");
+  list.innerHTML = "";
+  if (empty) empty.hidden = alerts.length > 0;
+  for (const a of alerts) {
+    const row = document.createElement("div");
+    row.className = "auth-alert-row";
+    const meta = document.createElement("div");
+    meta.className = "auth-alert-meta";
+    meta.innerHTML =
+      `<code>${escapeHtml(a.method)} ${escapeHtml(a.path)}</code>` +
+      `<span class="mp-dim"> from ${escapeHtml(a.ip)} · ×${a.count} · last ${escapeHtml(a.last_seen)}` +
+      (a.user_agent ? ` · ${escapeHtml(a.user_agent.slice(0, 60))}` : "") + `</span>`;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-small";
+    btn.textContent = "Dismiss";
+    btn.addEventListener("click", async () => {
+      try {
+        await fetch("/api/auth/alerts/dismiss", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fingerprint: a.fingerprint }),
+        });
+      } catch (e) {}
+      _loadAuthAlerts();
+    });
+    row.append(meta, btn);
+    list.appendChild(row);
+  }
+}
+
+async function _authPost(path, body) {
+  const r = await fetch(path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  if (!r.ok) {
+    let d = `HTTP ${r.status}`;
+    try { d = (await r.json()).detail || d; } catch (e) {}
+    throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+  }
+  return r.json();
+}
+
+function initSecurityUI() {
+  const setupBtn = document.getElementById("auth-setup-btn");
+  if (!setupBtn) return;
+
+  setupBtn.addEventListener("click", async () => {
+    const user = document.getElementById("auth-setup-user").value.trim();
+    const p1 = document.getElementById("auth-setup-pass").value;
+    const p2 = document.getElementById("auth-setup-pass2").value;
+    const status = document.getElementById("auth-setup-status");
+    if (!user || !p1) { status.textContent = "Username and password required."; return; }
+    if (p1.length < 6) { status.textContent = "Password must be at least 6 characters."; return; }
+    if (p1 !== p2) { status.textContent = "Passwords don't match."; return; }
+    setupBtn.disabled = true;
+    try {
+      const j = await _authPost("/api/auth/setup", { username: user, password: p1 });
+      await loadAuthState();
+      // Reveal the token immediately — this is the one guaranteed sighting.
+      const tokEl = document.getElementById("auth-token-value");
+      if (tokEl) tokEl.textContent = j.api_token;
+      showToast("Account created — auth is ON. Copy your API token now.", "ok");
+    } catch (e) {
+      status.textContent = e.message;
+    } finally {
+      setupBtn.disabled = false;
+    }
+  });
+
+  document.getElementById("auth-signout-btn")?.addEventListener("click", async () => {
+    try { await _authPost("/api/auth/logout"); } catch (e) {}
+    location.replace("/");   // server now serves the landing page
+  });
+
+  document.getElementById("auth-token-reveal")?.addEventListener("click", async () => {
+    try {
+      const r = await fetch("/api/auth/token");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _setText("auth-token-value", (await r.json()).api_token);
+    } catch (e) { showToast("Could not load token: " + e.message, "error"); }
+  });
+
+  document.getElementById("auth-token-copy")?.addEventListener("click", async () => {
+    try {
+      const r = await fetch("/api/auth/token");
+      const tok = (await r.json()).api_token;
+      await copyText(tok);
+      showToast("API token copied", "ok");
+    } catch (e) { showToast("Copy failed", "error"); }
+  });
+
+  document.getElementById("auth-token-regen")?.addEventListener("click", async () => {
+    const ok = await uiConfirm({
+      title: "Regenerate API token?",
+      message: "Every client using the current token will start showing up in " +
+               "'connections needing attention' until you update it.",
+      okText: "Regenerate", danger: true,
+    });
+    if (!ok) return;
+    try {
+      const j = await _authPost("/api/auth/token/regenerate");
+      _setText("auth-token-value", j.api_token);
+      showToast("New token generated — update your clients.", "ok");
+    } catch (e) { showToast(e.message, "error"); }
+  });
+
+  document.getElementById("auth-change-btn")?.addEventListener("click", async () => {
+    const cur = document.getElementById("auth-cur-pass").value;
+    const nw = document.getElementById("auth-new-pass").value;
+    const status = document.getElementById("auth-manage-status");
+    try {
+      await _authPost("/api/auth/change", { current_password: cur, new_password: nw });
+      status.textContent = "Password changed.";
+      document.getElementById("auth-cur-pass").value = "";
+      document.getElementById("auth-new-pass").value = "";
+    } catch (e) { status.textContent = e.message; }
+  });
+
+  document.getElementById("auth-disable-btn")?.addEventListener("click", async () => {
+    const cur = document.getElementById("auth-cur-pass").value;
+    const status = document.getElementById("auth-manage-status");
+    if (!cur) { status.textContent = "Enter your current password above to disable."; return; }
+    const ok = await uiConfirm({
+      title: "Disable authentication?",
+      message: "The app becomes open again: no sign-in, no API token, alerts cleared.",
+      okText: "Disable", danger: true,
+    });
+    if (!ok) return;
+    try {
+      await _authPost("/api/auth/disable", { password: cur });
+      showToast("Authentication disabled.", "ok");
+      await loadAuthState();
+    } catch (e) { status.textContent = e.message; }
+  });
+
+  document.getElementById("auth-alerts-clear")?.addEventListener("click", async () => {
+    try { await _authPost("/api/auth/alerts/clear"); } catch (e) {}
+    _loadAuthAlerts();
+  });
+
+  // Light poll: keep the gear's amber dot honest while auth is on.
+  _authState.pollTimer = setInterval(() => {
+    if (_authState.enabled) loadAuthState();
+  }, 60000);
+}
+
+// =====================================================================
 // Instance identity (Settings → Instance identity). Server-side per-install
 // name + description: the name becomes the browser-tab title, and because a
 // tab's hover card shows the full document.title, appending the description
@@ -8067,6 +8272,8 @@ async function init() {
   initImportBotUI();
   initModelsPage();
   initVoiceStudioPage();
+  initSecurityUI();
+  loadAuthState().catch(() => {});
   els.input.addEventListener("input", autoGrowInput);
   // Warm the backend cache FIRST so the dashboard's push-to-talk affordance
   // (which checks for a kind='voice' row) shows up without first opening

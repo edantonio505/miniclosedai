@@ -57,6 +57,8 @@
     <button class="nav-item" data-page="settings" title="Settings" aria-label="Settings">
       <!-- Feather: settings -->
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <!-- Amber dot: unauthenticated API connections need attention (auth grace mode). -->
+      <span class="nav-alert-dot" id="settings-alert-dot" hidden aria-hidden="true"></span>
     </button>
   </nav>
 
@@ -510,6 +512,55 @@
           <input type="text" id="instance-description" class="settings-select" maxlength="300" placeholder="e.g. lab server — RAG experiments" />
         </div>
         <p class="settings-hint" id="instance-meta-status"></p>
+      </section>
+
+      <section class="settings-section" id="security-section">
+        <div class="settings-section-header">
+          <h2>Security</h2>
+          <button id="auth-signout-btn" class="btn btn-small" hidden>Sign out</button>
+        </div>
+
+        <!-- State A: no account yet — create one to enable auth. -->
+        <div id="auth-setup-box">
+          <p class="settings-hint">Create a username and password to protect this MiniClosedAI. After that, opening the app requires signing in, and the REST API expects a bearer token — <strong>existing API clients keep working</strong> (requests without the token are allowed but flagged below so you can migrate them).</p>
+          <div class="settings-row"><label for="auth-setup-user">Username</label><input id="auth-setup-user" type="text" class="settings-select" maxlength="60" autocomplete="username" /></div>
+          <div class="settings-row"><label for="auth-setup-pass">Password</label><input id="auth-setup-pass" type="password" class="settings-select" autocomplete="new-password" /></div>
+          <div class="settings-row"><label for="auth-setup-pass2">Repeat password</label><input id="auth-setup-pass2" type="password" class="settings-select" autocomplete="new-password" /></div>
+          <button id="auth-setup-btn" class="btn btn-primary btn-small">Create account &amp; enable</button>
+          <p class="settings-hint" id="auth-setup-status"></p>
+        </div>
+
+        <!-- State B: account exists + signed in — manage everything. -->
+        <div id="auth-manage-box" hidden>
+          <p class="settings-hint">Signed in as <strong id="auth-username"></strong>. Sessions last until the browser closes.</p>
+          <div class="settings-row">
+            <label>API token</label>
+            <div class="auth-token-row">
+              <code id="auth-token-value">••••••••••••••••</code>
+              <button id="auth-token-reveal" class="btn btn-small">Reveal</button>
+              <button id="auth-token-copy" class="btn btn-small">Copy</button>
+              <button id="auth-token-regen" class="btn btn-small btn-danger">Regenerate</button>
+            </div>
+          </div>
+          <p class="settings-hint">Programmatic clients send <code>Authorization: Bearer &lt;token&gt;</code> — mcai reads it from <code>MINICLOSEDAI_API_KEY</code>; generated SDKs accept an <code>apiKey</code> option.</p>
+          <details class="auth-advanced"><summary>Change password / disable</summary>
+            <div class="settings-row"><label for="auth-cur-pass">Current password</label><input id="auth-cur-pass" type="password" class="settings-select" autocomplete="current-password" /></div>
+            <div class="settings-row"><label for="auth-new-pass">New password</label><input id="auth-new-pass" type="password" class="settings-select" autocomplete="new-password" /></div>
+            <div class="auth-danger-actions">
+              <button id="auth-change-btn" class="btn btn-small">Change password</button>
+              <button id="auth-disable-btn" class="btn btn-small btn-danger">Disable authentication</button>
+            </div>
+          </details>
+          <p class="settings-hint" id="auth-manage-status"></p>
+
+          <div class="settings-section-header auth-alerts-header">
+            <h2>Connections needing attention <span id="auth-alert-count" class="settings-hint-inline"></span></h2>
+            <button id="auth-alerts-clear" class="btn btn-small">Clear all</button>
+          </div>
+          <p class="settings-hint">API requests arriving <strong>without</strong> your token. They are not blocked (backwards compatibility) — but each one is a client you should update with the token above.</p>
+          <div id="auth-alerts-list" class="auth-alerts-list"></div>
+          <p class="settings-hint" id="auth-alerts-empty" hidden>None — every connected client authenticates. ✓</p>
+        </div>
       </section>
     </div>
   </div>

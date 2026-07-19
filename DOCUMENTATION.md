@@ -281,7 +281,7 @@ python3 cli.py <command> [args]  # directly — works under any python3, no venv
 | `MINICLOSEDAI_URL` | `https://localhost:8095` | Full base URL of the target server (overrides PORT). |
 | `MINICLOSEDAI_PORT` | `8095` | Port, when `MINICLOSEDAI_URL` is unset (scheme is `https`). |
 | `MINICLOSEDAI_VERIFY` | unset | `1`/`true` enforces TLS cert verification. Off by default because the dev server's cert is self-signed. |
-| `MINICLOSEDAI_API_KEY` | unset | Sent as `Authorization: Bearer …` on every request. The app does not require it; set it when you front the server with an auth proxy that does. |
+| `MINICLOSEDAI_API_KEY` | unset | Sent as `Authorization: Bearer …` on every request. Set it to the API token from Settings → Security once authentication is enabled (grace mode: requests without it still work but are flagged to the instance owner). |
 
 Exit codes: `0` ok · `1` API/usage error · `2` server unreachable / unauthorized.
 
@@ -1098,6 +1098,26 @@ Lists Ollama models available locally.
     {"name": "llama3.2:3b", "size": 2019393189, "details": {"parameter_size": "3.2B", "...": "..."}}
   ]
 }
+```
+
+### Authentication (opt-in, grace mode)
+
+Off until an account exists (Settings → Security). Once enabled: `/` serves
+`static/landing.html` to visitors without a session cookie (`mca_session`, HttpOnly,
+browser-session lifetime, Secure on https); `/api/*` + `/v1/*` accept the session OR
+`Authorization: Bearer <api_token>`; requests with neither are **allowed** and recorded
+in `auth_alerts` (surfaced in Settings + amber dot on the gear). Tables: `users`
+(single row, scrypt password hash, api_token), `sessions`, `auth_alerts` (deduped by
+ip+method+path, hit counts).
+
+```
+GET  /api/auth/state              → {enabled, logged_in, username?, alert_count?}
+POST /api/auth/setup              → create THE account (409 if exists); returns api_token once
+POST /api/auth/login | logout     → session cookie in/out (login sleeps 0.5s on failure)
+GET  /api/auth/token              → session-only; POST /api/auth/token/regenerate
+POST /api/auth/change             → {current_password, new_password}
+POST /api/auth/disable            → {password} — full reset back to the open app
+GET  /api/auth/alerts             → session-only; POST .../dismiss {fingerprint}, .../clear
 ```
 
 ### Sibling-service proxies (Models tab + Voice Studio tab)

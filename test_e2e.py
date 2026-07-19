@@ -1656,6 +1656,95 @@ def _():
         client.delete(f"/api/backends/{vbid}?force=true")
 
 
+@test("auth: opt-in lifecycle — setup, landing, grace alerts, bearer, disable")
+def _():
+    from fastapi.testclient import TestClient as _TC
+    # Pre-state: auth off, / serves the app, API open.
+    assert client.get("/api/auth/state").json() == {"enabled": False, "logged_in": False}
+    assert 'page page-bots' in client.get("/").text
+
+    anon = _TC(app_mod.app)   # separate cookie jar = a logged-out visitor
+    try:
+        # ---- setup: creates account, starts session, returns token once ----
+        r = client.post("/api/auth/setup", json={"username": "edgar", "password": "hunter22"})
+        assert r.status_code == 201, r.text
+        token = r.json()["api_token"]
+        assert len(token) > 20
+        st = client.get("/api/auth/state").json()
+        assert st["enabled"] and st["logged_in"] and st["username"] == "edgar", st
+        # Second setup refused.
+        assert client.post("/api/auth/setup", json={"username": "x", "password": "yyyyyy"}).status_code == 409
+
+        # ---- landing: logged-out visitor gets the landing, not the app ----
+        body = anon.get("/").text
+        assert "landing-card" in body and "Sign in" in body, body[:300]
+        assert 'page page-bots' not in body
+        # The session holder still gets the app.
+        assert 'page page-bots' in client.get("/").text
+
+        # ---- login: wrong → 401; right → session works ----
+        assert anon.post("/api/auth/login", json={"username": "edgar", "password": "nope"}).status_code == 401
+        r = anon.post("/api/auth/login", json={"username": "edgar", "password": "hunter22"})
+        assert r.status_code == 200, r.text
+        assert 'page page-bots' in anon.get("/").text
+        assert anon.get("/api/auth/token").json()["api_token"] == token
+
+        # ---- grace mode: no-auth API call is ALLOWED and alert-recorded ----
+        bare = _TC(app_mod.app)
+        assert bare.get("/api/conversations").status_code == 200   # never blocked
+        alerts = client.get("/api/auth/alerts").json()["alerts"]
+        hit = [a for a in alerts if a["path"] == "/api/conversations"]
+        assert hit, alerts
+        c0 = hit[0]["count"]
+        bare.get("/api/conversations")                              # repeat → count bump
+        hit2 = [a for a in client.get("/api/auth/alerts").json()["alerts"]
+                if a["path"] == "/api/conversations"]
+        assert hit2[0]["count"] == c0 + 1, hit2
+
+        # ---- bearer: token requests are clean (no new alert) ----
+        n0 = len(client.get("/api/auth/alerts").json()["alerts"])
+        r = bare.get("/api/backends", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 200
+        assert len(client.get("/api/auth/alerts").json()["alerts"]) == n0
+
+        # ---- dismiss + clear ----
+        fp = hit2[0]["fingerprint"]
+        client.post("/api/auth/alerts/dismiss", json={"fingerprint": fp})
+        assert not [a for a in client.get("/api/auth/alerts").json()["alerts"]
+                    if a["fingerprint"] == fp]
+        client.post("/api/auth/alerts/clear")
+        assert client.get("/api/auth/alerts").json()["alerts"] == []
+
+        # ---- regenerate: old token now alerts, new one doesn't ----
+        new_token = client.post("/api/auth/token/regenerate").json()["api_token"]
+        assert new_token != token
+        bare.get("/api/models", headers={"Authorization": f"Bearer {token}"})
+        assert [a for a in client.get("/api/auth/alerts").json()["alerts"]
+                if a["path"] == "/api/models"], "old token should now alert"
+        n1 = len(client.get("/api/auth/alerts").json()["alerts"])
+        bare.get("/api/backends", headers={"Authorization": f"Bearer {new_token}"})
+        assert len(client.get("/api/auth/alerts").json()["alerts"]) == n1
+
+        # ---- change password ----
+        r = client.post("/api/auth/change",
+                        json={"current_password": "hunter22", "new_password": "hunter23"})
+        assert r.status_code == 200, r.text
+
+        # ---- logout invalidates the session ----
+        anon.post("/api/auth/logout")
+        assert anon.get("/api/auth/token").status_code == 401
+        assert "landing-card" in anon.get("/").text
+    finally:
+        # Disable auth so the rest of the suite runs in the open state. The
+        # main `client` still holds a valid session.
+        r = client.post("/api/auth/disable", json={"password": "hunter23"})
+        if r.status_code != 200:   # fall back if the change-password step failed
+            client.post("/api/auth/disable", json={"password": "hunter22"})
+    st = client.get("/api/auth/state").json()
+    assert st == {"enabled": False, "logged_in": False}, st
+    assert 'page page-bots' in _TC(app_mod.app).get("/").text   # open again
+
+
 @test("/api/instance: defaults + PUT round-trip + partial update")
 def _():
     # Fresh DB → seeded blank identity.
@@ -2309,6 +2398,13 @@ def _():
     # Settings → Instance identity (tab title + hover description).
     assert 'id="instance-name"' in body
     assert 'id="instance-description"' in body
+    # Security section (opt-in auth) + landing page bits.
+    assert 'id="security-section"' in body
+    assert 'id="auth-setup-btn"' in body
+    assert 'id="auth-alerts-list"' in body
+    assert 'id="settings-alert-dot"' in body
+    landing = client.get("/static/landing.html").text
+    assert "landing-card" in landing and "/api/auth/login" in landing
     # Models + Voice Studio tabs (the three-app merge): nav buttons + pages.
     assert 'data-page="models"' in body
     assert 'data-page="voice-studio"' in body
@@ -2361,6 +2457,8 @@ def _():
         # Voice Studio tab (native miniclosedai-voice port)
         "initVoiceStudioPage", "onVoiceStudioPageEntered", "onVoiceStudioPageLeft",
         "vsLoadVoices", "vsSaveVoice", "_vsEncodeWav",
+        # Security (opt-in auth + grace-mode alerts)
+        "initSecurityUI", "loadAuthState", "_loadAuthAlerts", "_refreshAuthAlertDot",
         # Application export / import — mirrors the bot pattern at the apps level.
         "_handleAppImportFile", "_runAppImport", "_downloadApp",
         "initAppsImportUI",

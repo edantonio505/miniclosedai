@@ -48,6 +48,7 @@ dependency).
 from __future__ import annotations
 
 import contextlib
+import os
 from typing import Any, Iterator
 
 import httpx
@@ -112,13 +113,22 @@ class XBenchClient:
         verify: bool | str = True,
         timeout: float = 30.0,
         headers: dict[str, str] | None = None,
+        api_key: str | None = None,
     ) -> None:
+        """`api_key`: bearer for MiniClosedAI installs with authentication
+        enabled (Settings → Security). Defaults to $MINICLOSEDAI_API_KEY.
+        Omitted = requests go unauthenticated, which the server allows in
+        grace mode (they're flagged to the instance owner)."""
         self.base_url = base_url.rstrip("/")
+        merged = dict(headers or {})
+        key = api_key if api_key is not None else os.environ.get("MINICLOSEDAI_API_KEY")
+        if key:
+            merged.setdefault("Authorization", f"Bearer {key}")
         self._client = httpx.Client(
             base_url=self.base_url,
             verify=verify,
             timeout=timeout,
-            headers=headers or {},
+            headers=merged,
         )
 
     # ---- Backends -------------------------------------------------------

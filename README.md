@@ -2854,26 +2854,35 @@ miniclosedai/
 
 ## Security
 
-**MiniClosedAI ships with no authentication.** Anyone who can reach the HTTP port can:
+**Authentication is opt-in.** Out of the box MiniClosedAI is open (target deployment:
+`127.0.0.1` or a trusted LAN). To turn auth on: **Settings → Security → create a
+username and password.** From that moment:
 
-- Read, create, update, or delete any conversation.
-- Invoke any bot's endpoint (uses your local CPU/GPU, generates any output the bot is configured to).
-- Write to the SQLite file.
+- **Browser**: opening the app without a session shows a light **landing page**
+  (project blurb + sign-in). Sessions last until the browser closes. Sign out from
+  Settings; change password or disable auth (password-confirmed) there too.
+- **API — grace mode**: an **API token** is generated (shown once; copy/regenerate in
+  Settings). Clients should send `Authorization: Bearer <token>` — but requests
+  without it are **never blocked**. Instead each unauthenticated client is recorded
+  under **Settings → "Connections needing attention"** (method, path, IP, user-agent,
+  count) with an amber dot on the Settings gear — so everything already wired to this
+  instance keeps working while you migrate it.
 
-This is intentional — the target deployment is local-only on `127.0.0.1`, or on a trusted LAN.
+Updating each kind of client:
+- `mcai` CLI → `export MINICLOSEDAI_API_KEY=<token>` (already supported).
+- Generated SDKs (TS/JS/Python) → `setApiKey("<token>")` / `set_api_key(...)`, or the
+  `MINICLOSEDAI_API_KEY` env var (JS/Python).
+- OpenAI SDKs on `/v1` → `api_key="<token>"`.
+- `xbench_client` → `XBenchClient(api_key="<token>")` or the env var.
 
-If you need to expose MiniClosedAI beyond that, put it behind:
+**Grace mode is deliberate backwards compatibility, which means API auth is advisory**:
+anyone who can reach the port can still call the API (they'll just be flagged). For
+hostile networks, still pair it with a reverse proxy (nginx, Caddy, OAuth2-Proxy), a
+VPN (Tailscale, WireGuard), or a firewall allow-list.
 
-- A reverse proxy (nginx, Caddy) with basic auth or OAuth2-Proxy.
-- A VPN (Tailscale, WireGuard).
-- A firewall allow-list.
-
-This applies equally to terminal/agent access: the `mcai` CLI and the OpenAI-compatible
-endpoint reach the same unauthenticated `/api`. If you front the server with a
-token-checking proxy, set `MINICLOSEDAI_API_KEY` and both `mcai` and OpenAI SDK clients
-will send `Authorization: Bearer …`. See [Terminal CLI → From another machine, or from an LLM agent](#terminal-cli-mcai).
-
-The app does **not** speak HTTPS directly. `navigator.clipboard` requires HTTPS or `localhost`; the app falls back to `document.execCommand("copy")` over plain-HTTP.
+Passwords are hashed with scrypt; tokens/sessions use `secrets` randomness; no new
+dependencies. The session cookie is HttpOnly and marked Secure automatically when
+served over HTTPS (the dev cert setup). `navigator.clipboard` requires HTTPS or `localhost`; the app falls back to `document.execCommand("copy")` over plain-HTTP.
 
 ---
 

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MiniClosedAI — Sign in</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <!-- Same pre-paint theme snippet as the app, same localStorage key — the
+       landing respects whatever theme the user last had. -->
+  <script>
+    (function () {
+      try {
+        const saved = localStorage.getItem("miniclosedai:theme") || "system";
+        const systemDark = matchMedia("(prefers-color-scheme: dark)").matches;
+        if (saved === "dark" || (saved === "system" && systemDark))
+          document.documentElement.classList.add("dark");
+      } catch (e) {}
+    })();
+  </script>
+  <style>
+    /* Landing-only layout; visual language comes from style.css tokens. */
+    body.landing {
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh; margin: 0; background: var(--bg-deep, var(--bg));
+      font-family: var(--font-ui, system-ui, sans-serif); color: var(--text);
+    }
+    .landing-card {
+      width: min(400px, 92vw); padding: 36px 32px; text-align: center;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: var(--r-md, 12px); box-shadow: var(--shadow-md, 0 8px 30px rgba(0,0,0,.12));
+    }
+    .landing-logo { font-size: 40px; line-height: 1; }
+    .landing-card h1 { margin: 10px 0 4px; font-size: 22px; }
+    .landing-tag { margin: 0 0 4px; font-weight: 600; }
+    .landing-blurb { margin: 0 0 22px; font-size: 13px; color: var(--text-muted); }
+    .landing-form { display: flex; flex-direction: column; gap: 10px; text-align: left; }
+    .landing-form label { font-size: 12px; color: var(--text-muted); }
+    .landing-form input {
+      width: 100%; box-sizing: border-box; padding: 9px 11px; font-size: 14px;
+      border: 1px solid var(--border); border-radius: var(--r-sm, 8px);
+      background: var(--bg); color: var(--text);
+    }
+    .landing-form button {
+      margin-top: 6px; padding: 10px; font-size: 14px; font-weight: 600;
+      border: 0; border-radius: var(--r-sm, 8px); cursor: pointer;
+      background: var(--accent); color: #fff;
+    }
+    .landing-form button:disabled { opacity: 0.6; cursor: default; }
+    .landing-error { min-height: 18px; margin: 6px 0 0; font-size: 13px; color: var(--danger, #e5484d); }
+    .landing-foot { margin-top: 18px; font-size: 11px; color: var(--text-muted); }
+    .landing-card.shake { animation: landing-shake 0.35s; }
+    @keyframes landing-shake {
+      20% { transform: translateX(-8px); } 40% { transform: translateX(8px); }
+      60% { transform: translateX(-5px); } 80% { transform: translateX(5px); }
+    }
+  </style>
+</head>
+<body class="landing">
+  <main class="landing-card" id="card">
+    <div class="landing-logo">🤖</div>
+    <h1>MiniClosedAI</h1>
+    <p class="landing-tag">Be your own OpenAI.</p>
+    <p class="landing-blurb">Local bots · models · voices — every saved chat is a callable
+      endpoint, every model and voice runs on your own metal. No cloud, no API bills.</p>
+    <form class="landing-form" id="login-form">
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" required autofocus />
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required />
+      <button id="signin-btn" type="submit">Sign in</button>
+      <p class="landing-error" id="login-error"></p>
+    </form>
+    <p class="landing-foot">Self-hosted · MIT licensed · your data never leaves this server</p>
+  </main>
+  <script>
+    const form = document.getElementById("login-form");
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById("signin-btn");
+      const err = document.getElementById("login-error");
+      btn.disabled = true; err.textContent = "";
+      try {
+        const r = await fetch("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: document.getElementById("username").value.trim(),
+            password: document.getElementById("password").value,
+          }),
+        });
+        if (!r.ok) {
+          let d = "Sign-in failed";
+          try { d = (await r.json()).detail || d; } catch (e2) {}
+          throw new Error(d);
+        }
+        location.replace("/");
+      } catch (e2) {
+        err.textContent = e2.message || "Sign-in failed";
+        const card = document.getElementById("card");
+        card.classList.remove("shake");
+        void card.offsetWidth;   // restart the animation
+        card.classList.add("shake");
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
