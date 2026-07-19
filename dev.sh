@@ -44,6 +44,16 @@ llm_pid()    { pgrep -f "uvicorn app:app.*${PORT_LLM}" | head -1; }
 llm_alive()  { [[ -n "$(llm_pid)" ]]; }
 llm_health() { curl -fsS --max-time 2 "http://localhost:${PORT_LLM}/api/health" >/dev/null 2>&1; }
 
+# CUDA gate: the voice service (ASR+TTS) and the LLM model server are GPU
+# workloads — on a box without working CUDA they'd either crawl (CPU TTS) or
+# fail to load models. `up` starts them ONLY when nvidia-smi answers; the
+# Models / Voice Studio tabs degrade to their friendly "not running" state.
+# Override with MINICLOSEDAI_FORCE_GPU_SERVICES=1 (e.g. CPU-only debugging).
+cuda_available() {
+  [[ "${MINICLOSEDAI_FORCE_GPU_SERVICES:-}" == "1" ]] && return 0
+  command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
+}
+
 c_blue=$'\e[1;34m'; c_green=$'\e[1;32m'; c_red=$'\e[1;31m'; c_yellow=$'\e[1;33m'; c_dim=$'\e[2m'; c_off=$'\e[0m'
 step() { printf "\n%s▶ %s%s\n" "$c_blue"   "$1" "$c_off"; }
 ok()   { printf   "%s✓ %s%s\n" "$c_green"  "$1" "$c_off"; }
@@ -246,7 +256,17 @@ stop_llm() {
 # By design `down` leaves the voice container AND the LLM manager running so
 # models stay warm across MiniClosedAI restarts. Use `voice-purge` /
 # `llm-stop` to actually stop them.
-cmd_up()      { start_voice; start_llm; start_app; }
+cmd_up() {
+  if cuda_available; then
+    start_voice
+    start_llm
+  else
+    warn "No working CUDA on this machine (nvidia-smi absent/failing) — skipping the"
+    warn "voice service and LLM model server. MiniClosedAI still runs; register remote"
+    warn "endpoints in Settings, or set MINICLOSEDAI_FORCE_GPU_SERVICES=1 to override."
+  fi
+  start_app
+}
 cmd_down()    { stop_app; ok "Voice service + LLM manager left running (use '$0 voice-purge' / '$0 llm-stop')"; }
 cmd_restart() { cmd_down; cmd_up; }
 
