@@ -1137,7 +1137,15 @@ _LLM_MANAGER_KEY = os.environ.get("MINICLOSEDAI_LLM_MANAGER_KEY", "").strip()
 # open relay. Prefix match on the first path segment(s).
 _LLM_PROXY_ALLOWED = ("health", "gpu", "models", "analyze", "cache", "test-image")
 
-_VOICESTUDIO_ALLOWED = ("health", "voices", "api/connect-info")
+_VOICESTUDIO_ALLOWED = (
+    "health", "voices", "api/connect-info",
+    # speak / speak-stream / transcribe: not used by the Voice Studio GUI tab
+    # (catalog + health only), but proxying them lets `mcai voice speak` /
+    # `transcribe` work through miniclosedai's one port even when the CLI
+    # operator has no direct network path to a remote/firewalled voice
+    # backend — same remote-access principle as the rest of this API.
+    "speak", "speak/stream", "transcribe",
+)
 
 
 def _proxy_path_allowed(path: str, allowed: tuple) -> bool:
@@ -1150,24 +1158,40 @@ async def _proxy_stream(request: Request, upstream_url: str, *, headers: dict,
 
     One code path covers JSON, SSE (model logs), and binary (test-image):
     the upstream response is re-yielded chunk-by-chunk with buffering off.
-    Request bodies (JSON or multipart uploads) are streamed through untouched
-    with the original Content-Type. The client for streaming responses must
-    outlive this function's scope, so it's closed in the generator's finally.
+    Request bodies (JSON or multipart uploads) are fully buffered (these
+    proxies carry commands/short audio clips, not multi-GB uploads — bounded
+    payloads, so buffering is cheap and — unlike a one-shot body stream —
+    lets a failed send be retried with the exact same bytes).
+
+    Connecting to a sibling/remote service (a voice pod, a model manager) is
+    the one step genuinely worth retrying: a single transient blip (the
+    upstream still warming up, a momentary network hiccup) shouldn't surface
+    as a 502 to the caller when trying again immediately would succeed. One
+    retry only, tiny backoff — anything still failing after that is a real
+    unreachable-service condition, not a hiccup.
     """
     fwd_headers = dict(headers)
     for h in ("content-type",):
         v = request.headers.get(h)
         if v:
             fwd_headers[h] = v
-    client = httpx.AsyncClient(verify=verify, timeout=httpx.Timeout(300.0, connect=10.0))
-    try:
-        body = request.stream() if request.method in ("POST", "PUT", "PATCH") else None
-        req = client.build_request(request.method, upstream_url,
-                                   headers=fwd_headers, content=body)
-        resp = await client.send(req, stream=True)
-    except httpx.HTTPError:
-        await client.aclose()
-        raise HTTPException(502, unreachable_hint)
+    body = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
+
+    last_exc: httpx.HTTPError | None = None
+    for attempt in (1, 2):
+        client = httpx.AsyncClient(verify=verify, timeout=httpx.Timeout(300.0, connect=10.0))
+        try:
+            req = client.build_request(request.method, upstream_url,
+                                       headers=fwd_headers, content=body)
+            resp = await client.send(req, stream=True)
+            break
+        except httpx.HTTPError as e:
+            last_exc = e
+            await client.aclose()
+            if attempt == 1:
+                await asyncio.sleep(0.15)
+    else:
+        raise HTTPException(502, unreachable_hint) from last_exc
 
     async def gen():
         try:

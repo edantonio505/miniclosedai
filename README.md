@@ -350,6 +350,16 @@ engine auto-detected), and **MiniClosedAI** itself. `./dev.sh status` shows all 
 Studio tabs in the activity bar are the GUIs for the two siblings — no separate
 dashboards needed.
 
+`./dev.sh up` alone is enough on a fresh clone — it self-bootstraps a `.venv` and
+installs `requirements.txt` if one doesn't exist yet, same as the sibling repos' own
+`dev.sh` scripts, so a separate `install.sh` run first isn't required. A sibling repo
+that isn't cloned next to this one (or no working `nvidia-smi`) is skipped with a
+warning, not a crash — MiniClosedAI itself always comes up either way; the Models/Voice
+Studio tabs just show "not running" until you add that sibling or a remote endpoint.
+Override the port with `MINICLOSEDAI_PORT` (also honored by `install.sh`), or the
+sibling checkout paths with `MINICLOSEDAI_VOICE_DIR` / `MINICLOSEDAI_LLM_DIR` if they
+live somewhere other than next to this repo.
+
 ---
 
 ## Your first bot — 60 seconds
@@ -410,6 +420,18 @@ live on your `PATH`.)
 ./mcai bots export "Summarizer" --out bot.json
 ./mcai bots import bot.json --backend 1
 ./mcai logs
+
+# Models tab, from the terminal — run HuggingFace LLMs via the model manager
+./mcai llm ls                                  # what's running
+./mcai llm run meta-llama/Llama-3.1-8B-Instruct --wait
+./mcai llm test llama-3-1-8b-instruct "say hi"
+./mcai llm register llama-3-1-8b-instruct      # one-click "use it as a backend"
+
+# Voice Studio tab, from the terminal — manage any connected voice service
+./mcai voice ls                                # voice catalog (pick --backend if you have several)
+./mcai voice clone sample.wav --name "Edgar" --language en
+./mcai voice speak "hello there" --voice edgar --out hi.wav --play
+./mcai voice transcribe hi.wav
 ```
 
 A bot or app argument accepts either its numeric id or a unique substring of its
@@ -420,8 +442,14 @@ bearer if set — useful when you front the server with an auth proxy), and
 server uses a self-signed cert). Run `./mcai <command> -h` for per-command help.
 Symlink it onto your `PATH` if you like: `ln -s "$(pwd)/mcai" ~/.local/bin/mcai`.
 
-> Voice (push-to-talk / call mode) and the WebRTC duplex path remain GUI-only — they
-> need a browser mic/speaker. Everything else in the GUI is reachable from `mcai`.
+The `llm` and `voice` groups are the terminal side of the **Models** and **Voice
+Studio** tabs — same `/api/llm/*` and `/api/voicestudio/*` proxies, so a model you
+start with `mcai llm run` shows up in the Models tab and vice-versa. `voice` takes an
+optional `--backend <id-or-name>` when you have more than one voice service registered
+(defaults to the first enabled one). `mcai voice speak`/`transcribe` route through
+MiniClosedAI's own port even when the CLI has no direct network path to a remote voice
+backend — only push-to-talk and the WebRTC duplex call mode need an actual browser
+mic/speaker and stay GUI-only.
 
 ### From another machine, or from an LLM agent
 

@@ -30,12 +30,14 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import traceback
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import wave
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 
@@ -76,12 +78,30 @@ def _clear_companions() -> None:
 # In-process fake backend servers
 # ------------------------------------------------------------------
 
+class _ThreadingHTTPServerRobust(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a larger accept backlog.
+
+    socketserver's default `request_queue_size` (5) is a CLASS attribute read
+    by `server_activate()` during `__init__` — by the time a server object
+    exists, `socket.listen()` has already run with whatever value was in
+    effect, so this must be overridden on the class, not the instance.
+    Too-small a backlog is too small once a test fires several back-to-back
+    requests at one fake server (e.g. speak / speak-stream / transcribe in
+    quick succession): under full-suite load the OS can refuse/reset a
+    connection that arrives while the backlog is momentarily full, surfacing
+    as an intermittent httpx.ConnectError/ReadError ("not reachable") even
+    though the server is up and each call works fine in isolation.
+    """
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class _FakeServer:
     """Base class — threads a HTTPServer on a random localhost port."""
 
     def __init__(self) -> None:
         self.captured: list[dict] = []     # must exist before _handler_class runs
-        self._httpd = HTTPServer(("127.0.0.1", 0), self._handler_class())
+        self._httpd = _ThreadingHTTPServerRobust(("127.0.0.1", 0), self._handler_class())
         self.port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
@@ -443,6 +463,20 @@ class FakeVoice(_FakeServer):
                     for f in frames:
                         self.wfile.write(f"data: {json.dumps(f)}\n\n".encode())
                         self.wfile.flush()
+                    return
+                if self.path == "/speak":
+                    # Non-streaming synth: a minimal valid 1-frame silent WAV
+                    # (mono, 16-bit, 8000 Hz) — enough for a client to write
+                    # and open, without pulling in real TTS.
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length)) if length else {}
+                    captured.append({"path": self.path, "payload": payload,
+                                     "auth": self.headers.get("Authorization")})
+                    buf = io.BytesIO()
+                    with wave.open(buf, "wb") as w:
+                        w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+                        w.writeframes(b"\x00\x00")
+                    self._reply(200, buf.getvalue(), "audio/wav")
                     return
                 self._reply(404, b"not found", "text/plain")
 
@@ -1647,11 +1681,52 @@ def _():
         assert r.status_code == 200, r.text
         # Reserved voice refusal passes through.
         assert client.delete(f"/api/voicestudio/{vbid}/voices/default").status_code == 403
-        # Guards: allowlist + non-voice backend + disabled backend.
-        assert client.get(f"/api/voicestudio/{vbid}/transcribe").status_code == 404
+        # Guards: allowlist (call/configure is NOT proxied — only the Voice
+        # Studio + speak/transcribe surface is) + non-voice backend + disabled backend.
+        assert client.get(f"/api/voicestudio/{vbid}/call/configure").status_code == 404
         assert client.get("/api/voicestudio/1/health").status_code == 400  # backend 1 = ollama
         client.patch(f"/api/backends/{vbid}", json={"enabled": False})
         assert client.get(f"/api/voicestudio/{vbid}/health").status_code == 400
+    finally:
+        client.delete(f"/api/backends/{vbid}?force=true")
+
+
+@test("/api/voicestudio proxy: speak + speak/stream + transcribe now proxy through")
+def _():
+    # These three were added to _VOICESTUDIO_ALLOWED so `mcai voice speak` /
+    # `transcribe` work through miniclosedai's one port without the CLI
+    # needing direct network access to the (possibly remote/firewalled)
+    # voice backend. The GUI's Voice Studio tab never calls these — this is
+    # purely a CLI/remote-access capability, additive to the existing guards.
+    r = client.post("/api/backends", json={
+        "name": "SpeakVoice", "kind": "voice",
+        "base_url": fake_voice.base_url, "api_key": "vkey2",
+    })
+    assert r.status_code == 200, r.text
+    vbid = r.json()["id"]
+    fake_voice.captured.clear()
+    try:
+        # Non-streaming /speak: binary WAV passes through with the right
+        # content-type, and the bearer was injected server-side.
+        r = client.post(f"/api/voicestudio/{vbid}/speak",
+                        json={"text": "hi", "voice": "default", "language": "en"})
+        assert r.status_code == 200, r.text
+        assert r.headers.get("content-type", "").startswith("audio/wav"), r.headers
+        assert r.content[:4] == b"RIFF", r.content[:16]
+        speak_calls = [c for c in fake_voice.captured if c.get("path") == "/speak"]
+        assert speak_calls and speak_calls[-1]["auth"] == "Bearer vkey2", fake_voice.captured
+
+        # Streaming /speak/stream: SSE frames pass through untouched.
+        with client.stream("POST", f"/api/voicestudio/{vbid}/speak/stream",
+                           json={"text": "hi", "voice": "default", "language": "en"}) as r:
+            body = b"".join(r.iter_bytes())
+        assert b"chunk_b64" in body and b'"done": true' in body, body
+
+        # /transcribe: multipart passthrough, same as the /voices clone path.
+        r = client.post(f"/api/voicestudio/{vbid}/transcribe",
+                        files={"audio": ("clip.wav", b"RIFF" + b"\x00" * 32, "audio/wav")})
+        assert r.status_code == 200, r.text
+        assert r.json()["text"] == "hello world", r.json()
     finally:
         client.delete(f"/api/backends/{vbid}?force=true")
 
@@ -5544,6 +5619,54 @@ def _():
     finally:
         app_mod._generations.pop(cid, None)
         client.delete(f"/api/conversations/{cid}")
+
+
+# ==================================================================
+# mcai CLI — argparse registration smoke tests. `cli.py` needs a live
+# MiniClosedAI server for actual API calls, but --help never touches the
+# network (argparse prints and exits before require_daemon() runs), so these
+# run in the normal automated suite and catch registration mistakes (typos,
+# a subcommand missing set_defaults, etc.) for the new `llm`/`voice` groups
+# without needing the live-functional pass documented in the plan.
+# ==================================================================
+
+def _cli_help(*args: str) -> str:
+    """Run `cli.py <args> --help` in a subprocess; return combined output.
+    Raises AssertionError with the captured output if the exit code is non-zero
+    (argparse -h exits 0; a bad subcommand definition can raise before that)."""
+    r = subprocess.run(
+        [sys.executable, str(Path(__file__).parent / "cli.py"), *args, "--help"],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert r.returncode == 0, f"cli.py {' '.join(args)} --help exited {r.returncode}\n{r.stdout}\n{r.stderr}"
+    return r.stdout + r.stderr
+
+
+@test("mcai CLI: top-level --help registers the llm + voice groups")
+def _():
+    out = _cli_help()
+    assert "llm" in out and "voice" in out, out
+
+
+@test("mcai CLI: llm --help lists every subcommand + run/test take args cleanly")
+def _():
+    out = _cli_help("llm")
+    for sub in ("info", "gpu", "ls", "analyze", "run", "start", "stop", "rm",
+               "status", "logs", "test", "url", "register", "cache", "free"):
+        assert sub in out, f"'{sub}' missing from `mcai llm --help`:\n{out}"
+    # Spot-check a few subcommands parse their own --help without error
+    # (this is what would catch a stray argparse typo like a duplicate flag).
+    for sub in ("run", "test", "cache", "register"):
+        _cli_help("llm", sub)
+
+
+@test("mcai CLI: voice --help lists every subcommand incl. speak/transcribe")
+def _():
+    out = _cli_help("voice")
+    for sub in ("status", "url", "ls", "clone", "rm", "speak", "transcribe"):
+        assert sub in out, f"'{sub}' missing from `mcai voice --help`:\n{out}"
+    for sub in ("clone", "speak", "transcribe"):
+        _cli_help("voice", sub)
 
 
 # ==================================================================

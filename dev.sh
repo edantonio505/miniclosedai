@@ -19,14 +19,31 @@
 # Voice backend ("audio" / kind=voice / http://192.168.0.110:8090) is already
 # in the SQLite db from the first GUI registration — nothing to set up there.
 #
+# Fresh-clone friendly: `./dev.sh up` alone is enough — no separate install.sh
+# step required. If .venv doesn't exist yet, it's created and requirements.txt
+# installed automatically (same as the sibling repos' own dev.sh scripts).
+# Missing GPU siblings (miniclosedai-llm / miniclosedai-voice not cloned next
+# to this repo) are skipped with a warning, not a hard failure — MiniClosedAI
+# itself always comes up.
+#
+# Env vars:
+#   MINICLOSEDAI_PORT           app port (default 8095)
+#   MINICLOSEDAI_VOICE_DIR      path to miniclosedai-voice (default: ../miniclosedai-voice)
+#   MINICLOSEDAI_LLM_DIR        path to miniclosedai-llm (default: ../miniclosedai-llm)
+#   MINICLOSEDAI_FORCE_GPU_SERVICES=1   start voice/llm even without nvidia-smi
+#
 set -euo pipefail
 cd "$(dirname "$0")"
 
-PORT_APP=8095
+PORT_APP="${MINICLOSEDAI_PORT:-8095}"
 PORT_VOICE=8090
 APP_LOG=/tmp/miniclosedai.log
 CERT=.devcerts/dev-cert.pem
 KEY=.devcerts/dev-key.pem
+
+# Resolved lazily by ensure_venv() — self-bootstraps on a fresh clone so
+# `./dev.sh up` never assumes install.sh already ran.
+PY=".venv/bin/python"
 
 # Voice server lives in its own repo, alongside this one by default. Override
 # with MINICLOSEDAI_VOICE_DIR for non-default checkouts (e.g., on RunPod).
@@ -59,6 +76,19 @@ step() { printf "\n%s▶ %s%s\n" "$c_blue"   "$1" "$c_off"; }
 ok()   { printf   "%s✓ %s%s\n" "$c_green"  "$1" "$c_off"; }
 warn() { printf   "%s! %s%s\n" "$c_yellow" "$1" "$c_off"; }
 die()  { printf   "%s✗ %s%s\n" "$c_red"    "$1" "$c_off" >&2; exit 1; }
+
+# Self-bootstrap: mirrors install.sh's venv setup exactly, so a fresh clone
+# that skips install.sh and runs `./dev.sh up` directly still works. No-op
+# (and no output) once .venv/bin/python exists — never touches an existing venv.
+ensure_venv() {
+  [[ -x "$PY" ]] && return
+  command -v python3 >/dev/null 2>&1 || die "python3 not found — install Python 3.10+ and re-run"
+  step "Creating Python venv (.venv) — first run"
+  python3 -m venv .venv
+  "$PY" -m pip install -q --upgrade pip
+  "$PY" -m pip install -q -r requirements.txt
+  ok "dependencies installed"
+}
 
 app_pid()    { pgrep -f "uvicorn app:app.*${PORT_APP}" | head -1; }
 app_alive()  { [[ -n "$(app_pid)" ]]; }
@@ -101,9 +131,10 @@ start_app() {
     ok "MiniClosedAI already running (pid $(app_pid))"
     return
   fi
+  ensure_venv
   ensure_cert
   step "Starting MiniClosedAI on https://0.0.0.0:${PORT_APP}"
-  nohup .venv/bin/python -m uvicorn app:app \
+  nohup "$PY" -m uvicorn app:app \
     --host 0.0.0.0 --port "$PORT_APP" \
     --ssl-certfile "$CERT" --ssl-keyfile "$KEY" \
     > "$APP_LOG" 2>&1 &
@@ -125,6 +156,16 @@ start_voice() {
   # Fast path: already up and healthy.
   if voice_running && voice_health; then
     ok "Voice service already running   ${c_dim}$(voice_health_body)${c_off}"
+    return
+  fi
+
+  # The sibling repo may simply not be cloned on this box (e.g. a fresh
+  # server where only miniclosedai + miniclosedai-llm were set up). Every
+  # path below assumes $VOICE_DIR exists — `cd` into a missing directory
+  # would abort the whole script under `set -e`, so bail early with a warning
+  # instead (mirrors start_llm's identical guard).
+  if [[ ! -d "$VOICE_DIR" ]]; then
+    warn "miniclosedai-voice not found at $VOICE_DIR — Voice Studio tab will show 'not running' (set MINICLOSEDAI_VOICE_DIR)"
     return
   fi
 
@@ -306,7 +347,8 @@ cmd_status() {
     warn "not running"
   fi
   step "Registered voice backends in DB"
-  .venv/bin/python -c "
+  ensure_venv
+  "$PY" -c "
 import sqlite3
 db = sqlite3.connect('miniclosedai.db')
 db.row_factory = sqlite3.Row
@@ -322,13 +364,15 @@ cmd_test() {
   app_health   || die "MiniClosedAI not healthy — run $0 up first"
   voice_health || die "Voice service not healthy — run $0 up first"
   step "Running call-quality test (conv 94)"
-  .venv/bin/python tools/test_call.py --conv-id 94 "${@:1}"
+  ensure_venv
+  "$PY" tools/test_call.py --conv-id 94 "${@:1}"
 }
 
 cmd_logs() {
   case "${1:-app}" in
     app)   tail -f "$APP_LOG" ;;
-    voice) ( cd "$VOICE_DIR" && docker compose logs -f voice ) ;;
+    voice) [[ -d "$VOICE_DIR" ]] || die "miniclosedai-voice not found at $VOICE_DIR"
+           ( cd "$VOICE_DIR" && docker compose logs -f voice ) ;;
     llm)   tail -f "$LLM_LOG" ;;
     *)     die "logs target must be 'app', 'voice', or 'llm'" ;;
   esac
