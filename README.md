@@ -101,7 +101,7 @@ Five Python dependencies — `fastapi`, `uvicorn`, `httpx`, `pypdf`, `python-mul
 curl -fsSL https://raw.githubusercontent.com/edantonio505/miniclosedai/main/install.sh | bash
 ```
 
-What it does: clones to `~/miniclosedai`, creates a Python venv, installs the three dependencies, and starts the server detached on port `8095`. When it returns, open <http://localhost:8095>. Re-run the same command later to update — it `git pull`s the latest and reinstalls deps in place.
+What it does: clones to `~/miniclosedai`, creates a Python venv, installs the dependencies, and starts the server detached on port `8095`. **On a machine with working CUDA** (`nvidia-smi` answers) it goes further: it also clones the two sibling repos next to the app — **miniclosedai-llm** (HuggingFace model server) and **miniclosedai-voice** (ASR + TTS) — runs the voice one-time setup (torch wheels matched to your CUDA — several GB, takes minutes), and starts the whole stack via `./dev.sh up`, so the **Models** and **Voice Studio** tabs are live immediately (open <https://localhost:8095> — self-signed cert). On a CPU-only box it installs just the app (plain HTTP on <http://localhost:8095>) — same UI; point the tabs at remote services via Settings. Re-run the same command later to update — it `git pull`s everything (siblings included) and reinstalls deps in place.
 
 **No `curl`?** Same thing with `wget`:
 
@@ -113,11 +113,14 @@ wget -qO- https://raw.githubusercontent.com/edantonio505/miniclosedai/main/insta
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `MINICLOSEDAI_DIR` | `$HOME/miniclosedai` | Where to clone. |
+| `MINICLOSEDAI_DIR` | `$HOME/miniclosedai` | Where to clone (siblings land next to it). |
 | `MINICLOSEDAI_PORT` | `8095` | Port to bind. |
 | `MINICLOSEDAI_START` | `1` | `1` = auto-start the server detached, `0` = install only and print the run command. |
 | `MINICLOSEDAI_BRANCH` | `main` | Checkout a feature branch instead. |
 | `MINICLOSEDAI_REPO` | canonical URL | Use a fork. |
+| `MINICLOSEDAI_FULL` | `auto` | `auto` = install the GPU siblings only when CUDA works; `1` = force; `0` = app only. |
+| `MINICLOSEDAI_LLM_REPO` / `MINICLOSEDAI_VOICE_REPO` | canonical URLs | Fork overrides for the siblings. |
+| `MINICLOSEDAI_VOICE_SETUP` | `1` | `0` = clone the voice repo but skip its multi-GB torch setup (run `setup.sh` later). |
 
 Example — install to a custom path, skip auto-start:
 
