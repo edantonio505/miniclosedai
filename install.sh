@@ -21,6 +21,11 @@
 #   MINICLOSEDAI_JETSON_TORCH=2.8.0      torch/torchaudio version to pull from
 #                                         jetson-ai-lab on a Jetson (auto-picks
 #                                         the newest cp310 wheel if unavailable)
+#   OLLAMA_URL=...                        where Ollama listens; auto-detected
+#                                         (probes :11434/:11433) when unset, and
+#                                         written to ~/.bash_aliases for reuse
+#   MINICLOSEDAI_VOICE_URL=...            local voice service URL to auto-register
+#                                         in the app (default http://localhost:8090)
 #
 # What it does:
 #   1. Verifies git + python3 ≥ 3.10 are present
@@ -53,6 +58,12 @@ FULL_MODE="${MINICLOSEDAI_FULL:-auto}"
 LLM_REPO_URL="${MINICLOSEDAI_LLM_REPO:-https://github.com/edantonio505/miniclosedai-llm.git}"
 VOICE_REPO_URL="${MINICLOSEDAI_VOICE_REPO:-https://github.com/edantonio505/miniclosedai-voice.git}"
 VOICE_SETUP="${MINICLOSEDAI_VOICE_SETUP:-1}"
+# Local voice service URL to auto-register in the app (gap-3 fix). Preset it in
+# ~/.bash_aliases to point elsewhere; the installer reads it from the env.
+VOICE_URL="${MINICLOSEDAI_VOICE_URL:-http://localhost:8090}"
+# Where the app keeps its SQLite DB (mirrors app.py's default).
+DB_PATH="${MINICLOSEDAI_DB_PATH:-$INSTALL_DIR/miniclosedai.db}"
+VOICE_OK=0   # set to 1 once the voice env is built, gates auto-registration
 
 if [ -t 1 ]; then
     BOLD=$'\e[1m'; GREEN=$'\e[32m'; RED=$'\e[31m'; DIM=$'\e[2m'; RST=$'\e[0m'
@@ -67,6 +78,78 @@ fail() { warn "$1"; exit 1; }
 
 need() {
     command -v "$1" >/dev/null 2>&1 || fail "Missing required tool: $1. Install it, then re-run."
+}
+
+# ---------- Gap-2: find where Ollama actually listens ----------
+# A fresh DB seeds the built-in backend at OLLAMA_URL (default :11434), but a
+# host may run Ollama on a custom port (e.g. :11433 via a systemd override).
+# Honor an explicit OLLAMA_URL / OLLAMA_HOST, else probe the two common ports.
+detect_ollama_url() {
+    if [ -n "${OLLAMA_URL:-}" ]; then echo "$OLLAMA_URL"; return; fi
+    if [ -n "${OLLAMA_HOST:-}" ]; then
+        case "$OLLAMA_HOST" in http*) echo "$OLLAMA_HOST";; *) echo "http://$OLLAMA_HOST";; esac
+        return
+    fi
+    local p
+    for p in 11434 11433; do
+        if curl -sf -m 2 "http://127.0.0.1:$p/api/tags" >/dev/null 2>&1; then
+            echo "http://127.0.0.1:$p"; return
+        fi
+    done
+    echo "http://localhost:11434"
+}
+
+# ---------- Gaps 2 + 3: reconcile backends in the app DB ----------
+# Run AFTER the app has started (so the DB + schema exist). Points the built-in
+# Ollama backend at the detected URL, and registers the local voice service so
+# the mic buttons light up without a manual Settings step. Idempotent.
+finalize_backends() {
+    [ -f "$DB_PATH" ] || return 0
+    "$INSTALL_DIR/.venv/bin/python" - "$DB_PATH" "$OLLAMA_URL_DETECTED" "$VOICE_URL" "$VOICE_OK" <<'PY' 2>/dev/null || true
+import sqlite3, sys
+db, ollama_url, voice_url, voice_ok = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+c = sqlite3.connect(db, timeout=15)
+try:
+    # gap 2: built-in ollama → detected URL
+    c.execute("UPDATE backends SET base_url=? WHERE kind='ollama' AND (is_builtin=1 OR id=1)",
+              (ollama_url,))
+    # gap 3: register the local voice backend once (only if voice was built)
+    if voice_ok == "1" and not c.execute(
+            "SELECT 1 FROM backends WHERE kind='voice' AND base_url=?", (voice_url,)).fetchone():
+        c.execute("INSERT INTO backends (name, kind, base_url, enabled) VALUES (?, 'voice', ?, 1)",
+                  ("Voice (local, GPU)", voice_url))
+    c.commit()
+finally:
+    c.close()
+PY
+    if [ "$VOICE_OK" = "1" ]; then
+        ok "backends reconciled (Ollama → $OLLAMA_URL_DETECTED, voice → $VOICE_URL)"
+    else
+        ok "backends reconciled (Ollama → $OLLAMA_URL_DETECTED)"
+    fi
+}
+
+# ---------- Persist env for future shells / installs (~/.bash_aliases) ----------
+# The user asked that a fresh install pick these up automatically. We write a
+# marked, idempotent block so re-running just refreshes it (never duplicates).
+write_bash_aliases() {
+    local f="$HOME/.bash_aliases"
+    local begin="# >>> miniclosedai (auto) >>>"
+    local end="# <<< miniclosedai (auto) <<<"
+    touch "$f"
+    # strip any previous managed block, then append the current one
+    if grep -qF "$begin" "$f" 2>/dev/null; then
+        sed -i "/${begin//\//\\/}/,/${end//\//\\/}/d" "$f"
+    fi
+    {
+        echo "$begin"
+        echo "# Auto-written by miniclosedai install.sh — points the app at the local"
+        echo "# Ollama/voice services so a fresh install is recognized automatically."
+        echo "export OLLAMA_URL=\"$OLLAMA_URL_DETECTED\""
+        echo "export MINICLOSEDAI_VOICE_URL=\"$VOICE_URL\""
+        echo "$end"
+    } >> "$f"
+    ok "wrote env to $f (OLLAMA_URL, MINICLOSEDAI_VOICE_URL)"
 }
 
 printf '%sMiniClosedAI installer%s\n' "$BOLD" "$RST"
@@ -113,6 +196,14 @@ fi
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q -r requirements.txt
 ok "dependencies installed"
+
+# ---------- Gap-2: detect Ollama + export so the fresh DB seeds correctly ----
+# db.py seeds the built-in backend from $OLLAMA_URL at first app start, so
+# exporting it here means a brand-new DB gets the right port with no edit.
+OLLAMA_URL_DETECTED="$(detect_ollama_url)"
+export OLLAMA_URL="$OLLAMA_URL_DETECTED"
+ok "Ollama endpoint: $OLLAMA_URL_DETECTED"
+write_bash_aliases
 
 # ---------- GPU siblings (miniclosedai-llm + miniclosedai-voice) ----------
 # The Models and Voice Studio tabs are the GUIs for two sibling services.
@@ -233,6 +324,7 @@ if [ "$INSTALL_FULL" = "1" ]; then
             if is_jetson; then
                 # Jetson path: build with jetson-ai-lab GPU wheels (see above).
                 if jetson_voice_setup "$VOICE_DIR"; then
+                    VOICE_OK=1
                     ok "voice service set up (Jetson GPU, sm_87)"
                 else
                     warn "voice Jetson setup failed — re-run this installer, or build manually with jetson-ai-lab torch"
@@ -240,6 +332,7 @@ if [ "$INSTALL_FULL" = "1" ]; then
             elif [ -x "$VOICE_DIR/setup.sh" ]; then
                 say "Running voice one-time setup (torch + TTS models — several GB, can take minutes)…"
                 if ( cd "$VOICE_DIR" && ./setup.sh ); then
+                    VOICE_OK=1
                     ok "voice service set up"
                 else
                     warn "voice setup failed — fix and re-run: cd $VOICE_DIR && ./setup.sh"
@@ -291,6 +384,7 @@ if [ "$INSTALL_FULL" = "1" ] && [ -x "$INSTALL_DIR/dev.sh" ] && command -v opens
     ( cd "$INSTALL_DIR" && ./dev.sh up ) || warn "dev.sh up reported a problem — check output above"
     if curl -skf -m 3 "https://127.0.0.1:$PORT/" >/dev/null 2>&1; then
         ok "server running (https)"
+        finalize_backends   # gaps 2+3: point at the real Ollama, register voice
         echo
         printf '%sOpen: %shttps://localhost:%s%s  (self-signed cert — accept the warning)\n' "$BOLD" "$GREEN" "$PORT" "$RST"
         echo
@@ -315,6 +409,7 @@ for _ in $(seq 1 30); do
     sleep 0.5
     if curl -sf -m 2 "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
         ok "server running"
+        finalize_backends   # gap 2: point the built-in backend at the real Ollama
         echo
         printf '%sOpen: %shttp://localhost:%s%s\n' "$BOLD" "$GREEN" "$PORT" "$RST"
         echo
