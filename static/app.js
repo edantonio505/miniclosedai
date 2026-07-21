@@ -674,6 +674,13 @@ async function loadModels() {
     if (saved.model) _selectModelOption(saved.model, saved.backend_id);
   } catch {}
 
+  // Fallback: nothing got selected (no saved model, or the saved one is gone —
+  // e.g. right after deleting all bots) but models DO exist → auto-select the
+  // first usable one, so "+ New bot" isn't dead-ended on "Pick a model first."
+  if (els.modelSelect.selectedIndex === -1 && totalModels > 0) {
+    _selectFirstAvailableModel();
+  }
+
   if (totalModels === 0) {
     setStatus("warn", `No models available. Endpoints: ${backends.length} · reachable: ${reachableCount}.`);
   } else {
@@ -711,6 +718,23 @@ function _selectModelOption(modelName, backendId) {
   // No match — deselect.
   els.modelSelect.selectedIndex = -1;
   if (typeof _syncModelPickerLabel === "function") _syncModelPickerLabel();
+  return false;
+}
+
+/**
+ * Select the first non-disabled model option (first reachable backend with
+ * models). Used as a default when nothing could be restored, so the app always
+ * has a usable model selected instead of blocking bot/chat creation.
+ * Returns true if one was selected.
+ */
+function _selectFirstAvailableModel() {
+  for (const opt of els.modelSelect.querySelectorAll("option")) {
+    if (opt.disabled || !opt.value) continue;
+    opt.selected = true;
+    if (typeof _syncModelPickerLabel === "function") _syncModelPickerLabel();
+    try { saveSettings(); } catch {}   // persist so the choice sticks
+    return true;
+  }
   return false;
 }
 
