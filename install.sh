@@ -18,6 +18,9 @@
 #   MINICLOSEDAI_VOICE_REPO=...           override miniclosedai-voice repo URL
 #   MINICLOSEDAI_VOICE_SETUP=1            0 = clone voice but skip its setup.sh
 #                                         (the multi-GB torch install)
+#   MINICLOSEDAI_JETSON_TORCH=2.8.0      torch/torchaudio version to pull from
+#                                         jetson-ai-lab on a Jetson (auto-picks
+#                                         the newest cp310 wheel if unavailable)
 #
 # What it does:
 #   1. Verifies git + python3 ≥ 3.10 are present
@@ -26,6 +29,11 @@
 #   4. On a CUDA machine (nvidia-smi answers), ALSO clones the two sibling
 #      repos next to it — miniclosedai-llm (model server) and
 #      miniclosedai-voice (ASR + TTS) — and runs the voice one-time setup.
+#      NVIDIA Jetson (Tegra/Orin) is auto-detected: the voice env is built with
+#      NVIDIA's jetson-ai-lab torch (sm_87) instead of pytorch.org's generic
+#      aarch64 wheels (which load but crash on the Orin GPU), and the Tegra NVML
+#      allocator workaround is baked into the voice venv. So a fresh Jetson
+#      install gets working GPU voice out of the box.
 #      The full stack then starts via ./dev.sh up (voice + models + app) and
 #      the Models / Voice Studio tabs are live. CPU-only boxes skip this and
 #      run the app alone — same UI, register remote endpoints in Settings.
@@ -131,6 +139,74 @@ clone_or_update() {
     fi
 }
 
+# ---------- Jetson (Tegra) detection + GPU-voice recipe ----------
+# NVIDIA Jetson (Orin/Xavier) is aarch64 with an *integrated* CUDA GPU whose
+# compute capability (sm_87 on Orin) is NOT covered by pytorch.org's generic
+# aarch64 wheels — those load but crash at the first GPU op ("no kernel image
+# is available"). The voice repo's setup.sh installs exactly those wheels, so
+# on Jetson we bypass it and build torch from NVIDIA's jetson-ai-lab index,
+# which ships sm_87 wheels (built for cp310 = the Jetson system Python).
+is_jetson() { [ "$(uname -m)" = "aarch64" ] && [ -f /etc/nv_tegra_release ]; }
+
+jetson_index_url() {
+    # JetPack major from the L4T release tag (R36→jp6, R35→jp5); CUDA from the
+    # driver. Yields e.g. https://pypi.jetson-ai-lab.io/jp6/cu126/+simple/
+    # (|| true guards keep a missing tool from aborting the installer.)
+    local l4t jp cuda
+    l4t=$(sed -nE 's/^# R([0-9]+).*/\1/p' /etc/nv_tegra_release 2>/dev/null) || true
+    case "$l4t" in 35) jp=jp5 ;; *) jp=jp6 ;; esac
+    cuda=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9.]+' | awk '{print $NF}') || true
+    if [ -z "$cuda" ]; then
+        cuda=$(nvcc --version 2>/dev/null | sed -nE 's/.*release ([0-9]+\.[0-9]+).*/\1/p') || true
+    fi
+    [ -n "$cuda" ] || cuda=12.6
+    echo "https://pypi.jetson-ai-lab.io/${jp}/cu${cuda//./}/+simple/"
+}
+
+jetson_pick_torch() {
+    # Prefer the validated default; else the newest cp310 torch the index has.
+    local idx="$1" want="${MINICLOSEDAI_JETSON_TORCH:-2.8.0}" list
+    list=$(curl -s -m 20 "${idx}torch/" 2>/dev/null \
+           | grep -oE 'torch-[0-9.]+-cp310' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -uV) || list=""
+    if echo "$list" | grep -qx "$want" 2>/dev/null; then echo "$want"
+    elif [ -n "$list" ]; then echo "$list" | tail -1
+    else echo "$want"; fi
+}
+
+jetson_voice_setup() {
+    local vdir="$1" idx tv
+    idx="$(jetson_index_url)"; tv="$(jetson_pick_torch "$idx")"
+    say "Jetson/Tegra detected — building voice on system Python 3 + jetson-ai-lab torch $tv (sm_87)."
+    say "  wheel index: $idx"
+    ( set -e
+      cd "$vdir"
+      rm -rf env
+      python3 -m venv env
+      env/bin/pip install -q --upgrade pip wheel setuptools
+      # torch/torchaudio built for the Jetson GPU (sm_87). Its own deps resolve
+      # via the index's PyPI mirror. Keep this as its own step so nothing later
+      # can pull a pytorch.org wheel over it.
+      env/bin/pip install -q "torch==$tv" "torchaudio==$tv" --index-url "$idx"
+      env/bin/pip install -q "numpy>=1.24,<2"
+      env/bin/pip install -q --no-deps chatterbox-tts==0.1.6
+      env/bin/pip install -q -r requirements.txt
+      # Same patches the repo's setup.sh applies.
+      DF_IO=$(find env -path "*/df/io.py" -not -path "*/__pycache__/*" 2>/dev/null | head -1) || true
+      if [ -n "$DF_IO" ] && grep -q "from torchaudio.backend.common import AudioMetaData" "$DF_IO" 2>/dev/null; then
+          sed -i 's|from torchaudio.backend.common import AudioMetaData|class AudioMetaData: pass  # stub for torchaudio>=2.1|' "$DF_IO"
+      fi
+      TURBO=$(find env -path "*/chatterbox/tts_turbo.py" -not -path "*/__pycache__/*" 2>/dev/null | head -1) || true
+      if [ -n "$TURBO" ] && grep -q 'token=os.getenv("HF_TOKEN") or True' "$TURBO" 2>/dev/null; then
+          sed -i 's|token=os.getenv("HF_TOKEN") or True|token=os.getenv("HF_TOKEN") or None|' "$TURBO"
+      fi
+      # Tegra has only partial NVML support, so torch's CUDA caching allocator
+      # asserts when moving a model to GPU. Bake the documented workaround into
+      # the venv so every `start.sh` (which sources this) picks it up.
+      grep -q PYTORCH_NO_CUDA_MEMORY_CACHING env/bin/activate 2>/dev/null \
+          || echo 'export PYTORCH_NO_CUDA_MEMORY_CACHING=1' >> env/bin/activate
+    )
+}
+
 INSTALL_FULL=0
 case "$FULL_MODE" in
     1) INSTALL_FULL=1 ;;
@@ -154,7 +230,14 @@ if [ "$INSTALL_FULL" = "1" ]; then
 
     if clone_or_update "$VOICE_REPO_URL" "$VOICE_DIR" "miniclosedai-voice"; then
         if [ "$VOICE_SETUP" = "1" ]; then
-            if [ -x "$VOICE_DIR/setup.sh" ]; then
+            if is_jetson; then
+                # Jetson path: build with jetson-ai-lab GPU wheels (see above).
+                if jetson_voice_setup "$VOICE_DIR"; then
+                    ok "voice service set up (Jetson GPU, sm_87)"
+                else
+                    warn "voice Jetson setup failed — re-run this installer, or build manually with jetson-ai-lab torch"
+                fi
+            elif [ -x "$VOICE_DIR/setup.sh" ]; then
                 say "Running voice one-time setup (torch + TTS models — several GB, can take minutes)…"
                 if ( cd "$VOICE_DIR" && ./setup.sh ); then
                     ok "voice service set up"
