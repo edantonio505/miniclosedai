@@ -1135,7 +1135,7 @@ _LLM_MANAGER_KEY = os.environ.get("MINICLOSEDAI_LLM_MANAGER_KEY", "").strip()
 
 # Only the manager endpoints the Models page actually uses — a proxy, not an
 # open relay. Prefix match on the first path segment(s).
-_LLM_PROXY_ALLOWED = ("health", "gpu", "models", "analyze", "cache", "test-image")
+_LLM_PROXY_ALLOWED = ("health", "gpu", "models", "analyze", "cache", "test-image", "hf-token")
 
 _VOICESTUDIO_ALLOWED = (
     "health", "voices", "api/connect-info",

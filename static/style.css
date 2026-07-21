@@ -3521,7 +3521,16 @@ body[data-page="voice-studio"] .page-voice-studio {
   display: grid; grid-template-columns: max-content 1fr; gap: 3px 16px;
 }
 .mp-a-grid span:nth-child(odd) { color: var(--text-muted); }
-.mp-a-actions { margin-top: 10px; }
+.mp-a-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+.mp-err-actions { margin: 8px 0 2px; }
+.mp-err-detail { margin-top: 8px; }
+.mp-err-detail summary { cursor: pointer; font-size: 12px; opacity: 0.85; }
+.mp-err-detail pre {
+  margin: 6px 0 0; padding: 8px; max-height: 220px; overflow: auto;
+  background: var(--panel-subtle); border: 1px solid var(--border);
+  border-radius: var(--r-sm); font-size: 11.5px;
+  white-space: pre-wrap; word-break: break-word;
+}
 .mp-type-pill {
   margin-left: 6px; padding: 1px 7px; border-radius: 999px; font-size: 11px;
   background: var(--accent-soft); color: var(--accent);

@@ -574,6 +574,27 @@
       <div id="mp-banner" class="mp-banner">Checking model server…</div>
       <div id="mp-offline" class="mp-offline" hidden></div>
 
+      <section class="settings-section" id="mp-hf-token-section">
+        <div class="settings-section-header">
+          <h2>Hugging Face access <span id="mp-hf-token-status" class="settings-hint-inline"></span></h2>
+          <button id="mp-hf-token-toggle" type="button" class="btn btn-small">Set token</button>
+        </div>
+        <div id="mp-hf-token-panel" hidden>
+          <p class="settings-hint">Gated models (Llama, Gemma, Mistral, …) need a Hugging Face token.
+            Get a <strong>read</strong> token at
+            <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">huggingface.co/settings/tokens</a>,
+            request access on the model's page, then paste it here. It's saved on the model server and
+            used automatically for every download — no restart needed.</p>
+          <div class="mp-add-row">
+            <input id="mp-hf-token-input" type="password" autocomplete="off" spellcheck="false"
+                   placeholder="hf_… paste your token" />
+            <button id="mp-hf-token-save" type="button" class="btn btn-primary btn-small">Save token</button>
+            <button id="mp-hf-token-clear" type="button" class="btn btn-small btn-danger">Clear</button>
+          </div>
+          <p id="mp-hf-token-msg" class="settings-hint" hidden></p>
+        </div>
+      </section>
+
       <section class="settings-section" id="mp-add-section">
         <div class="settings-section-header"><h2>Add a model</h2></div>
         <form id="mp-add-form">

@@ -7263,16 +7263,115 @@ async function mpAnalyze() {
       return;
     }
     const cls = a.fits ? "ok" : "warn";
+    const needTok = a.gated && !a.hf_token_present;
     out.className = "mp-analyze-result " + cls;
     out.innerHTML =
       `<div class="mp-a-title">${escapeHtml(a.hf_id)} <span class="mp-type-pill">${a.fmt === "gguf" ? "gguf" : (a.multimodal ? "vision" : "text")}</span></div>` +
       `<div class="mp-a-grid">${_mpFmtAnalysis(a)}</div>` +
-      `<div class="mp-a-actions"><button id="mp-analyze-run" class="btn btn-small btn-primary" type="button">${a.fits ? "Download & Run" : "Run anyway"}</button></div>`;
+      (needTok ? `<p class="settings-hint" style="color:var(--warn)">This is a gated model — set a Hugging Face token (and request access on its page) before downloading.</p>` : "") +
+      `<div class="mp-a-actions">` +
+        (needTok ? `<button id="mp-analyze-settoken" class="btn btn-small" type="button">Set Hugging Face token</button>` : "") +
+        `<button id="mp-analyze-run" class="btn btn-small btn-primary" type="button">${a.fits ? "Download & Run" : "Run anyway"}</button>` +
+      `</div>`;
     document.getElementById("mp-analyze-run")
       .addEventListener("click", () => mpAdd(hf, !a.fits));
+    if (needTok) document.getElementById("mp-analyze-settoken")
+      .addEventListener("click", mpOpenTokenPanel);
   } catch (err) {
     out.className = "mp-analyze-result bad"; out.textContent = err.message;
   }
+}
+
+// ---------- Hugging Face token (gated models) ----------
+// model ids that failed to download because a gated repo needs a token — retried
+// automatically once a token is saved (see mpSaveHFToken).
+const _mpGatedModels = new Set();
+
+function mpOpenTokenPanel() {
+  const p = document.getElementById("mp-hf-token-panel");
+  if (!p) return;
+  p.hidden = false;
+  const inp = document.getElementById("mp-hf-token-input");
+  if (inp) { inp.focus(); try { inp.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {} }
+}
+
+async function mpLoadHFToken() {
+  const statusEl = document.getElementById("mp-hf-token-status");
+  if (!statusEl) return;
+  let s;
+  try { s = await _mpApi("hf-token"); }
+  catch (e) { statusEl.textContent = ""; return; }
+  if (!s.present) {
+    statusEl.textContent = "· no token set — required for gated models";
+    const p = document.getElementById("mp-hf-token-panel");
+    if (p) p.hidden = false;   // nudge: reveal the input when none is set
+  } else if (s.user) {
+    statusEl.textContent = `· signed in as ${s.user} (${s.masked})`;
+  } else {
+    statusEl.textContent = `· token set (${s.masked})` + (s.valid === false ? " — unverified" : "");
+  }
+}
+
+async function mpSaveHFToken() {
+  const inp = document.getElementById("mp-hf-token-input");
+  const msg = document.getElementById("mp-hf-token-msg");
+  const token = (inp.value || "").trim();
+  if (!token) { msg.hidden = false; msg.textContent = "Paste a token first."; return; }
+  const btn = document.getElementById("mp-hf-token-save");
+  btn.disabled = true;
+  msg.hidden = false; msg.textContent = "Saving…";
+  try {
+    const r = await _mpApi("hf-token", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    inp.value = "";
+    if (r.valid && r.user) {
+      msg.textContent = `Saved — signed in as ${r.user}. It'll be used for the next download automatically.`;
+      showToast("Hugging Face token saved", "ok");
+    } else {
+      msg.textContent = "Saved, but couldn't verify it with Hugging Face right now (network?). "
+        + "It'll still be used on the next download.";
+      showToast("Token saved (unverified)", "ok");
+    }
+    if (r.warning) msg.textContent += " " + r.warning;
+    await mpLoadHFToken();
+    // Auto-retry any model that failed because it was gated — the download now
+    // continues on its own with the token we just saved.
+    const toRetry = [..._mpGatedModels];
+    for (const id of toRetry) {
+      try { await _mpApi(`models/${encodeURIComponent(id)}/start`, { method: "POST" }); }
+      catch (e) { /* leave it in error; the user can hit Retry */ }
+    }
+    _mpGatedModels.clear();
+    if (toRetry.length) {
+      msg.textContent += ` Retrying ${toRetry.length} model${toRetry.length > 1 ? "s" : ""} now…`;
+      showToast(`Retrying ${toRetry.length} model${toRetry.length > 1 ? "s" : ""} with the new token`, "ok");
+    }
+    // Gated model waiting to be analyzed? re-check it now that we're authenticated.
+    if (document.getElementById("mp-hf-id").value.trim()) mpAnalyze();
+    mpLoadBanner();
+    mpLoadModels();
+  } catch (e) {
+    msg.textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function mpClearHFToken() {
+  const ok = await uiConfirm({
+    title: "Remove Hugging Face token?",
+    message: "Gated models won't download until you set one again.",
+    okText: "Clear", danger: true,
+  });
+  if (!ok) return;
+  try { await _mpApi("hf-token", { method: "DELETE" }); }
+  catch (e) { showToast(e.message, "error"); return; }
+  const msg = document.getElementById("mp-hf-token-msg");
+  if (msg) msg.hidden = true;
+  showToast("Token cleared", "ok");
+  mpLoadHFToken();
 }
 
 let _mpAddInFlight = false;
@@ -7349,9 +7448,24 @@ function mpRenderCard(m) {
 
   const errEl = q(".mp-model-error", n);
   if (m.status === "error" && (m.error || m.detail)) {
-    errEl.hidden = false; errEl.textContent = m.error || m.detail;
-    if (st.lastStatus !== "error") _mpSetExpanded(st, true);
+    const raw = m.error || m.detail;
+    if (m.needs_hf_token) {
+      _mpGatedModels.add(m.id);
+      errEl.innerHTML =
+        `<strong>Gated model — a Hugging Face token is required to download it.</strong> ` +
+        `Request access on the model's HF page, then paste a token to continue.` +
+        `<div class="mp-err-actions"><button class="btn btn-small btn-primary mp-act-settoken" type="button">Set Hugging Face token</button></div>` +
+        `<details class="mp-err-detail"><summary>Show full error</summary><pre>${escapeHtml(raw)}</pre></details>`;
+      q(".mp-act-settoken", n).addEventListener("click", mpOpenTokenPanel);
+      if (st.lastStatus !== "error") { _mpSetExpanded(st, true); mpOpenTokenPanel(); }
+    } else {
+      _mpGatedModels.delete(m.id);
+      errEl.textContent = raw;
+      if (st.lastStatus !== "error") _mpSetExpanded(st, true);
+    }
+    errEl.hidden = false;
   } else {
+    _mpGatedModels.delete(m.id);
     errEl.hidden = true;
   }
   q(".mp-body", n).hidden = !st.expanded;
@@ -7497,7 +7611,13 @@ function _mpOpenLogs(st, id) {
       const pill = st.node.querySelector(".mp-status-pill");
       pill.className = "mp-status-pill mp-status-" + d.status;
       st.node.querySelector(".mp-status-text").textContent = _MP_STATUS_LABEL[d.status] || d.status;
-      if (d.ready) mpLoadModels();
+      if (d.ready) { st.tokenPrompted = false; mpLoadModels(); }
+      // Gated-repo failure detected mid-download → surface the token input at once.
+      else if (d.needs_hf_token && !st.tokenPrompted) {
+        st.tokenPrompted = true;
+        mpLoadModels();      // re-render this card with the "Set token" button + error
+        mpOpenTokenPanel();  // and pop the paste box
+      }
     }
     if (d.eof) _mpCloseLogs(st);
   };
@@ -7572,7 +7692,7 @@ function onModelsPageEntered() {
   if (_mpState.active) return;
   _mpState.active = true;
   fetch("/api/llm-info").then(r => r.json()).then(i => { _mpState.info = i; }).catch(() => {});
-  mpLoadBanner(); mpLoadModels(); mpLoadCache();
+  mpLoadBanner(); mpLoadHFToken(); mpLoadModels(); mpLoadCache();
   _mpState.pollTimer = setInterval(mpLoadModels, 5000);
   _mpState.bannerTimer = setInterval(mpLoadBanner, 15000);
 }
@@ -7596,6 +7716,19 @@ function initModelsPage() {
   document.getElementById("mp-analyze-btn").addEventListener("click", mpAnalyze);
   document.getElementById("mp-refresh-btn").addEventListener("click", () => { mpLoadBanner(); mpLoadModels(); });
   document.getElementById("mp-cache-refresh").addEventListener("click", mpLoadCache);
+  // hugging face token controls
+  const tokToggle = document.getElementById("mp-hf-token-toggle");
+  if (tokToggle) tokToggle.addEventListener("click", () => {
+    const p = document.getElementById("mp-hf-token-panel");
+    p.hidden = !p.hidden;
+    if (!p.hidden) document.getElementById("mp-hf-token-input").focus();
+  });
+  const tokSave = document.getElementById("mp-hf-token-save");
+  if (tokSave) tokSave.addEventListener("click", mpSaveHFToken);
+  const tokInput = document.getElementById("mp-hf-token-input");
+  if (tokInput) tokInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); mpSaveHFToken(); } });
+  const tokClear = document.getElementById("mp-hf-token-clear");
+  if (tokClear) tokClear.addEventListener("click", mpClearHFToken);
 }
 
 // =====================================================================
