@@ -129,6 +129,38 @@ CREATE TABLE IF NOT EXISTS instance_meta (
     name        TEXT    NOT NULL DEFAULT '',
     description TEXT    NOT NULL DEFAULT ''
 );
+
+-- Opt-in authentication (Settings → Security). Auth is enforced iff `users`
+-- has a row; the app is wide open until then. Single account for now (id=1).
+-- password_hash is "salt_hex$scrypt_hex". api_token is the bearer programmatic
+-- clients send; unauthenticated API requests are NOT blocked — they're
+-- recorded in auth_alerts (grace mode) so already-connected projects keep
+-- working while the user migrates them.
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    username      TEXT    NOT NULL,
+    password_hash TEXT    NOT NULL,
+    api_token     TEXT    NOT NULL,
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token      TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS auth_alerts (
+    fingerprint TEXT PRIMARY KEY,
+    method      TEXT    NOT NULL,
+    path        TEXT    NOT NULL,
+    ip          TEXT    NOT NULL,
+    user_agent  TEXT    NOT NULL DEFAULT '',
+    first_seen  TEXT    NOT NULL,
+    last_seen   TEXT    NOT NULL,
+    count       INTEGER NOT NULL DEFAULT 1,
+    dismissed   INTEGER NOT NULL DEFAULT 0
+);
 """
 
 

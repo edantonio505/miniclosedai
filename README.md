@@ -101,7 +101,7 @@ Five Python dependencies — `fastapi`, `uvicorn`, `httpx`, `pypdf`, `python-mul
 curl -fsSL https://raw.githubusercontent.com/edantonio505/miniclosedai/main/install.sh | bash
 ```
 
-What it does: clones to `~/miniclosedai`, creates a Python venv, installs the three dependencies, and starts the server detached on port `8095`. When it returns, open <http://localhost:8095>. Re-run the same command later to update — it `git pull`s the latest and reinstalls deps in place.
+What it does: clones to `~/miniclosedai`, creates a Python venv, installs the dependencies, and starts the server detached on port `8095`. **On a machine with working CUDA** (`nvidia-smi` answers) it goes further: it also clones the two sibling repos next to the app — **miniclosedai-llm** (HuggingFace model server) and **miniclosedai-voice** (ASR + TTS) — runs the voice one-time setup (torch wheels matched to your CUDA — several GB, takes minutes), and starts the whole stack via `./dev.sh up`, so the **Models** and **Voice Studio** tabs are live immediately (open <https://localhost:8095> — self-signed cert). On a CPU-only box it installs just the app (plain HTTP on <http://localhost:8095>) — same UI; point the tabs at remote services via Settings. Re-run the same command later to update — it `git pull`s everything (siblings included) and reinstalls deps in place.
 
 **No `curl`?** Same thing with `wget`:
 
@@ -113,11 +113,14 @@ wget -qO- https://raw.githubusercontent.com/edantonio505/miniclosedai/main/insta
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `MINICLOSEDAI_DIR` | `$HOME/miniclosedai` | Where to clone. |
+| `MINICLOSEDAI_DIR` | `$HOME/miniclosedai` | Where to clone (siblings land next to it). |
 | `MINICLOSEDAI_PORT` | `8095` | Port to bind. |
 | `MINICLOSEDAI_START` | `1` | `1` = auto-start the server detached, `0` = install only and print the run command. |
 | `MINICLOSEDAI_BRANCH` | `main` | Checkout a feature branch instead. |
 | `MINICLOSEDAI_REPO` | canonical URL | Use a fork. |
+| `MINICLOSEDAI_FULL` | `auto` | `auto` = install the GPU siblings only when CUDA works; `1` = force; `0` = app only. |
+| `MINICLOSEDAI_LLM_REPO` / `MINICLOSEDAI_VOICE_REPO` | canonical URLs | Fork overrides for the siblings. |
+| `MINICLOSEDAI_VOICE_SETUP` | `1` | `0` = clone the voice repo but skip its multi-GB torch setup (run `setup.sh` later). |
 
 Example — install to a custom path, skip auto-start:
 
@@ -339,6 +342,24 @@ uvicorn app:app --host 127.0.0.1 --port 8095
 
 Open **http://localhost:8095**.
 
+**One command for the whole stack:** on a machine with an NVIDIA GPU + CUDA, `./dev.sh up`
+brings all three systems online together — the **voice service** (ASR + TTS,
+sibling repo `miniclosedai-voice`), the **LLM model server** (`miniclosedai-llm`,
+engine auto-detected), and **MiniClosedAI** itself. `./dev.sh status` shows all three;
+`./dev.sh down` stops only the app (voice + models stay warm). The Models and Voice
+Studio tabs in the activity bar are the GUIs for the two siblings — no separate
+dashboards needed.
+
+`./dev.sh up` alone is enough on a fresh clone — it self-bootstraps a `.venv` and
+installs `requirements.txt` if one doesn't exist yet, same as the sibling repos' own
+`dev.sh` scripts, so a separate `install.sh` run first isn't required. A sibling repo
+that isn't cloned next to this one (or no working `nvidia-smi`) is skipped with a
+warning, not a crash — MiniClosedAI itself always comes up either way; the Models/Voice
+Studio tabs just show "not running" until you add that sibling or a remote endpoint.
+Override the port with `MINICLOSEDAI_PORT` (also honored by `install.sh`), or the
+sibling checkout paths with `MINICLOSEDAI_VOICE_DIR` / `MINICLOSEDAI_LLM_DIR` if they
+live somewhere other than next to this repo.
+
 ---
 
 ## Your first bot — 60 seconds
@@ -399,6 +420,18 @@ live on your `PATH`.)
 ./mcai bots export "Summarizer" --out bot.json
 ./mcai bots import bot.json --backend 1
 ./mcai logs
+
+# Models tab, from the terminal — run HuggingFace LLMs via the model manager
+./mcai llm ls                                  # what's running
+./mcai llm run meta-llama/Llama-3.1-8B-Instruct --wait
+./mcai llm test llama-3-1-8b-instruct "say hi"
+./mcai llm register llama-3-1-8b-instruct      # one-click "use it as a backend"
+
+# Voice Studio tab, from the terminal — manage any connected voice service
+./mcai voice ls                                # voice catalog (pick --backend if you have several)
+./mcai voice clone sample.wav --name "Edgar" --language en
+./mcai voice speak "hello there" --voice edgar --out hi.wav --play
+./mcai voice transcribe hi.wav
 ```
 
 A bot or app argument accepts either its numeric id or a unique substring of its
@@ -409,8 +442,14 @@ bearer if set — useful when you front the server with an auth proxy), and
 server uses a self-signed cert). Run `./mcai <command> -h` for per-command help.
 Symlink it onto your `PATH` if you like: `ln -s "$(pwd)/mcai" ~/.local/bin/mcai`.
 
-> Voice (push-to-talk / call mode) and the WebRTC duplex path remain GUI-only — they
-> need a browser mic/speaker. Everything else in the GUI is reachable from `mcai`.
+The `llm` and `voice` groups are the terminal side of the **Models** and **Voice
+Studio** tabs — same `/api/llm/*` and `/api/voicestudio/*` proxies, so a model you
+start with `mcai llm run` shows up in the Models tab and vice-versa. `voice` takes an
+optional `--backend <id-or-name>` when you have more than one voice service registered
+(defaults to the first enabled one). `mcai voice speak`/`transcribe` route through
+MiniClosedAI's own port even when the CLI has no direct network path to a remote voice
+backend — only push-to-talk and the WebRTC duplex call mode need an actual browser
+mic/speaker and stay GUI-only.
 
 ### From another machine, or from an LLM agent
 
@@ -485,6 +524,8 @@ Vertical nav with three icons — clicking swaps the main content area without u
 
 - **Bots** (top, message-square icon) — the home for everything chat-related. Shows a searchable list of every saved conversation; click a card to enter that chat. The icon stays highlighted whether you're on the list OR inside a chat (chats are children of Bots, not a sibling tab). A small **pulse dot** on this icon lights up when a bot has a streaming or unread reply you haven't seen yet.
 - **Logs** (middle, terminal icon) — live LM-Studio-style viewer of every chat request and response across all endpoints. See [Logs page](#logs-page) below.
+- **Models** (CPU-chip icon) — the **miniclosedai-llm** model server as a first-class page: analyze any HuggingFace model (type/size/fits verdict), download & run it with vLLM (11 advanced fields), watch per-model live logs, quick-test it (text or vision), manage the on-disk weight cache, and **register a ready model as a backend in one click** — it appears in every model picker immediately. All traffic flows through a same-origin `/api/llm/*` proxy, so the manager stays its own process (auto-started by `./dev.sh up` on a CUDA machine); when it's down the tab shows a friendly hint instead of errors.
+- **Voice Studio** (mic icon) — the **miniclosedai-voice** voice manager as a first-class page: pick any registered voice service (local or remote/RunPod), see its health (ASR/TTS models, device, relay capability), browse the voice catalog per language, **clone a new voice** by recording a sample in the browser (or uploading audio — decoded, downmixed, and WAV-encoded client-side), and delete clones. New voices appear in the chat voice picker instantly. Proxied via `/api/voicestudio/{backend}/*` with the backend's API key injected server-side.
 - **Theme toggle** (bottom, sits on top of the gear) — cycles System → Light → Dark → System. Respects `prefers-color-scheme` while on System.
 - **Settings** (bottom, gear icon) — register and manage LLM endpoints (see [Connecting LM Studio and other endpoints](#connecting-lm-studio-and-other-openai-compatible-endpoints)). Also home to **Instance identity**: give this installation a name (becomes the browser-tab title) and a description (revealed when hovering the tab) — stored server-side, so multiple MiniClosedAI instances stay tellable apart from the tab strip alone.
 
@@ -2844,26 +2885,35 @@ miniclosedai/
 
 ## Security
 
-**MiniClosedAI ships with no authentication.** Anyone who can reach the HTTP port can:
+**Authentication is opt-in.** Out of the box MiniClosedAI is open (target deployment:
+`127.0.0.1` or a trusted LAN). To turn auth on: **Settings → Security → create a
+username and password.** From that moment:
 
-- Read, create, update, or delete any conversation.
-- Invoke any bot's endpoint (uses your local CPU/GPU, generates any output the bot is configured to).
-- Write to the SQLite file.
+- **Browser**: opening the app without a session shows a light **landing page**
+  (project blurb + sign-in). Sessions last until the browser closes. Sign out from
+  Settings; change password or disable auth (password-confirmed) there too.
+- **API — grace mode**: an **API token** is generated (shown once; copy/regenerate in
+  Settings). Clients should send `Authorization: Bearer <token>` — but requests
+  without it are **never blocked**. Instead each unauthenticated client is recorded
+  under **Settings → "Connections needing attention"** (method, path, IP, user-agent,
+  count) with an amber dot on the Settings gear — so everything already wired to this
+  instance keeps working while you migrate it.
 
-This is intentional — the target deployment is local-only on `127.0.0.1`, or on a trusted LAN.
+Updating each kind of client:
+- `mcai` CLI → `export MINICLOSEDAI_API_KEY=<token>` (already supported).
+- Generated SDKs (TS/JS/Python) → `setApiKey("<token>")` / `set_api_key(...)`, or the
+  `MINICLOSEDAI_API_KEY` env var (JS/Python).
+- OpenAI SDKs on `/v1` → `api_key="<token>"`.
+- `xbench_client` → `XBenchClient(api_key="<token>")` or the env var.
 
-If you need to expose MiniClosedAI beyond that, put it behind:
+**Grace mode is deliberate backwards compatibility, which means API auth is advisory**:
+anyone who can reach the port can still call the API (they'll just be flagged). For
+hostile networks, still pair it with a reverse proxy (nginx, Caddy, OAuth2-Proxy), a
+VPN (Tailscale, WireGuard), or a firewall allow-list.
 
-- A reverse proxy (nginx, Caddy) with basic auth or OAuth2-Proxy.
-- A VPN (Tailscale, WireGuard).
-- A firewall allow-list.
-
-This applies equally to terminal/agent access: the `mcai` CLI and the OpenAI-compatible
-endpoint reach the same unauthenticated `/api`. If you front the server with a
-token-checking proxy, set `MINICLOSEDAI_API_KEY` and both `mcai` and OpenAI SDK clients
-will send `Authorization: Bearer …`. See [Terminal CLI → From another machine, or from an LLM agent](#terminal-cli-mcai).
-
-The app does **not** speak HTTPS directly. `navigator.clipboard` requires HTTPS or `localhost`; the app falls back to `document.execCommand("copy")` over plain-HTTP.
+Passwords are hashed with scrypt; tokens/sessions use `secrets` randomness; no new
+dependencies. The session cookie is HttpOnly and marked Secure automatically when
+served over HTTPS (the dev cert setup). `navigator.clipboard` requires HTTPS or `localhost`; the app falls back to `document.execCommand("copy")` over plain-HTTP.
 
 ---
 

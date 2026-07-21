@@ -30,12 +30,14 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import traceback
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import wave
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 
@@ -76,12 +78,30 @@ def _clear_companions() -> None:
 # In-process fake backend servers
 # ------------------------------------------------------------------
 
+class _ThreadingHTTPServerRobust(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a larger accept backlog.
+
+    socketserver's default `request_queue_size` (5) is a CLASS attribute read
+    by `server_activate()` during `__init__` — by the time a server object
+    exists, `socket.listen()` has already run with whatever value was in
+    effect, so this must be overridden on the class, not the instance.
+    Too-small a backlog is too small once a test fires several back-to-back
+    requests at one fake server (e.g. speak / speak-stream / transcribe in
+    quick succession): under full-suite load the OS can refuse/reset a
+    connection that arrives while the backlog is momentarily full, surfacing
+    as an intermittent httpx.ConnectError/ReadError ("not reachable") even
+    though the server is up and each call works fine in isolation.
+    """
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class _FakeServer:
     """Base class — threads a HTTPServer on a random localhost port."""
 
     def __init__(self) -> None:
         self.captured: list[dict] = []     # must exist before _handler_class runs
-        self._httpd = HTTPServer(("127.0.0.1", 0), self._handler_class())
+        self._httpd = _ThreadingHTTPServerRobust(("127.0.0.1", 0), self._handler_class())
         self.port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
@@ -369,9 +389,37 @@ class FakeVoice(_FakeServer):
                     self._reply(200, body, "application/json"); return
                 self._reply(404, b"not found", "text/plain")
 
+            def do_DELETE(self):
+                if outer.fail:
+                    self._reply(503, b"down", "text/plain"); return
+                if self.path.startswith("/voices/"):
+                    vid = self.path.split("/voices/", 1)[1]
+                    captured.append({"path": self.path, "method": "DELETE",
+                                     "auth": self.headers.get("Authorization")})
+                    if vid == "default":
+                        self._reply(403, json.dumps({"detail": "reserved"}).encode(),
+                                    "application/json")
+                    else:
+                        self._reply(200, json.dumps({"ok": True, "voice_id": vid}).encode(),
+                                    "application/json")
+                    return
+                self._reply(404, b"not found", "text/plain")
+
             def do_POST(self):
                 if outer.fail:
                     self._reply(503, b"down", "text/plain"); return
+                if self.path == "/voices":
+                    raw = self._read_body()
+                    captured.append({"path": self.path, "method": "POST",
+                                     "auth": self.headers.get("Authorization"),
+                                     "content_type": self.headers.get("Content-Type", ""),
+                                     "body_len": len(raw),
+                                     "body_head": raw[:2000].decode(errors="replace")})
+                    self._reply(201, json.dumps({
+                        "voice_id": "cloned-1", "name": "Cloned", "language": "en",
+                        "duration_sec": 2.0, "sample_rate": 24000,
+                    }).encode(), "application/json")
+                    return
                 if self.path == "/call/configure":
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length)) if length else {}
@@ -415,6 +463,20 @@ class FakeVoice(_FakeServer):
                     for f in frames:
                         self.wfile.write(f"data: {json.dumps(f)}\n\n".encode())
                         self.wfile.flush()
+                    return
+                if self.path == "/speak":
+                    # Non-streaming synth: a minimal valid 1-frame silent WAV
+                    # (mono, 16-bit, 8000 Hz) — enough for a client to write
+                    # and open, without pulling in real TTS.
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = json.loads(self.rfile.read(length)) if length else {}
+                    captured.append({"path": self.path, "payload": payload,
+                                     "auth": self.headers.get("Authorization")})
+                    buf = io.BytesIO()
+                    with wave.open(buf, "wb") as w:
+                        w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+                        w.writeframes(b"\x00\x00")
+                    self._reply(200, buf.getvalue(), "audio/wav")
                     return
                 self._reply(404, b"not found", "text/plain")
 
@@ -1549,6 +1611,215 @@ def _():
         _clear_companions()
 
 
+@test("/api/llm proxy: round-trip + bearer injection + allowlist + llm-info")
+def _():
+    orig_url, orig_key = app_mod.LLM_MANAGER_URL, app_mod._LLM_MANAGER_KEY
+    app_mod.LLM_MANAGER_URL = fake_manager.base_url
+    app_mod._LLM_MANAGER_KEY = "sekret"
+    fake_manager.captured.clear()
+    try:
+        # GET round-trip through the proxy, bearer injected server-side.
+        r = client.get("/api/llm/models")
+        assert r.status_code == 200, r.text
+        assert r.json()["models"][0]["id"] == "qwen3-vl-8b"
+        assert fake_manager.captured[-1]["auth"] == "Bearer sekret", fake_manager.captured[-1]
+        # POST passthrough (JSON body).
+        r = client.post("/api/llm/models/qwen3-vl-8b/stop")
+        assert r.status_code == 200, r.text
+        assert fake_manager.captured[-1]["path"] == "/api/models/qwen3-vl-8b/stop"
+        # Allowlist: unknown prefixes are NOT proxied.
+        r = client.get("/api/llm/secrets")
+        assert r.status_code == 404, r.text
+        # llm-info: reachable against the fake.
+        r = client.get("/api/llm-info")
+        assert r.status_code == 200
+        j = r.json()
+        assert j["manager_url"] == fake_manager.base_url and j["reachable"] is True, j
+        # Unreachable manager → 502 with the dev.sh hint.
+        app_mod.LLM_MANAGER_URL = "http://127.0.0.1:9"
+        r = client.get("/api/llm/models")
+        assert r.status_code == 502, r.text
+        assert "dev.sh" in r.text
+        r = client.get("/api/llm-info")
+        assert r.json()["reachable"] is False
+    finally:
+        app_mod.LLM_MANAGER_URL, app_mod._LLM_MANAGER_KEY = orig_url, orig_key
+
+
+@test("/api/voicestudio proxy: catalog + upload passthrough + bearer + guards")
+def _():
+    # Register the fake voice service WITH an api_key — the proxy must inject
+    # it as a bearer on every forwarded call.
+    r = client.post("/api/backends", json={
+        "name": "StudioVoice", "kind": "voice",
+        "base_url": fake_voice.base_url, "api_key": "vkey",
+    })
+    assert r.status_code == 200, r.text
+    vbid = r.json()["id"]
+    fake_voice.captured.clear()
+    try:
+        # Catalog via proxy.
+        r = client.get(f"/api/voicestudio/{vbid}/voices")
+        assert r.status_code == 200, r.text
+        assert "en" in r.json()
+        # Health via proxy.
+        assert client.get(f"/api/voicestudio/{vbid}/health").json()["ok"] is True
+        # Multipart clone-upload passthrough: fields + bytes arrive intact.
+        r = client.post(
+            f"/api/voicestudio/{vbid}/voices",
+            files={"audio": ("sample.wav", b"RIFF" + b"\x00" * 64, "audio/wav")},
+            data={"name": "Test Clone", "language": "en"},
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["voice_id"] == "cloned-1"
+        up = [c for c in fake_voice.captured if c.get("path") == "/voices"][-1]
+        assert up["auth"] == "Bearer vkey", up
+        assert "multipart/form-data" in up["content_type"], up
+        assert "Test Clone" in up["body_head"] and "RIFF" in up["body_head"], up
+        # DELETE via proxy.
+        r = client.delete(f"/api/voicestudio/{vbid}/voices/cloned-1")
+        assert r.status_code == 200, r.text
+        # Reserved voice refusal passes through.
+        assert client.delete(f"/api/voicestudio/{vbid}/voices/default").status_code == 403
+        # Guards: allowlist (call/configure is NOT proxied — only the Voice
+        # Studio + speak/transcribe surface is) + non-voice backend + disabled backend.
+        assert client.get(f"/api/voicestudio/{vbid}/call/configure").status_code == 404
+        assert client.get("/api/voicestudio/1/health").status_code == 400  # backend 1 = ollama
+        client.patch(f"/api/backends/{vbid}", json={"enabled": False})
+        assert client.get(f"/api/voicestudio/{vbid}/health").status_code == 400
+    finally:
+        client.delete(f"/api/backends/{vbid}?force=true")
+
+
+@test("/api/voicestudio proxy: speak + speak/stream + transcribe now proxy through")
+def _():
+    # These three were added to _VOICESTUDIO_ALLOWED so `mcai voice speak` /
+    # `transcribe` work through miniclosedai's one port without the CLI
+    # needing direct network access to the (possibly remote/firewalled)
+    # voice backend. The GUI's Voice Studio tab never calls these — this is
+    # purely a CLI/remote-access capability, additive to the existing guards.
+    r = client.post("/api/backends", json={
+        "name": "SpeakVoice", "kind": "voice",
+        "base_url": fake_voice.base_url, "api_key": "vkey2",
+    })
+    assert r.status_code == 200, r.text
+    vbid = r.json()["id"]
+    fake_voice.captured.clear()
+    try:
+        # Non-streaming /speak: binary WAV passes through with the right
+        # content-type, and the bearer was injected server-side.
+        r = client.post(f"/api/voicestudio/{vbid}/speak",
+                        json={"text": "hi", "voice": "default", "language": "en"})
+        assert r.status_code == 200, r.text
+        assert r.headers.get("content-type", "").startswith("audio/wav"), r.headers
+        assert r.content[:4] == b"RIFF", r.content[:16]
+        speak_calls = [c for c in fake_voice.captured if c.get("path") == "/speak"]
+        assert speak_calls and speak_calls[-1]["auth"] == "Bearer vkey2", fake_voice.captured
+
+        # Streaming /speak/stream: SSE frames pass through untouched.
+        with client.stream("POST", f"/api/voicestudio/{vbid}/speak/stream",
+                           json={"text": "hi", "voice": "default", "language": "en"}) as r:
+            body = b"".join(r.iter_bytes())
+        assert b"chunk_b64" in body and b'"done": true' in body, body
+
+        # /transcribe: multipart passthrough, same as the /voices clone path.
+        r = client.post(f"/api/voicestudio/{vbid}/transcribe",
+                        files={"audio": ("clip.wav", b"RIFF" + b"\x00" * 32, "audio/wav")})
+        assert r.status_code == 200, r.text
+        assert r.json()["text"] == "hello world", r.json()
+    finally:
+        client.delete(f"/api/backends/{vbid}?force=true")
+
+
+@test("auth: opt-in lifecycle — setup, landing, grace alerts, bearer, disable")
+def _():
+    from fastapi.testclient import TestClient as _TC
+    # Pre-state: auth off, / serves the app, API open.
+    assert client.get("/api/auth/state").json() == {"enabled": False, "logged_in": False}
+    assert 'page page-bots' in client.get("/").text
+
+    anon = _TC(app_mod.app)   # separate cookie jar = a logged-out visitor
+    try:
+        # ---- setup: creates account, starts session, returns token once ----
+        r = client.post("/api/auth/setup", json={"username": "edgar", "password": "hunter22"})
+        assert r.status_code == 201, r.text
+        token = r.json()["api_token"]
+        assert len(token) > 20
+        st = client.get("/api/auth/state").json()
+        assert st["enabled"] and st["logged_in"] and st["username"] == "edgar", st
+        # Second setup refused.
+        assert client.post("/api/auth/setup", json={"username": "x", "password": "yyyyyy"}).status_code == 409
+
+        # ---- landing: logged-out visitor gets the landing, not the app ----
+        body = anon.get("/").text
+        assert "landing-card" in body and "Sign in" in body, body[:300]
+        assert 'page page-bots' not in body
+        # The session holder still gets the app.
+        assert 'page page-bots' in client.get("/").text
+
+        # ---- login: wrong → 401; right → session works ----
+        assert anon.post("/api/auth/login", json={"username": "edgar", "password": "nope"}).status_code == 401
+        r = anon.post("/api/auth/login", json={"username": "edgar", "password": "hunter22"})
+        assert r.status_code == 200, r.text
+        assert 'page page-bots' in anon.get("/").text
+        assert anon.get("/api/auth/token").json()["api_token"] == token
+
+        # ---- grace mode: no-auth API call is ALLOWED and alert-recorded ----
+        bare = _TC(app_mod.app)
+        assert bare.get("/api/conversations").status_code == 200   # never blocked
+        alerts = client.get("/api/auth/alerts").json()["alerts"]
+        hit = [a for a in alerts if a["path"] == "/api/conversations"]
+        assert hit, alerts
+        c0 = hit[0]["count"]
+        bare.get("/api/conversations")                              # repeat → count bump
+        hit2 = [a for a in client.get("/api/auth/alerts").json()["alerts"]
+                if a["path"] == "/api/conversations"]
+        assert hit2[0]["count"] == c0 + 1, hit2
+
+        # ---- bearer: token requests are clean (no new alert) ----
+        n0 = len(client.get("/api/auth/alerts").json()["alerts"])
+        r = bare.get("/api/backends", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 200
+        assert len(client.get("/api/auth/alerts").json()["alerts"]) == n0
+
+        # ---- dismiss + clear ----
+        fp = hit2[0]["fingerprint"]
+        client.post("/api/auth/alerts/dismiss", json={"fingerprint": fp})
+        assert not [a for a in client.get("/api/auth/alerts").json()["alerts"]
+                    if a["fingerprint"] == fp]
+        client.post("/api/auth/alerts/clear")
+        assert client.get("/api/auth/alerts").json()["alerts"] == []
+
+        # ---- regenerate: old token now alerts, new one doesn't ----
+        new_token = client.post("/api/auth/token/regenerate").json()["api_token"]
+        assert new_token != token
+        bare.get("/api/models", headers={"Authorization": f"Bearer {token}"})
+        assert [a for a in client.get("/api/auth/alerts").json()["alerts"]
+                if a["path"] == "/api/models"], "old token should now alert"
+        n1 = len(client.get("/api/auth/alerts").json()["alerts"])
+        bare.get("/api/backends", headers={"Authorization": f"Bearer {new_token}"})
+        assert len(client.get("/api/auth/alerts").json()["alerts"]) == n1
+
+        # ---- change password ----
+        r = client.post("/api/auth/change",
+                        json={"current_password": "hunter22", "new_password": "hunter23"})
+        assert r.status_code == 200, r.text
+
+        # ---- logout invalidates the session ----
+        anon.post("/api/auth/logout")
+        assert anon.get("/api/auth/token").status_code == 401
+        assert "landing-card" in anon.get("/").text
+    finally:
+        # Disable auth so the rest of the suite runs in the open state. The
+        # main `client` still holds a valid session.
+        r = client.post("/api/auth/disable", json={"password": "hunter23"})
+        if r.status_code != 200:   # fall back if the change-password step failed
+            client.post("/api/auth/disable", json={"password": "hunter22"})
+    st = client.get("/api/auth/state").json()
+    assert st == {"enabled": False, "logged_in": False}, st
+    assert 'page page-bots' in _TC(app_mod.app).get("/").text   # open again
+
+
 @test("/api/instance: defaults + PUT round-trip + partial update")
 def _():
     # Fresh DB → seeded blank identity.
@@ -2202,6 +2473,22 @@ def _():
     # Settings → Instance identity (tab title + hover description).
     assert 'id="instance-name"' in body
     assert 'id="instance-description"' in body
+    # Security section (opt-in auth) + landing page bits.
+    assert 'id="security-section"' in body
+    assert 'id="auth-setup-btn"' in body
+    assert 'id="auth-alerts-list"' in body
+    assert 'id="settings-alert-dot"' in body
+    landing = client.get("/static/landing.html").text
+    assert "landing-card" in landing and "/api/auth/login" in landing
+    # Models + Voice Studio tabs (the three-app merge): nav buttons + pages.
+    assert 'data-page="models"' in body
+    assert 'data-page="voice-studio"' in body
+    assert 'class="page page-models"' in body
+    assert 'class="page page-voice-studio"' in body
+    assert 'id="mp-add-form"' in body
+    assert 'id="mp-card-tpl"' in body
+    assert 'id="vs-backend-select"' in body
+    assert 'id="vs-record-btn"' in body
 
 
 @test("static: app.js is served and contains recent helpers")
@@ -2239,6 +2526,15 @@ def _():
         "openBotModelPicker", "_chooseBotModel", "_positionBotModelPop",
         # Instance identity (server-side tab title + hover description)
         "loadInstanceMeta", "_applyInstanceTitle", "initInstanceMetaUI",
+        # Models tab (native miniclosedai-llm port)
+        "initModelsPage", "onModelsPageEntered", "onModelsPageLeft",
+        "mpLoadModels", "mpAnalyze", "_mpOpenLogs",
+        # Voice Studio tab (native miniclosedai-voice port)
+        "initVoiceStudioPage", "onVoiceStudioPageEntered", "onVoiceStudioPageLeft",
+        "vsLoadVoices", "vsSaveVoice", "_vsEncodeWav",
+        # Security (opt-in auth + grace-mode alerts)
+        "initSecurityUI", "loadAuthState", "_loadAuthAlerts", "_refreshAuthAlertDot",
+        "_refreshApiCodeToken",   # token baked into the API-code snippets
         # Application export / import — mirrors the bot pattern at the apps level.
         "_handleAppImportFile", "_runAppImport", "_downloadApp",
         "initAppsImportUI",
@@ -5113,21 +5409,40 @@ def _():
 # ----- Auto-register against a fake miniclosedai-llm manager -----
 
 class FakeManager(_FakeServer):
-    """Speaks just enough of miniclosedai-llm's /api/models for the
-    auto-register endpoint to find a served model."""
+    """Speaks enough of the miniclosedai-llm manager API for BOTH the
+    auto-register flow and the /api/llm/* proxy: /api/models (modern
+    {"models": [...]} shape), /api/health, /api/gpu, /api/cache, plus a
+    capture-all for POSTs. Records the Authorization header so the proxy's
+    server-side bearer injection is assertable."""
 
     def _handler_class(self):
+        captured = self.captured
         outer = self
+
         class H(BaseHTTPRequestHandler):
             def log_message(self, *a, **kw): pass
+
+            def _reply(self, status, body, ct="application/json"):
+                self.send_response(status)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
-                if self.path == "/api/models":
-                    body = json.dumps([
+                captured.append({"path": self.path, "method": "GET",
+                                 "auth": self.headers.get("Authorization")})
+                routes = {
+                    "/api/models": {"models": [
                         {
                             "id": "qwen3-vl-8b",
                             "served_name": "qwen3-vl-8b",
                             "hf_id": "Qwen/Qwen3-VL-8B-Instruct",
                             "status": "running",
+                            "ready": True,
+                            "multimodal": True,
+                            "port": 8001,
+                            "source": "custom",
                             "base_url": "http://localhost:8001/v1",
                             "alt_base_url": "http://host.docker.internal:8001/v1",
                         },
@@ -5136,17 +5451,34 @@ class FakeManager(_FakeServer):
                             "served_name": "stopped-model",
                             "hf_id": "Foo/Bar",
                             "status": "stopped",
+                            "ready": False,
+                            "multimodal": False,
+                            "port": 8002,
+                            "source": "custom",
                             "base_url": "http://localhost:8002/v1",
                             "alt_base_url": "http://host.docker.internal:8002/v1",
                         },
-                    ]).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                    return
-                self.send_response(404); self.end_headers()
+                    ]},
+                    "/api/health": {"engine": "docker", "gpu_ok": True,
+                                    "dashboard_url": outer.base_url},
+                    "/api/gpu": {"gpus": [{"index": 0, "name": "FakeGPU",
+                                           "mem_total_mb": 1000, "mem_used_mb": 100,
+                                           "util_pct": 5}]},
+                    "/api/cache": {"models": [], "total_gb": 0, "hf_home": "/tmp/hf"},
+                }
+                body = routes.get(self.path)
+                if body is None:
+                    self._reply(404, b'{"detail": "nope"}'); return
+                self._reply(200, json.dumps(body).encode())
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b""
+                captured.append({"path": self.path, "method": "POST",
+                                 "auth": self.headers.get("Authorization"),
+                                 "body": raw.decode(errors="replace")})
+                self._reply(200, json.dumps({"ok": True}).encode())
+
         return H
 
 
@@ -5287,6 +5619,54 @@ def _():
     finally:
         app_mod._generations.pop(cid, None)
         client.delete(f"/api/conversations/{cid}")
+
+
+# ==================================================================
+# mcai CLI — argparse registration smoke tests. `cli.py` needs a live
+# MiniClosedAI server for actual API calls, but --help never touches the
+# network (argparse prints and exits before require_daemon() runs), so these
+# run in the normal automated suite and catch registration mistakes (typos,
+# a subcommand missing set_defaults, etc.) for the new `llm`/`voice` groups
+# without needing the live-functional pass documented in the plan.
+# ==================================================================
+
+def _cli_help(*args: str) -> str:
+    """Run `cli.py <args> --help` in a subprocess; return combined output.
+    Raises AssertionError with the captured output if the exit code is non-zero
+    (argparse -h exits 0; a bad subcommand definition can raise before that)."""
+    r = subprocess.run(
+        [sys.executable, str(Path(__file__).parent / "cli.py"), *args, "--help"],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert r.returncode == 0, f"cli.py {' '.join(args)} --help exited {r.returncode}\n{r.stdout}\n{r.stderr}"
+    return r.stdout + r.stderr
+
+
+@test("mcai CLI: top-level --help registers the llm + voice groups")
+def _():
+    out = _cli_help()
+    assert "llm" in out and "voice" in out, out
+
+
+@test("mcai CLI: llm --help lists every subcommand + run/test take args cleanly")
+def _():
+    out = _cli_help("llm")
+    for sub in ("info", "gpu", "ls", "analyze", "run", "start", "stop", "rm",
+               "status", "logs", "test", "url", "register", "cache", "free"):
+        assert sub in out, f"'{sub}' missing from `mcai llm --help`:\n{out}"
+    # Spot-check a few subcommands parse their own --help without error
+    # (this is what would catch a stray argparse typo like a duplicate flag).
+    for sub in ("run", "test", "cache", "register"):
+        _cli_help("llm", sub)
+
+
+@test("mcai CLI: voice --help lists every subcommand incl. speak/transcribe")
+def _():
+    out = _cli_help("voice")
+    for sub in ("status", "url", "ls", "clone", "rm", "speak", "transcribe"):
+        assert sub in out, f"'{sub}' missing from `mcai voice --help`:\n{out}"
+    for sub in ("clone", "speak", "transcribe"):
+        _cli_help("voice", sub)
 
 
 # ==================================================================

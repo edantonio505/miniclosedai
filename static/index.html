@@ -36,6 +36,14 @@
       <!-- Feather: terminal — represents request/response stream activity -->
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
     </button>
+    <button class="nav-item" data-page="models" title="Models — run HuggingFace LLMs (miniclosedai-llm)" aria-label="Models">
+      <!-- Feather: cpu — the model server -->
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+    </button>
+    <button class="nav-item" data-page="voice-studio" title="Voice Studio — clone &amp; manage TTS voices (miniclosedai-voice)" aria-label="Voice Studio">
+      <!-- Feather: mic -->
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+    </button>
     <!-- Theme toggle — cycles System → Light → Dark. Lives at the bottom of the
          activity bar, on top of Settings. nav-item-bottom carries the
          margin-top:auto so this + Settings group at the bottom. No data-page,
@@ -49,6 +57,8 @@
     <button class="nav-item" data-page="settings" title="Settings" aria-label="Settings">
       <!-- Feather: settings -->
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <!-- Amber dot: unauthenticated API connections need attention (auth grace mode). -->
+      <span class="nav-alert-dot" id="settings-alert-dot" hidden aria-hidden="true"></span>
     </button>
   </nav>
 
@@ -502,6 +512,236 @@
           <input type="text" id="instance-description" class="settings-select" maxlength="300" placeholder="e.g. lab server — RAG experiments" />
         </div>
         <p class="settings-hint" id="instance-meta-status"></p>
+      </section>
+
+      <section class="settings-section" id="security-section">
+        <div class="settings-section-header">
+          <h2>Security</h2>
+          <button id="auth-signout-btn" class="btn btn-small" hidden>Sign out</button>
+        </div>
+
+        <!-- State A: no account yet — create one to enable auth. -->
+        <div id="auth-setup-box">
+          <p class="settings-hint">Create a username and password to protect this MiniClosedAI. After that, opening the app requires signing in, and the REST API expects a bearer token — <strong>existing API clients keep working</strong> (requests without the token are allowed but flagged below so you can migrate them).</p>
+          <div class="settings-row"><label for="auth-setup-user">Username</label><input id="auth-setup-user" type="text" class="settings-select" maxlength="60" autocomplete="username" /></div>
+          <div class="settings-row"><label for="auth-setup-pass">Password</label><input id="auth-setup-pass" type="password" class="settings-select" autocomplete="new-password" /></div>
+          <div class="settings-row"><label for="auth-setup-pass2">Repeat password</label><input id="auth-setup-pass2" type="password" class="settings-select" autocomplete="new-password" /></div>
+          <button id="auth-setup-btn" class="btn btn-primary btn-small">Create account &amp; enable</button>
+          <p class="settings-hint" id="auth-setup-status"></p>
+        </div>
+
+        <!-- State B: account exists + signed in — manage everything. -->
+        <div id="auth-manage-box" hidden>
+          <p class="settings-hint">Signed in as <strong id="auth-username"></strong>. Sessions last until the browser closes.</p>
+          <div class="settings-row">
+            <label>API token</label>
+            <div class="auth-token-row">
+              <code id="auth-token-value">••••••••••••••••</code>
+              <button id="auth-token-reveal" class="btn btn-small">Reveal</button>
+              <button id="auth-token-copy" class="btn btn-small">Copy</button>
+              <button id="auth-token-regen" class="btn btn-small btn-danger">Regenerate</button>
+            </div>
+          </div>
+          <p class="settings-hint">Programmatic clients send <code>Authorization: Bearer &lt;token&gt;</code> — mcai reads it from <code>MINICLOSEDAI_API_KEY</code>; generated SDKs accept an <code>apiKey</code> option.</p>
+          <details class="auth-advanced"><summary>Change password / disable</summary>
+            <div class="settings-row"><label for="auth-cur-pass">Current password</label><input id="auth-cur-pass" type="password" class="settings-select" autocomplete="current-password" /></div>
+            <div class="settings-row"><label for="auth-new-pass">New password</label><input id="auth-new-pass" type="password" class="settings-select" autocomplete="new-password" /></div>
+            <div class="auth-danger-actions">
+              <button id="auth-change-btn" class="btn btn-small">Change password</button>
+              <button id="auth-disable-btn" class="btn btn-small btn-danger">Disable authentication</button>
+            </div>
+          </details>
+          <p class="settings-hint" id="auth-manage-status"></p>
+
+          <div class="settings-section-header auth-alerts-header">
+            <h2>Connections needing attention <span id="auth-alert-count" class="settings-hint-inline"></span></h2>
+            <button id="auth-alerts-clear" class="btn btn-small">Clear all</button>
+          </div>
+          <p class="settings-hint">API requests arriving <strong>without</strong> your token. They are not blocked (backwards compatibility) — but each one is a client you should update with the token above.</p>
+          <div id="auth-alerts-list" class="auth-alerts-list"></div>
+          <p class="settings-hint" id="auth-alerts-empty" hidden>None — every connected client authenticates. ✓</p>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ============= Models page — native port of the miniclosedai-llm dashboard.
+       All data flows through the same-origin /api/llm/* proxy. ============= -->
+  <div class="page page-models">
+    <div class="models-page-container">
+      <h1>Models</h1>
+      <p class="settings-hint">Run any HuggingFace LLM (text or vision) on this machine via the <strong>miniclosedai-llm</strong> model server, then register it as a backend with one click.</p>
+      <div id="mp-banner" class="mp-banner">Checking model server…</div>
+      <div id="mp-offline" class="mp-offline" hidden></div>
+
+      <section class="settings-section" id="mp-add-section">
+        <div class="settings-section-header"><h2>Add a model</h2></div>
+        <form id="mp-add-form">
+          <div class="mp-add-row">
+            <input id="mp-hf-id" type="text" autocomplete="off" spellcheck="false"
+                   placeholder="meta-llama/Llama-3.1-8B-Instruct  or  https://huggingface.co/…" />
+            <button id="mp-analyze-btn" type="button" class="btn btn-small">Analyze</button>
+            <button id="mp-run-btn" type="submit" class="btn btn-primary btn-small">Download &amp; Run</button>
+          </div>
+          <div id="mp-analyze-result" class="mp-analyze-result" hidden></div>
+          <details class="mp-advanced">
+            <summary>Advanced settings</summary>
+            <div class="mp-advanced-grid">
+              <label class="mp-field"><span>Served name (model id)</span><input id="mp-adv-served" type="text" placeholder="auto from repo name" /></label>
+              <label class="mp-field"><span>Port</span><input id="mp-adv-port" type="number" placeholder="auto (8001+)" min="1024" max="65535" /></label>
+              <label class="mp-field"><span>Quantization</span>
+                <select id="mp-adv-quant">
+                  <option value="">none / auto-detect</option>
+                  <option value="fp8">fp8</option>
+                  <option value="awq">awq</option>
+                  <option value="gptq">gptq</option>
+                </select>
+              </label>
+              <label class="mp-field"><span>Max model len</span><input id="mp-adv-maxlen" type="number" placeholder="16384" /></label>
+              <label class="mp-field"><span>GPU mem util (0–1)</span><input id="mp-adv-gpumem" type="number" step="0.05" min="0.1" max="1" placeholder="0.90" /></label>
+              <label class="mp-field"><span>Tensor parallel (#GPUs)</span><input id="mp-adv-tp" type="number" min="1" placeholder="1" /></label>
+              <label class="mp-field"><span>Max images / request</span><input id="mp-adv-maximg" type="number" min="1" placeholder="5" /></label>
+              <label class="mp-field mp-field-check"><input id="mp-adv-trust" type="checkbox" /><span>trust_remote_code (runs repo code)</span></label>
+              <label class="mp-field mp-full"><span>mm_processor_kwargs (JSON)</span><textarea id="mp-adv-mmproc" rows="2" placeholder='{"max_pixels": 1605632}'></textarea></label>
+              <label class="mp-field mp-full"><span>hf_overrides (JSON)</span><textarea id="mp-adv-hfover" rows="2" placeholder='{"max_dynamic_patch": 24}'></textarea></label>
+              <label class="mp-field mp-full"><span>Extra vLLM flags</span><input id="mp-adv-extra" type="text" placeholder="--max-num-seqs 8" /></label>
+            </div>
+          </details>
+          <p id="mp-add-error" class="mp-error" hidden></p>
+          <p class="settings-hint"><strong>Analyze</strong> first to check type, size, and memory fit — then <strong>Download &amp; Run</strong>. First run downloads the weights; watch the per-model logs.</p>
+        </form>
+      </section>
+
+      <section class="settings-section" id="mp-cache-section">
+        <div class="settings-section-header">
+          <h2>Downloaded models <span id="mp-cache-count" class="settings-hint-inline"></span></h2>
+          <button id="mp-cache-refresh" type="button" class="btn btn-small">Refresh</button>
+        </div>
+        <p class="settings-hint">Already on disk — <strong>Run</strong> loads them directly, no re-download.</p>
+        <ul id="mp-cache-list" class="mp-cache-list"></ul>
+        <p id="mp-cache-empty" class="settings-hint" hidden>No cached LLMs found yet.</p>
+      </section>
+
+      <section class="settings-section" id="mp-models-section">
+        <div class="settings-section-header">
+          <h2>Running &amp; saved models</h2>
+          <button id="mp-refresh-btn" type="button" class="btn btn-small">Refresh</button>
+        </div>
+        <ul id="mp-models-list" class="mp-models-list" aria-live="polite"></ul>
+        <p id="mp-models-empty" class="settings-hint" hidden>No models yet. Paste one above to get started.</p>
+      </section>
+    </div>
+  </div>
+
+  <!-- Models page: per-model card template -->
+  <template id="mp-card-tpl">
+    <li class="mp-card">
+      <div class="mp-card-top">
+        <span class="mp-caret" aria-hidden="true">▸</span>
+        <div class="mp-meta">
+          <span class="mp-id"></span>
+          <div class="mp-sub"></div>
+        </div>
+        <span class="mp-status-pill"><span class="mp-led"></span><span class="mp-status-text"></span></span>
+        <div class="mp-actions">
+          <button class="btn btn-small mp-act-run" type="button">Run</button>
+          <button class="btn btn-small mp-act-stop" type="button" hidden>Stop</button>
+          <button class="btn btn-small mp-act-logs" type="button">Logs</button>
+          <button class="btn btn-small btn-danger mp-act-remove" type="button">Remove</button>
+        </div>
+      </div>
+      <div class="mp-body" hidden>
+        <div class="mp-register-block" hidden>
+          <div class="mp-section-label">Use in MiniClosedAI</div>
+          <div class="mp-copy-box">
+            <code class="mp-base-url"></code>
+            <button class="btn btn-small mp-act-copy" type="button">Copy URL</button>
+            <button class="btn btn-small btn-primary mp-act-register" type="button">Register as backend</button>
+            <span class="mp-registered-note" hidden>registered ✓</span>
+          </div>
+        </div>
+        <div class="mp-test-block" hidden>
+          <div class="mp-section-label">Quick test</div>
+          <div class="mp-test-row">
+            <div class="mp-test-img-wrap" hidden>
+              <img class="mp-test-img" alt="test image" />
+              <input class="mp-test-file" type="file" accept="image/*" hidden />
+              <div><button class="btn btn-small mp-act-pick" type="button">Change image</button></div>
+            </div>
+            <div class="mp-test-controls">
+              <textarea class="mp-test-prompt">Reply with a short sentence to confirm you are working.</textarea>
+              <div class="mp-test-actions">
+                <button class="btn btn-small btn-primary mp-act-test" type="button">Run test</button>
+                <button class="btn btn-small mp-act-addimg" type="button" hidden>+ Attach image</button>
+              </div>
+            </div>
+          </div>
+          <div class="mp-test-answer" hidden></div>
+        </div>
+        <div class="mp-logs-block" hidden>
+          <div class="mp-section-label">Logs</div>
+          <pre class="mp-logs-view"></pre>
+        </div>
+        <p class="mp-model-error mp-error" hidden></p>
+      </div>
+    </li>
+  </template>
+
+  <!-- ============= Voice Studio page — native port of miniclosedai-voice's
+       Voice Studio. Data flows through /api/voicestudio/{backend_id}/*. ==== -->
+  <div class="page page-voice-studio">
+    <div class="voice-studio-container">
+      <h1>Voice Studio</h1>
+      <p class="settings-hint">Manage the TTS voices of any connected voice service — local or remote. Record or upload a short sample to clone a new voice; clones appear in the chat voice picker immediately.</p>
+
+      <section class="settings-section">
+        <div class="settings-section-header"><h2>Voice service</h2></div>
+        <div class="settings-row">
+          <label for="vs-backend-select">Service</label>
+          <select id="vs-backend-select" class="settings-select"></select>
+        </div>
+        <div id="vs-health" class="settings-hint"></div>
+      </section>
+
+      <section class="settings-section">
+        <div class="settings-section-header">
+          <h2>Voices</h2>
+          <button id="vs-refresh" type="button" class="btn btn-small">Refresh</button>
+        </div>
+        <div id="vs-voices-list" class="vs-voices-list"></div>
+        <p id="vs-voices-empty" class="settings-hint" hidden>No voices on this service yet.</p>
+      </section>
+
+      <section class="settings-section">
+        <div class="settings-section-header"><h2>Clone a voice</h2></div>
+        <p class="settings-hint">Record 10–30&nbsp;s of clear speech (or upload a WAV) — the service conditions its TTS on this single reference clip. Read naturally; avoid background noise.</p>
+        <div class="vs-clone-row">
+          <button id="vs-record-btn" type="button" class="btn btn-small">● Record</button>
+          <span id="vs-rec-timer" class="vs-rec-timer" hidden>0:00</span>
+          <div id="vs-level" class="vs-level" hidden><div id="vs-level-bar"></div></div>
+          <span class="settings-hint-inline">or</span>
+          <input id="vs-file" type="file" accept="audio/wav,audio/x-wav,.wav" />
+        </div>
+        <p id="vs-script" class="vs-script" hidden></p>
+        <div id="vs-review" class="vs-review" hidden>
+          <audio id="vs-audio" controls></audio>
+          <div class="settings-row">
+            <label for="vs-name">Name</label>
+            <input id="vs-name" type="text" class="settings-select" maxlength="60" placeholder="e.g. Edgar" />
+          </div>
+          <div class="settings-row">
+            <label for="vs-lang">Language</label>
+            <select id="vs-lang" class="settings-select">
+              <option value="en">English</option>
+              <option value="es">Spanish</option>
+            </select>
+          </div>
+          <div class="vs-clone-actions">
+            <button id="vs-save-btn" type="button" class="btn btn-primary btn-small">Save voice</button>
+            <button id="vs-discard-btn" type="button" class="btn btn-small">Discard</button>
+          </div>
+        </div>
+        <p id="vs-status" class="settings-hint"></p>
       </section>
     </div>
   </div>

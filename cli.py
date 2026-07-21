@@ -3,9 +3,12 @@
 
 Everything the web dashboard does, from the shell: manage backends, create and
 edit bots, chat with a saved bot, upload knowledge, wire up MCP extensions, run
-evals, group bots into apps + generate their SDK, tail logs, and import/export
-bots. It's a thin HTTP client over the same `/api` endpoints the GUI uses, so the
-two stay in live sync (create a bot here → it shows in the browser, and vice-versa).
+evals, group bots into apps + generate their SDK, tail logs, import/export bots,
+run HuggingFace models on the miniclosedai-llm manager (`llm` group), and manage
+TTS voices on any connected miniclosedai-voice service (`voice` group). It's a
+thin HTTP client over the same `/api` endpoints the GUI uses (the `llm`/`voice`
+groups go through the same-origin `/api/llm/*` and `/api/voicestudio/*` proxies
+the Models and Voice Studio tabs use), so the CLI and browser stay in live sync.
 
 Dependency-free: standard library only (argparse + urllib + json + ssl) — runs
 under any python3, no venv required. Talks to the server at $MINICLOSEDAI_URL
@@ -21,18 +24,24 @@ Run `mcai <command> -h` for per-command help. Common commands:
     mcai url <bot>                         mcai logs
     mcai kb add <bot> notes.md             mcai eval run <bot> --mode contains
     mcai apps sdk <app> --lang ts --out ./sdk
+    mcai llm ls | run <hf_id> --wait | test <id> "prompt" | register <id>
+    mcai voice ls | speak "hi" --out hi.wav | clone sample.wav --name X
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import wave
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -225,6 +234,75 @@ def resolve_app(key: str) -> int:
         die(f"'{key}' didn't match any app. List them:  mcai apps ls")
     die(f"'{key}' matched {len(matches)} apps: "
         + ", ".join(f"{a['id']}:{a['name']}" for a in matches))
+
+
+def resolve_voice_backend(key: str | None) -> dict:
+    """Resolve --backend to an enabled kind='voice' backend row.
+
+    Unlike vc (always exactly one target service), mcai may have several
+    registered voice backends (local + remote). `key` is an id or a forgiving
+    name substring; omitted → the first enabled one, with a printed note of
+    which was picked so the choice is never silently ambiguous."""
+    backends = [b for b in api_get("/api/backends") if b.get("kind") == "voice" and b.get("enabled")]
+    if not backends:
+        die("no voice backends registered — add one in Settings, or:\n"
+            "  mcai backend add --name X --kind voice --url https://host:8090")
+    if key is None:
+        b = backends[0]
+        if len(backends) > 1:
+            print(c(f"(using voice backend {b['id']}:{b['name']} — pass --backend to choose another)", "dim"),
+                  file=sys.stderr)
+        return b
+    if str(key).isdigit() and any(str(b["id"]) == str(key) for b in backends):
+        return next(b for b in backends if str(b["id"]) == str(key))
+    matches = [b for b in backends if key.lower() in (b.get("name") or "").lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        die(f"'{key}' didn't match any voice backend. Candidates: "
+            + ", ".join(f"{b['id']}:{b['name']}" for b in backends))
+    die(f"'{key}' matched {len(matches)} voice backends: "
+        + ", ".join(f"{b['id']}:{b['name']}" for b in matches))
+
+
+def _llm_resolve_id(key: str) -> str:
+    """Forgiving model-id match against the LLM manager: exact → prefix →
+    hf_id substring (mirrors `mc`'s resolve_id)."""
+    models = api_get("/api/llm/models")["models"]
+    ids = [m["id"] for m in models]
+    if key in ids:
+        return key
+    pref = [i for i in ids if i.startswith(key)]
+    if len(pref) == 1:
+        return pref[0]
+    byhf = [m["id"] for m in models if key.lower() in m["hf_id"].lower()]
+    if len(byhf) == 1:
+        return byhf[0]
+    if not models:
+        die("no models yet — run one first:  mcai llm run <hf_id>")
+    cands = pref or byhf or ids
+    die(f"'{key}' didn't match one model. Candidates: {', '.join(cands)}")
+
+
+def _voice_resolve_id(backend: dict, key: str) -> str:
+    """Forgiving voice-id match within one backend's catalog: exact → prefix
+    → name substring (mirrors `vc`'s resolve_voice)."""
+    cat = api_get(f"/api/voicestudio/{backend['id']}/voices")
+    voices = [{"lang": lang, **v} for lang, items in cat.items() for v in items]
+    ids = [v["id"] for v in voices]
+    if key in ids:
+        return key
+    pref = sorted({i for i in ids if i.startswith(key)})
+    if len(pref) == 1:
+        return pref[0]
+    byname = sorted({v["id"] for v in voices if key.lower() in v.get("name", "").lower()})
+    if len(byname) == 1:
+        return byname[0]
+    if not voices:
+        die(f"no voices on backend {backend['id']}:{backend['name']} — clone one:  "
+            f"mcai voice clone <audio> --name NAME --backend {backend['id']}")
+    cands = pref or byname or sorted(set(ids))
+    die(f"'{key}' didn't match one voice. Candidates: {', '.join(cands)}")
 
 
 def _table(rows, headers):
@@ -1004,6 +1082,559 @@ def cmd_logs(args):
     _table(rows, ["STATUS", "MODEL", "LATENCY", "RESPONSE"])
 
 
+# --------------------------------------------------------------------- llm (miniclosedai-llm, via /api/llm/* proxy)
+# Port of miniclosedai-llm's own `mc` CLI, retargeted at the same-origin
+# /api/llm/* proxy (app.py) instead of dialing the manager's :8099 directly —
+# so it works identically whether the CLI is run on this box or against a
+# remote miniclosedai (which is why the group is named `llm`, not `models`:
+# mcai already has a top-level `models` command — the aggregated model list
+# across registered backends — which this is not).
+
+_LLM_STATUS_COLOR = {"ready": "green", "error": "red", "stopped": "dim",
+                     "pulling": "yellow", "downloading": "yellow", "loading": "yellow"}
+
+
+def cmd_llm_info(args):
+    require_daemon()
+    try:
+        h = api_get("/api/llm/health")
+    except ApiError as e:
+        die(str(e))
+    eng = h.get("engine")
+    print(f"{c('engine', 'dim')}     {eng}  ({'GPU ok' if h.get('gpu_ok') else c('no GPU', 'yellow')})")
+    if h.get("dashboard_url"):
+        print(f"{c('dashboard', 'dim')}  {h.get('dashboard_url')}")
+    if h.get("hf_home"):
+        print(f"{c('hf_home', 'dim')}    {h.get('hf_home')}")
+    gg = c("ready", "green") if h.get("llamacpp_ok") else c("run ./setup_llamacpp.sh", "yellow")
+    print(f"{c('gguf', 'dim')}       llama.cpp (ternary/GGUF): {gg}")
+    if h.get("no_engine"):
+        print(c("  no launch engine available — install Docker or `pip install vllm`", "red"))
+    try:
+        g = api_get("/api/llm/gpu")
+        for gpu in g.get("gpus", []):
+            mem = "unified memory" if gpu["mem_total_mb"] is None else f"{gpu['mem_used_mb']}/{gpu['mem_total_mb']} MB"
+            print(f"{c('gpu', 'dim')}        GPU{gpu['index']} {gpu['name']} — {mem} ({gpu['util_pct']}%)")
+        if g.get("error"):
+            print(f"{c('gpu', 'dim')}        {c(g['error'], 'yellow')}")
+    except ApiError:
+        pass
+
+
+def cmd_llm_gpu(args):
+    require_daemon()
+    g = api_get("/api/llm/gpu")
+    if args.json:
+        print(json.dumps(g, indent=2)); return
+    if not g.get("gpus"):
+        print(c("no GPU: " + (g.get("error") or "not detected"), "yellow")); return
+    for gpu in g["gpus"]:
+        mem = "unified" if gpu["mem_total_mb"] is None else f"{gpu['mem_used_mb']}/{gpu['mem_total_mb']} MB"
+        print(f"GPU{gpu['index']}  {gpu['name']}  {mem}  util {gpu['util_pct']}%")
+
+
+def cmd_llm_ls(args):
+    require_daemon()
+    models = api_get("/api/llm/models")["models"]
+    if args.json:
+        print(json.dumps(models, indent=2)); return
+    if not models:
+        print(c("no models — run one:  mcai llm run <hf_id>", "dim")); return
+    rows = []
+    for m in sorted(models, key=lambda x: (x["source"] != "custom", x["id"])):
+        st = c(m["status"], _LLM_STATUS_COLOR.get(m["status"], "dim"))
+        kind = "gguf" if m.get("fmt") == "gguf" else ("vision" if m.get("multimodal") else "text")
+        rows.append([m["id"], st, f":{m['port']}", kind, m["hf_id"]])
+    _table(rows, ["NAME", "STATUS", "PORT", "KIND", "HF_ID"])
+
+
+def cmd_llm_analyze(args):
+    require_daemon()
+    a = api_post("/api/llm/analyze", {"hf_id": args.hf_id})
+    if args.json:
+        print(json.dumps(a, indent=2)); return
+    if not a.get("exists"):
+        die(a.get("error", "not found"))
+    typ = "vision+text" if a["multimodal"] else "text"
+    print(f"{c(a['hf_id'], 'bold')}  ({typ})")
+    if a.get("fmt") == "gguf":
+        print(f"  format     GGUF → llama.cpp" + (f"  ·  {a['gguf_file']}" if a.get("gguf_file") else ""))
+    if a.get("params"):
+        print(f"  params     {a['params']/1e9:.1f} B" + (f" · {a['dtype']}" if a.get('dtype') else ""))
+    if a.get("size_gb") is not None:
+        print(f"  weights    ~{a['size_gb']} GB")
+    if a.get("need_gb") is not None:
+        print(f"  needs      ~{a['need_gb']} GB")
+    print(f"  available  {a['available_gb']} GB / {a['total_gb']} GB total")
+    if a.get("gated"):
+        print("  gated      " + ("yes (HF_TOKEN set)" if a["hf_token_present"]
+                                  else c("yes — set HF_TOKEN on the manager", "yellow")))
+    verdict = c("fits ✓", "green") if a.get("fits") else c("may not fit ⚠", "yellow")
+    print(f"  verdict    {verdict}")
+
+
+def _llm_run_params(args) -> dict:
+    p = {}
+    if args.max_len is not None: p["max_model_len"] = args.max_len
+    if args.gpu_mem is not None: p["gpu_memory_util"] = args.gpu_mem
+    if args.tp is not None: p["tensor_parallel"] = args.tp
+    if args.max_images is not None: p["max_images"] = args.max_images
+    if args.quant: p["quantization"] = args.quant
+    if args.trust_remote_code: p["trust_remote_code"] = True
+    if getattr(args, "gguf_file", None): p["gguf_file"] = args.gguf_file
+    return p
+
+
+def cmd_llm_run(args):
+    require_daemon()
+    body = {"hf_id": args.hf_id, "run": True, "force": args.force}
+    if args.name: body["served_name"] = args.name
+    if args.port: body["port"] = args.port
+    p = _llm_run_params(args)
+    if p: body["params"] = p
+    try:
+        m = api_post("/api/llm/models", body)
+    except ApiError as e:
+        if e.status == 409:
+            msg = e.detail.get("message") if isinstance(e.detail, dict) else e.detail
+            die(f"{msg}\n  re-run with --force to launch anyway.")
+        die(str(e))
+    print(f"launching {c(m['served_name'], 'bold')} on :{m['port']}  "
+          f"({'vision' if m.get('multimodal') else 'text'}, {m.get('size_gb', '?')} GB)")
+    if not args.wait:
+        print(c(f"  watch:  mcai llm logs {m['id']} -f", "dim"))
+        return
+    _llm_wait_ready(m["id"], args.timeout)
+
+
+def _llm_wait_ready(mid, timeout):
+    start = time.time()
+    last = None
+    while time.time() - start < timeout:
+        st = api_get(f"/api/llm/models/{mid}/status")
+        s = st["status"]
+        if s != last:
+            print(f"  [{int(time.time()-start):4d}s] {c(s, _LLM_STATUS_COLOR.get(s, 'dim'))}")
+            last = s
+        if st.get("ready"):
+            print(c(f"ready — try:  mcai llm test {mid} \"hello\"", "green"))
+            return
+        if s == "error":
+            die("failed to start:\n" + (st.get("detail") or "")[-800:])
+        time.sleep(3)
+    die(f"timed out after {timeout}s (last: {last})")
+
+
+def cmd_llm_start(args):
+    require_daemon()
+    mid = _llm_resolve_id(args.id)
+    try:
+        m = api_post(f"/api/llm/models/{mid}/start")
+    except ApiError as e:
+        die(str(e))
+    print(f"starting {c(mid, 'bold')} on :{m['port']}")
+    if args.wait:
+        _llm_wait_ready(mid, args.timeout)
+    else:
+        print(c(f"  watch:  mcai llm logs {mid} -f", "dim"))
+
+
+def cmd_llm_stop(args):
+    require_daemon()
+    mid = _llm_resolve_id(args.id)
+    api_post(f"/api/llm/models/{mid}/stop")
+    print(f"stopped {mid}")
+
+
+def cmd_llm_rm(args):
+    require_daemon()
+    mid = _llm_resolve_id(args.id)
+    api_delete(f"/api/llm/models/{mid}")
+    print(f"removed {mid}  (weights kept; free them with: mcai llm free <hf_id>)")
+
+
+def cmd_llm_status(args):
+    require_daemon()
+    mid = _llm_resolve_id(args.id)
+    st = api_get(f"/api/llm/models/{mid}/status")
+    if args.json:
+        print(json.dumps(st, indent=2)); return
+    print(f"{mid}: {c(st['status'], _LLM_STATUS_COLOR.get(st['status'], 'dim'))}"
+          + (f"  ({st['detail']})" if st.get("detail") else ""))
+
+
+def cmd_llm_logs(args):
+    require_daemon()
+    mid = _llm_resolve_id(args.id)
+    # SSE stream through the proxy — same raw-line-reader `mc` uses, since the
+    # proxy re-yields the manager's chunks untouched (framing survives intact).
+    read_timeout = None if args.follow else 5.0
+    deadline = None if args.follow else time.time() + 6.0
+    try:
+        resp = _request("GET", f"/api/llm/models/{mid}/logs", timeout=read_timeout)
+    except Unreachable as e:
+        die(str(e), EXIT_UNREACHABLE)
+    try:
+        for raw in resp:
+            if deadline and time.time() > deadline:
+                break
+            line = raw.decode(errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                d = json.loads(line[5:].strip())
+            except ValueError:
+                continue
+            if "line" in d:
+                print(d["line"])
+            elif d.get("eof"):
+                break
+    except (socket.timeout, TimeoutError):
+        pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        resp.close()
+
+
+def cmd_llm_test(args):
+    require_daemon()
+    mid = _llm_resolve_id(args.id)
+    fields = {"prompt": args.prompt, "max_tokens": str(args.max_tokens)}
+    files = {}
+    if args.image:
+        p = Path(args.image)
+        if not p.exists():
+            die(f"image not found: {args.image}")
+        files["image"] = (p.name, p.read_bytes(), "image/png")
+    try:
+        r = _llm_multipart(f"/api/llm/models/{mid}/test", fields, files)
+    except ApiError as e:
+        die(str(e))
+    print(r.get("answer", "").strip())
+    u = r.get("usage") or {}
+    print(c(f"\n[{r.get('latency_ms')} ms"
+            + (f" · {u.get('total_tokens')} tok" if u.get('total_tokens') else "") + "]", "dim"))
+
+
+def _llm_multipart(path, fields, files, timeout=300):
+    """Like `api_multipart`, but also carries text fields (mcai's own
+    `api_multipart` is files-only — the manager's /test endpoint takes both)."""
+    boundary = "----mcai" + str(int(time.time() * 1000))
+    parts = []
+    for k, v in fields.items():
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
+    for k, (fn, content, ctype) in files.items():
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{fn}\"\r\n"
+            f"Content-Type: {ctype}\r\n\r\n".encode() + content + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+    with _request("POST", path, data=body,
+                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                  timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def cmd_llm_url(args):
+    require_daemon()
+    mid = _llm_resolve_id(args.id)
+    m = next(x for x in api_get("/api/llm/models")["models"] if x["id"] == mid)
+    print(f"Kind:     openai")
+    print(f"Base URL: {c(m['base_url'], 'cyan')}")
+    if m.get("alt_base_url"):
+        print(c(f"(same-host Docker miniclosedai? use {m['alt_base_url']})", "dim"))
+    print(c(f"register it here:  mcai llm register {mid}", "dim"))
+
+
+def cmd_llm_register(args):
+    require_daemon()
+    mid = _llm_resolve_id(args.id)
+    try:
+        info = api_get("/api/llm-info")
+    except ApiError as e:
+        die(str(e))
+    if not info.get("reachable"):
+        die(f"model manager at {info.get('manager_url')} is not reachable")
+    body = {"manager_url": info["manager_url"], "model_id": mid}
+    if args.name: body["name"] = args.name
+    if args.prefer_docker_host: body["prefer_docker_host"] = True
+    try:
+        b = api_post("/api/backends/auto-register", body)
+    except ApiError as e:
+        die(str(e))
+    print(f"registered backend {c(str(b['id']), 'bold')}  {b['name']} → {b['base_url']}")
+    print(c(f"  use it as a bot's model:  {b.get('served_model')}", "dim"))
+
+
+def cmd_llm_cache(args):
+    require_daemon()
+    if args.sub == "rm":
+        api_post("/api/llm/cache/delete", {"hf_id": args.hf_id})
+        print(f"freed {args.hf_id} from cache"); return
+    d = api_get("/api/llm/cache")
+    if args.json:
+        print(json.dumps(d, indent=2)); return
+    models = d.get("models", [])
+    if not models:
+        print(c("no downloaded LLMs in the cache yet.", "dim")); return
+    rows = [[m["hf_id"], f"{m['size_gb']} GB", "vision" if m["multimodal"] else "text"]
+            for m in sorted(models, key=lambda x: -x["size_gb"])]
+    _table(rows, ["HF_ID", "SIZE", "KIND"])
+    print(c(f"\n{len(models)} models · {d.get('total_gb')} GB", "dim"))
+    print(c("run one (loads from disk, no re-download):  mcai llm run <hf_id>", "dim"))
+
+
+def cmd_llm_free(args):
+    require_daemon()
+    try:
+        api_post("/api/llm/cache/delete", {"hf_id": args.hf_id})
+    except ApiError as e:
+        die(str(e))
+    print(f"freed {args.hf_id} from cache")
+
+
+# --------------------------------------------------------------------- voice (miniclosedai-voice, via /api/voicestudio/{backend}/* proxy)
+# Port of miniclosedai-voice's own `vc` CLI. Unlike `vc` (always exactly one
+# target service), mcai may have several registered voice backends — every
+# command takes an optional --backend (id or name substring); omitted picks
+# the first enabled one (see resolve_voice_backend).
+
+def _voice_get(backend, path, timeout=30):
+    with _request("GET", f"/api/voicestudio/{backend['id']}/{path}", timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def _voice_post_json(backend, path, obj, timeout=120):
+    data = json.dumps(obj).encode()
+    with _request("POST", f"/api/voicestudio/{backend['id']}/{path}", data=data,
+                  headers={"Content-Type": "application/json"}, timeout=timeout) as r:
+        body = r.read().decode()
+        return json.loads(body) if body else None
+
+
+def _voice_post_binary(backend, path, obj, timeout=300) -> bytes:
+    data = json.dumps(obj).encode()
+    with _request("POST", f"/api/voicestudio/{backend['id']}/{path}", data=data,
+                  headers={"Content-Type": "application/json"}, timeout=timeout) as r:
+        return r.read()
+
+
+def _voice_post_sse(backend, path, obj, timeout=300):
+    data = json.dumps(obj).encode()
+    with _request("POST", f"/api/voicestudio/{backend['id']}/{path}", data=data,
+                  headers={"Content-Type": "application/json",
+                           "Accept": "text/event-stream"}, timeout=timeout) as r:
+        for raw in r:
+            line = raw.decode(errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload:
+                continue
+            try:
+                yield json.loads(payload)
+            except ValueError:
+                continue
+
+
+def _voice_multipart(backend, path, fields, files, timeout=300):
+    boundary = "----mcai" + str(int(time.time() * 1000))
+    parts = []
+    for k, v in fields.items():
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
+    for k, (fn, content, ctype) in files.items():
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{fn}\"\r\n"
+            f"Content-Type: {ctype}\r\n\r\n".encode() + content + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+    with _request("POST", f"/api/voicestudio/{backend['id']}/{path}", data=body,
+                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                  timeout=timeout) as r:
+        out = r.read().decode()
+        return json.loads(out) if out else None
+
+
+_AUDIO_CTYPES = {
+    ".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4", ".ogg": "audio/ogg", ".oga": "audio/ogg",
+    ".flac": "audio/flac", ".webm": "audio/webm",
+}
+
+
+def _audio_ctype(p: Path) -> str:
+    return _AUDIO_CTYPES.get(p.suffix.lower(), "application/octet-stream")
+
+
+def _voice_play(path: str):
+    """Play a WAV through the first available system player. A no-op (with a
+    hint) when none is installed — never an error, so headless use is fine."""
+    for tool, argv in (("ffplay", [path]), ("paplay", [path]),
+                       ("aplay", [path]), ("afplay", [path])):
+        exe = shutil.which(tool)
+        if not exe:
+            continue
+        args = [exe]
+        if tool == "ffplay":
+            args += ["-nodisp", "-autoexit", "-loglevel", "quiet"]
+        args += argv
+        try:
+            subprocess.run(args, check=False)
+        except Exception as e:
+            print(c(f"(playback via {tool} failed: {e})", "dim"))
+        return
+    print(c("(no audio player found — install ffmpeg/alsa to use --play)", "dim"))
+
+
+def cmd_voice_status(args):
+    require_daemon()
+    b = resolve_voice_backend(args.backend)
+    try:
+        h = _voice_get(b, "health")
+    except ApiError as e:
+        die(str(e))
+    count = 0
+    try:
+        cat = _voice_get(b, "voices")
+        count = len({v["id"] for items in cat.values() for v in items})
+    except ApiError:
+        pass
+    if args.json:
+        print(json.dumps({"backend": {"id": b["id"], "name": b["name"]}, "health": h, "voice_count": count}, indent=2))
+        return
+    ok = h.get("ok")
+    print(f"{c('backend', 'dim')}    {b['id']}:{b['name']}  {c(b['base_url'], 'cyan')}")
+    print(f"{c('status', 'dim')}     {c('ready', 'green') if ok else c('degraded', 'yellow')}")
+    print(f"{c('asr', 'dim')}        {h.get('asr_model')}")
+    print(f"{c('tts', 'dim')}        {h.get('tts_model')}")
+    print(f"{c('device', 'dim')}     {h.get('device')}  (voices_loaded={h.get('voices_loaded')})")
+    print(f"{c('voices', 'dim')}     {count}")
+
+
+def cmd_voice_url(args):
+    require_daemon()
+    b = resolve_voice_backend(args.backend)
+    try:
+        info = _voice_get(b, "api/connect-info")
+    except ApiError as e:
+        die(str(e))
+    print(f"Kind:     {info.get('kind', 'voice')}")
+    print(f"Base URL: {c(info['base_url'], 'cyan')}")
+    if info.get("alt_base_url"):
+        print(c(f"(same-host Docker miniclosedai? use {info['alt_base_url']})", "dim"))
+    if info.get("auth_required"):
+        print(c("(auth on for this voice service — set its API key in Settings)", "dim"))
+
+
+def cmd_voice_ls(args):
+    require_daemon()
+    b = resolve_voice_backend(args.backend)
+    cat = _voice_get(b, "voices")
+    if args.json:
+        print(json.dumps(cat, indent=2)); return
+    rows = []
+    for lang in sorted(cat):
+        for v in cat[lang]:
+            rows.append([lang, v["id"], v.get("name", ""), v.get("gender", "") or ""])
+    if not rows:
+        print(c("no voices yet — clone one:  mcai voice clone <audio> --name NAME", "dim")); return
+    _table(rows, ["LANG", "ID", "NAME", "GENDER"])
+
+
+def cmd_voice_clone(args):
+    require_daemon()
+    b = resolve_voice_backend(args.backend)
+    p = Path(args.audio)
+    if not p.exists():
+        die(f"file not found: {args.audio}")
+    ctype = "audio/wav" if p.suffix.lower() == ".wav" else _audio_ctype(p)
+    if not ctype.startswith("audio/wav"):
+        print(c(f"note: the service accepts WAV for cloning; sending {p.name} "
+                f"as {ctype} may be rejected (convert with ffmpeg first).", "yellow"))
+    try:
+        out = _voice_multipart(b, "voices", {"name": args.name, "language": args.language},
+                               {"audio": (p.name, p.read_bytes(), ctype)})
+    except ApiError as e:
+        die(str(e))
+    print(f"cloned {c(out['voice_id'], 'bold')}  "
+          f"({out.get('language')}, {out.get('duration_sec')}s @ {out.get('sample_rate')}Hz)")
+    print(c(f"try it:  mcai voice speak \"hello\" --voice {out['voice_id']} "
+            f"--language {out.get('language', 'en')} --backend {b['id']}", "dim"))
+
+
+def cmd_voice_rm(args):
+    require_daemon()
+    b = resolve_voice_backend(args.backend)
+    vid = _voice_resolve_id(b, args.voice_id)
+    try:
+        with _request("DELETE", f"/api/voicestudio/{b['id']}/voices/{vid}") as r:
+            r.read()
+    except ApiError as e:
+        die(str(e))
+    print(f"removed {c(vid, 'bold')} from {b['id']}:{b['name']}")
+
+
+def cmd_voice_speak(args):
+    require_daemon()
+    b = resolve_voice_backend(args.backend)
+    voice = _voice_resolve_id(b, args.voice) if args.voice != "default" else "default"
+    out = Path(args.out)
+    payload = {"text": args.text, "voice": voice, "language": args.language}
+    if args.speed is not None:
+        payload["speed"] = args.speed
+
+    if args.stream:
+        pcm = bytearray()
+        sample_rate = None
+        try:
+            for ev in _voice_post_sse(b, "speak/stream", payload):
+                if ev.get("error"):
+                    die(f"speak failed: {ev['error']}")
+                if "chunk_b64" in ev:
+                    pcm += base64.b64decode(ev["chunk_b64"])
+                    sample_rate = ev.get("sample_rate", sample_rate)
+                if ev.get("done"):
+                    break
+        except ApiError as e:
+            die(str(e))
+        if not pcm or not sample_rate:
+            die("stream produced no audio.")
+        with wave.open(str(out), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)  # int16
+            w.setframerate(int(sample_rate))
+            w.writeframes(bytes(pcm))
+    else:
+        try:
+            wav = _voice_post_binary(b, "speak", payload)
+        except ApiError as e:
+            die(str(e))
+        if not wav:
+            die("speak produced no audio.")
+        out.write_bytes(wav)
+
+    print(str(out))
+    if args.play:
+        _voice_play(str(out))
+
+
+def cmd_voice_transcribe(args):
+    require_daemon()
+    b = resolve_voice_backend(args.backend)
+    p = Path(args.audio)
+    if not p.exists():
+        die(f"file not found: {args.audio}")
+    fields = {"language": args.language} if args.language else {}
+    try:
+        res = _voice_multipart(b, "transcribe", fields, {"audio": (p.name, p.read_bytes(), _audio_ctype(p))})
+    except ApiError as e:
+        die(str(e))
+    if args.json:
+        print(json.dumps(res, indent=2)); return
+    print((res.get("text") or "").strip())
+
+
 # --------------------------------------------------------------------- parser
 def build_parser():
     p = argparse.ArgumentParser(
@@ -1114,6 +1745,83 @@ def build_parser():
     s = ap.add_parser("sdk", help="generate an app's SDK"); s.add_argument("id")
     s.add_argument("--lang", choices=["ts", "js", "py"], default="ts"); s.add_argument("--out"); s.add_argument("--zip", action="store_true")
     s.set_defaults(fn=cmd_apps_sdk)
+
+    # llm group — run HuggingFace models on the miniclosedai-llm manager
+    # (via /api/llm/*; port of the manager's own `mc` CLI)
+    lm = sub.add_parser("llm", help="run HuggingFace LLMs via the model manager").add_subparsers(dest="sub")
+    lm.add_parser("info", help="engine + GPU + dashboard status").set_defaults(fn=cmd_llm_info)
+    s = lm.add_parser("gpu", help="GPU readout"); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_llm_gpu)
+    for name in ("ls", "list"):
+        s = lm.add_parser(name, help="list models"); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_llm_ls)
+    s = lm.add_parser("analyze", help="inspect a HF model before downloading")
+    s.add_argument("hf_id"); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_llm_analyze)
+    s = lm.add_parser("run", help="download + run a model")
+    s.add_argument("hf_id")
+    s.add_argument("--name", help="served model name (default: slug of repo)")
+    s.add_argument("--port", type=int)
+    s.add_argument("--quant", help="fp8 | awq | gptq")
+    s.add_argument("--max-len", type=int, dest="max_len")
+    s.add_argument("--gpu-mem", type=float, dest="gpu_mem")
+    s.add_argument("--tp", type=int, help="tensor parallel size (#GPUs)")
+    s.add_argument("--max-images", type=int, dest="max_images")
+    s.add_argument("--trust-remote-code", action="store_true")
+    s.add_argument("--gguf-file", dest="gguf_file", help="for a multi-file GGUF repo, pick the file")
+    s.add_argument("--force", action="store_true", help="launch even if it may not fit")
+    s.add_argument("--wait", action="store_true", help="poll until ready")
+    s.add_argument("--timeout", type=int, default=1200)
+    s.set_defaults(fn=cmd_llm_run)
+    s = lm.add_parser("start", help="(re)start an existing stopped model by id")
+    s.add_argument("id"); s.add_argument("--wait", action="store_true")
+    s.add_argument("--timeout", type=int, default=1200); s.set_defaults(fn=cmd_llm_start)
+    s = lm.add_parser("stop", help="stop a running model"); s.add_argument("id"); s.set_defaults(fn=cmd_llm_stop)
+    s = lm.add_parser("rm", help="remove a model (keeps weights)"); s.add_argument("id"); s.set_defaults(fn=cmd_llm_rm)
+    s = lm.add_parser("status", help="status of one model"); s.add_argument("id"); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_llm_status)
+    s = lm.add_parser("logs", help="stream a model's logs"); s.add_argument("id")
+    s.add_argument("-f", "--follow", action="store_true", help="follow (Ctrl-C to stop)"); s.set_defaults(fn=cmd_llm_logs)
+    s = lm.add_parser("test", help="one-shot chat test")
+    s.add_argument("id"); s.add_argument("prompt", nargs="?", default="Say hello in one short sentence.")
+    s.add_argument("--image"); s.add_argument("--max-tokens", type=int, default=300, dest="max_tokens")
+    s.set_defaults(fn=cmd_llm_test)
+    s = lm.add_parser("url", help="base_url for this model"); s.add_argument("id"); s.set_defaults(fn=cmd_llm_url)
+    s = lm.add_parser("register", help="register a ready model as a MiniClosedAI backend (one click, like the GUI)")
+    s.add_argument("id"); s.add_argument("--name"); s.add_argument("--prefer-docker-host", action="store_true")
+    s.set_defaults(fn=cmd_llm_register)
+    for name in ("cache", "downloaded"):
+        s = lm.add_parser(name, help="list / manage already-downloaded models")
+        s.add_argument("sub", nargs="?", choices=["rm"], help="rm <hf_id> to delete weights")
+        s.add_argument("hf_id", nargs="?")
+        s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_llm_cache)
+    s = lm.add_parser("free", help="delete a cached model's weights"); s.add_argument("hf_id"); s.set_defaults(fn=cmd_llm_free)
+
+    # voice group — manage TTS voices on any connected miniclosedai-voice
+    # service (via /api/voicestudio/{backend}/*; port of vc, extended with
+    # --backend since mcai may have more than one registered voice service)
+    vo = sub.add_parser("voice", help="manage TTS voices (Voice Studio)").add_subparsers(dest="sub")
+    for name in ("status", "info"):
+        s = vo.add_parser(name, help="service health + voice count"); s.add_argument("--backend"); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_voice_status)
+    s = vo.add_parser("url", help="base URL for this voice service"); s.add_argument("--backend"); s.set_defaults(fn=cmd_voice_url)
+    for name in ("voices", "ls"):
+        s = vo.add_parser(name, help="list available voices"); s.add_argument("--backend"); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_voice_ls)
+    s = vo.add_parser("clone", help="clone a voice from a WAV sample")
+    s.add_argument("audio", help="path to a WAV clip (0.5-35 s)")
+    s.add_argument("--name", required=True, help="display name shown in the dropdown")
+    s.add_argument("--language", default="en", help="en | es (default: en)")
+    s.add_argument("--backend"); s.set_defaults(fn=cmd_voice_clone)
+    s = vo.add_parser("rm", help="remove a cloned voice"); s.add_argument("voice_id"); s.add_argument("--backend"); s.set_defaults(fn=cmd_voice_rm)
+    s = vo.add_parser("speak", help="synthesize text to a WAV file")
+    s.add_argument("text")
+    s.add_argument("--voice", default="default", help="voice id (default: default)")
+    s.add_argument("--language", default="en", help="en | es (default: en)")
+    s.add_argument("--speed", type=float, help="0.5-2.0 speed multiplier")
+    s.add_argument("--out", default="speech.wav", help="output WAV path (default: speech.wav)")
+    s.add_argument("--play", action="store_true", help="play after saving (needs ffplay/aplay)")
+    s.add_argument("--stream", action="store_true", help="use the streaming endpoint")
+    s.add_argument("--backend"); s.set_defaults(fn=cmd_voice_speak)
+    s = vo.add_parser("transcribe", help="transcribe an audio file to text")
+    s.add_argument("audio", help="path to an audio file")
+    s.add_argument("--language", help="language hint, e.g. en (default: auto-detect)")
+    s.add_argument("--json", action="store_true"); s.add_argument("--backend")
+    s.set_defaults(fn=cmd_voice_transcribe)
 
     # logs
     s = sub.add_parser("logs", help="recent LLM request/response logs")

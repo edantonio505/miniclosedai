@@ -4575,6 +4575,24 @@ function initCallButton() {
 // when the modal was opened from a bot card's `</>` button on the Bots list.
 // Cleared in closeModal so a subsequent topbar open uses the live conversation.
 let _modalConvId = null;
+
+// API token baked into copied snippets when authentication is enabled — so a
+// pasted snippet works immediately instead of landing in the "connections
+// needing attention" list. Refreshed on every modal open (cheap, and stays
+// correct across token regeneration). null = auth off → snippets unchanged.
+let _apiCodeToken = null;
+async function _refreshApiCodeToken() {
+  const before = _apiCodeToken;
+  _apiCodeToken = null;
+  try {
+    if (_authState.enabled && _authState.loggedIn) {
+      const r = await fetch("/api/auth/token");
+      if (r.ok) _apiCodeToken = (await r.json()).api_token || null;
+    }
+  } catch (e) {}
+  if (_apiCodeToken !== before) paintSnippet();   // repaint if it changed mid-open
+}
+
 function buildCodeSnippet(tab, mode, style) {
   const base = window.location.origin;
   const convId = _modalConvId != null ? _modalConvId : state.conversationId;
@@ -4596,25 +4614,33 @@ async function openApiCodeForConv(convId) {
   _modalConvId = convId;
   paintSnippet();
   els.modalBackdrop.classList.remove("hidden");
+  _refreshApiCodeToken();   // repaints with the bearer once fetched (auth on)
 }
 
 function buildNativeSnippet(tab, mode, base, convId) {
   const msg = "Hello!";
+  const tok = _apiCodeToken;
   const streamUrl = `${base}/api/conversations/${convId}/chat/stream`;
   const syncUrl = `${base}/api/conversations/${convId}/chat`;
   const header = `# Chat #${convId}. Config (model, system prompt, temperature, max_tokens,\n# top_p, top_k, thinking) is set in the GUI — this call only supplies the message.`;
+  // Auth (when enabled): the copied code carries the instance's API token so
+  // it authenticates immediately instead of tripping the grace-mode alerts.
+  const curlAuth = tok ? `\n  -H "Authorization: Bearer ${tok}" \\` : "";
+  const pyHeaders = tok ? `\nHEADERS = {"Authorization": "Bearer ${tok}"}` : "";
+  const pyKw = tok ? ", headers=HEADERS" : "";
+  const jsAuth = tok ? `, "Authorization": "Bearer ${tok}"` : "";
 
   // ---- cURL ----
   if (tab === "curl") {
     if (mode === "stream") {
       return `${header}
 curl -N -X POST ${streamUrl} \\
-  -H "Content-Type: application/json" \\
+  -H "Content-Type: application/json" \\${curlAuth}
   -d '{"message": "${msg}"}'`;
     }
     return `${header}
 curl -X POST ${syncUrl} \\
-  -H "Content-Type: application/json" \\
+  -H "Content-Type: application/json" \\${curlAuth}
   -d '{"message": "${msg}"}'`;
   }
 
@@ -4624,9 +4650,9 @@ curl -X POST ${syncUrl} \\
       return `import json
 import requests
 
-URL = "${streamUrl}"
+URL = "${streamUrl}"${pyHeaders}
 
-with requests.post(URL, json={"message": "${msg}"}, stream=True, timeout=None) as r:
+with requests.post(URL, json={"message": "${msg}"}, stream=True, timeout=None${pyKw}) as r:
     for line in r.iter_lines(decode_unicode=True):
         if not line:
             continue  # SSE keep-alives are empty lines
@@ -4639,9 +4665,9 @@ with requests.post(URL, json={"message": "${msg}"}, stream=True, timeout=None) a
     }
     return `import requests
 
-URL = "${syncUrl}"
+URL = "${syncUrl}"${pyHeaders}
 
-response = requests.post(URL, json={"message": "${msg}"}, timeout=120).json()
+response = requests.post(URL, json={"message": "${msg}"}, timeout=120${pyKw}).json()
 print(response["response"])`;
   }
 
@@ -4650,7 +4676,7 @@ print(response["response"])`;
     if (mode === "stream") {
       return `const res = await fetch("${streamUrl}", {
   method: "POST",
-  headers: { "Content-Type": "application/json" },
+  headers: { "Content-Type": "application/json"${jsAuth} },
   body: JSON.stringify({ message: "${msg}" }),
 });
 
@@ -4673,7 +4699,7 @@ while (true) {
     }
     return `const { response } = await fetch("${syncUrl}", {
   method: "POST",
-  headers: { "Content-Type": "application/json" },
+  headers: { "Content-Type": "application/json"${jsAuth} },
   body: JSON.stringify({ message: "${msg}" }),
 }).then(r => r.json());
 
@@ -4688,17 +4714,21 @@ console.log(response);`;
 // the server in favor of the bot's GUI-saved config.
 function buildOpenAISnippet(tab, mode, base, convId) {
   const msg = "Hello!";
+  const tok = _apiCodeToken;
   const url = `${base}/v1/chat/completions`;
   const header = `# OpenAI-compatible. Use the conversation ID as 'model'. The bot's saved
 # config (model, system prompt, temperature, etc.) is the source of truth —
 # any caller-provided sampling params are ignored by the server.`;
+  const curlAuth = tok ? `\n  -H "Authorization: Bearer ${tok}" \\` : "";
+  // With auth enabled the token IS the OpenAI api_key; otherwise any string works.
+  const sdkKey = tok || "not-required";
 
   // ---- cURL ----
   if (tab === "curl") {
     if (mode === "stream") {
       return `${header}
 curl -N -X POST ${url} \\
-  -H "Content-Type: application/json" \\
+  -H "Content-Type: application/json" \\${curlAuth}
   -d '{
     "model": "${convId}",
     "messages": [{"role":"user","content":"${msg}"}],
@@ -4707,7 +4737,7 @@ curl -N -X POST ${url} \\
     }
     return `${header}
 curl -X POST ${url} \\
-  -H "Content-Type: application/json" \\
+  -H "Content-Type: application/json" \\${curlAuth}
   -d '{
     "model": "${convId}",
     "messages": [{"role":"user","content":"${msg}"}]
@@ -4721,7 +4751,7 @@ curl -X POST ${url} \\
 from openai import OpenAI
 
 # Drop-in for OpenAI: point base_url at MiniClosedAI, use chat id as 'model'.
-client = OpenAI(base_url="${base}/v1", api_key="not-required")
+client = OpenAI(base_url="${base}/v1", api_key="${sdkKey}")
 
 stream = client.chat.completions.create(
     model="${convId}",
@@ -4736,7 +4766,7 @@ for chunk in stream:
     return `# pip install openai
 from openai import OpenAI
 
-client = OpenAI(base_url="${base}/v1", api_key="not-required")
+client = OpenAI(base_url="${base}/v1", api_key="${sdkKey}")
 
 response = client.chat.completions.create(
     model="${convId}",
@@ -4753,7 +4783,7 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   baseURL: "${base}/v1",
-  apiKey: "not-required",
+  apiKey: "${sdkKey}",
 });
 
 const stream = await client.chat.completions.create({
@@ -4772,7 +4802,7 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   baseURL: "${base}/v1",
-  apiKey: "not-required",
+  apiKey: "${sdkKey}",
 });
 
 const response = await client.chat.completions.create({
@@ -4823,6 +4853,7 @@ async function openModal() {
   await flushPendingSave();
   paintSnippet();
   els.modalBackdrop.classList.remove("hidden");
+  _refreshApiCodeToken();   // repaints with the bearer once fetched (auth on)
 }
 function closeModal() {
   els.modalBackdrop.classList.add("hidden");
@@ -5903,7 +5934,8 @@ const ACTIVE_PAGE_KEY = "miniclosedai:activePage";
 // no longer has its own button in the activity bar. The Bots nav icon stays
 // highlighted whether you're on the list (page=bots) or inside a chat
 // (page=dashboard), reinforcing the parent/child relationship.
-const VALID_PAGES = new Set(["dashboard", "bots", "settings", "logs", "apps", "app-detail"]);
+const VALID_PAGES = new Set(["dashboard", "bots", "settings", "logs", "apps", "app-detail",
+                             "models", "voice-studio"]);
 const _BOTS_AREA = new Set(["bots", "dashboard"]);
 // The Apps nav-item owns both the applications list and a single app's detail.
 const _APPS_AREA = new Set(["apps", "app-detail"]);
@@ -5913,7 +5945,7 @@ const _APPS_AREA = new Set(["apps", "app-detail"]);
 // animates back; same-depth peer hops (activity-bar clicks between top-level
 // pages) don't animate. Adding a new page = add it here and pick its depth.
 const _PAGE_DEPTH = {
-  bots: 0, apps: 0, logs: 0, settings: 0,
+  bots: 0, apps: 0, logs: 0, settings: 0, models: 0, "voice-studio": 0,
   "app-detail": 1,
   dashboard: 2,
 };
@@ -5961,6 +5993,7 @@ function applyActivePage(page) {
   if (typeof _refreshUnreadUI === "function") _refreshUnreadUI();
   if (p === "settings" && typeof renderSettingsPage === "function") {
     renderSettingsPage();
+    if (typeof loadAuthState === "function") loadAuthState();
   }
   if (p === "bots" && typeof onBotsPageEntered === "function") {
     onBotsPageEntered();
@@ -5972,6 +6005,18 @@ function applyActivePage(page) {
     onLogsPageEntered();
   } else if (typeof onLogsPageLeft === "function") {
     onLogsPageLeft();
+  }
+  // Models + Voice Studio follow the Logs pattern: poll/stream only while
+  // the page is visible; everything stops the moment the user navigates away.
+  if (p === "models" && typeof onModelsPageEntered === "function") {
+    onModelsPageEntered();
+  } else if (typeof onModelsPageLeft === "function") {
+    onModelsPageLeft();
+  }
+  if (p === "voice-studio" && typeof onVoiceStudioPageEntered === "function") {
+    onVoiceStudioPageEntered();
+  } else if (typeof onVoiceStudioPageLeft === "function") {
+    onVoiceStudioPageLeft();
   }
 }
 
@@ -7048,6 +7093,1112 @@ function initGlobalTooltip() {
 }
 
 // =====================================================================
+// Shared small helpers introduced with the Models / Voice Studio tabs.
+// =====================================================================
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+let _toastTimer = null;
+function showToast(msg, kind = "") {
+  let el = document.getElementById("app-toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "app-toast";
+    el.className = "app-toast";
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.className = "app-toast" + (kind ? " is-" + kind : "");
+  el.hidden = false;
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise((resolve, reject) => {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      ok ? resolve() : reject(new Error("copy failed"));
+    } catch (e) { reject(e); }
+  });
+}
+
+// =====================================================================
+// Models page — native port of the miniclosedai-llm dashboard. The manager
+// stays its own process; everything here talks to it through the same-origin
+// /api/llm/* proxy (which injects auth server-side). Polling and log streams
+// run ONLY while the page is visible (Logs-page pattern).
+// =====================================================================
+const _mpState = {
+  cards: new Map(),   // model id → {node, es, file, expanded, model, lastStatus}
+  active: false,
+  pollTimer: null,
+  bannerTimer: null,
+  info: null,         // /api/llm-info result ({manager_url, reachable})
+};
+
+async function _mpApi(path, opts = {}) {
+  const r = await fetch(`/api/llm/${path}`, opts);
+  if (!r.ok) {
+    let detail = `HTTP ${r.status}`;
+    try { const b = await r.json(); if (b.detail !== undefined) detail = b.detail; } catch (e) {}
+    const msg = (detail && detail.message) || (typeof detail === "string" ? detail : JSON.stringify(detail));
+    const err = new Error(msg);
+    err.status = r.status;
+    err.detail = detail;
+    throw err;
+  }
+  return r.status === 204 ? null : r.json();
+}
+
+function _mpSetOffline(offline, msg) {
+  const box = document.getElementById("mp-offline");
+  if (!box) return;
+  box.hidden = !offline;
+  if (offline) box.textContent = msg ||
+    "Model server not reachable. Start it with ./dev.sh up (it launches the miniclosedai-llm manager alongside the app).";
+  for (const id of ["mp-add-section", "mp-cache-section", "mp-models-section"]) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = offline;
+  }
+  const banner = document.getElementById("mp-banner");
+  if (banner) banner.hidden = offline;
+}
+
+async function mpLoadBanner() {
+  const el = document.getElementById("mp-banner");
+  if (!el || !_mpState.active) return;
+  let h;
+  try { h = await _mpApi("health"); }
+  catch (e) { _mpSetOffline(true); return; }
+  _mpSetOffline(false);
+
+  let gpuTxt = "";
+  try {
+    const g = await _mpApi("gpu");
+    if (g.gpus && g.gpus.length) {
+      gpuTxt = g.gpus.map((x) => {
+        const mem = (x.mem_total_mb == null)
+          ? "unified memory" : `${x.mem_used_mb}/${x.mem_total_mb} MB`;
+        return `GPU${x.index} ${x.name} — ${mem} (${x.util_pct}%)`;
+      }).join(" · ");
+    } else { gpuTxt = "GPU: " + (g.error || "not detected"); }
+  } catch (e) { gpuTxt = "GPU: unknown"; }
+
+  let cls = "ok", msg;
+  if (h.no_engine) {
+    cls = "bad"; msg = "No launch engine — install Docker, or pip install vllm.";
+  } else if (!h.gpu_ok) {
+    cls = "warn"; msg = "Engine ready, but no GPU detected.";
+  } else {
+    msg = "Ready.";
+  }
+  const engLabel = h.engine === "docker" ? "Docker engine"
+    : h.engine === "native" ? "Native (vllm serve)" : (h.engine || "?");
+  el.className = "mp-banner " + cls;
+  el.innerHTML =
+    `<span class="mp-engine-badge">${escapeHtml(engLabel)}</span>` +
+    `<span>${escapeHtml(msg)}</span>` +
+    `<span class="mp-dim">${escapeHtml(gpuTxt)}</span>` +
+    (h.llamacpp_ok ? `<span class="mp-dim">· GGUF ready</span>` : "");
+}
+
+function _mpReadAdvanced() {
+  const $id = (i) => document.getElementById(i);
+  const num = (i) => { const v = $id(i).value.trim(); return v === "" ? undefined : Number(v); };
+  const str = (i) => { const v = $id(i).value.trim(); return v === "" ? undefined : v; };
+  const params = {};
+  const maxlen = num("mp-adv-maxlen"); if (maxlen !== undefined) params.max_model_len = maxlen;
+  const gpumem = num("mp-adv-gpumem"); if (gpumem !== undefined) params.gpu_memory_util = gpumem;
+  const tp = num("mp-adv-tp"); if (tp !== undefined) params.tensor_parallel = tp;
+  const maximg = num("mp-adv-maximg"); if (maximg !== undefined) params.max_images = maximg;
+  const quant = str("mp-adv-quant"); if (quant !== undefined) params.quantization = quant;
+  if ($id("mp-adv-trust").checked) params.trust_remote_code = true;
+  const mm = str("mp-adv-mmproc"); if (mm !== undefined) params.mm_processor_kwargs = mm;
+  const hf = str("mp-adv-hfover"); if (hf !== undefined) params.hf_overrides = hf;
+  const extra = str("mp-adv-extra"); if (extra !== undefined) params.extra_args = extra.split(/\s+/);
+  return {
+    served_name: str("mp-adv-served"),
+    port: num("mp-adv-port"),
+    params: Object.keys(params).length ? params : undefined,
+  };
+}
+
+function _mpFmtAnalysis(a) {
+  const rows = [];
+  const typ = a.multimodal ? "vision + text" : (a.is_llm ? "text LLM" : "⚠ not a text-gen model?");
+  rows.push(["Type", typ]);
+  if (a.params) rows.push(["Parameters", (a.params / 1e9).toFixed(1) + " B" + (a.dtype ? " · " + a.dtype : "")]);
+  if (a.size_gb != null) rows.push(["Weights", "~" + a.size_gb + " GB"]);
+  if (a.need_gb != null) rows.push(["Needs (est.)", "~" + a.need_gb + " GB"]);
+  rows.push(["Available", a.available_gb + " GB" + (a.total_gb ? " / " + a.total_gb + " GB total" : "")]);
+  if (a.gated) rows.push(["Gated", a.hf_token_present ? "yes (HF_TOKEN set ✓)" : "yes — set HF_TOKEN ⚠"]);
+  return rows.map(([k, v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(v)}</span>`).join("");
+}
+
+async function mpAnalyze() {
+  const hf = document.getElementById("mp-hf-id").value.trim();
+  const out = document.getElementById("mp-analyze-result");
+  if (!hf) return;
+  out.hidden = false; out.className = "mp-analyze-result"; out.innerHTML = "Analyzing…";
+  try {
+    const a = await _mpApi("analyze", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hf_id: hf }),
+    });
+    if (!a.exists) {
+      out.className = "mp-analyze-result bad";
+      out.innerHTML = `<strong>Can't use this model.</strong> ${escapeHtml(a.error || "not found")}`;
+      return;
+    }
+    const cls = a.fits ? "ok" : "warn";
+    out.className = "mp-analyze-result " + cls;
+    out.innerHTML =
+      `<div class="mp-a-title">${escapeHtml(a.hf_id)} <span class="mp-type-pill">${a.fmt === "gguf" ? "gguf" : (a.multimodal ? "vision" : "text")}</span></div>` +
+      `<div class="mp-a-grid">${_mpFmtAnalysis(a)}</div>` +
+      `<div class="mp-a-actions"><button id="mp-analyze-run" class="btn btn-small btn-primary" type="button">${a.fits ? "Download & Run" : "Run anyway"}</button></div>`;
+    document.getElementById("mp-analyze-run")
+      .addEventListener("click", () => mpAdd(hf, !a.fits));
+  } catch (err) {
+    out.className = "mp-analyze-result bad"; out.textContent = err.message;
+  }
+}
+
+let _mpAddInFlight = false;
+async function mpAdd(hf, force) {
+  if (_mpAddInFlight) return;
+  _mpAddInFlight = true;
+  const errEl = document.getElementById("mp-add-error");
+  errEl.hidden = true;
+  try {
+    await _mpApi("models", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hf_id: hf, run: true, force: !!force, ..._mpReadAdvanced() }),
+    });
+    document.getElementById("mp-hf-id").value = "";
+    document.getElementById("mp-analyze-result").hidden = true;
+    showToast("Launching — watch the logs for download progress.", "ok");
+    await mpLoadModels();
+  } catch (err) {
+    errEl.hidden = false;
+    if (err.status === 409) {
+      errEl.innerHTML = escapeHtml(err.message) +
+        ` <button id="mp-force-run" class="btn btn-small" type="button">Run anyway</button>`;
+      const f = document.getElementById("mp-force-run");
+      if (f) f.addEventListener("click", () => mpAdd(hf, true));
+    } else {
+      errEl.textContent = err.message;
+    }
+  } finally {
+    _mpAddInFlight = false;
+  }
+}
+
+const _MP_STATUS_LABEL = {
+  stopped: "Stopped", queued: "Queued", pulling: "Pulling image",
+  downloading: "Downloading", loading: "Loading", ready: "Ready", error: "Error",
+};
+
+function _mpIsRegistered(m) {
+  return (backendCache || []).some(b =>
+    b.base_url === m.base_url || (m.alt_base_url && b.base_url === m.alt_base_url));
+}
+
+function mpRenderCard(m) {
+  const q = (sel, root) => root.querySelector(sel);
+  let st = _mpState.cards.get(m.id);
+  if (!st) {
+    const node = document.getElementById("mp-card-tpl").content.firstElementChild.cloneNode(true);
+    st = { node, es: null, file: null, expanded: false };
+    _mpState.cards.set(m.id, st);
+    _mpWireCard(st, m);
+    document.getElementById("mp-models-list").appendChild(node);
+  }
+  const n = st.node;
+  q(".mp-id", n).textContent = m.served_name;
+  q(".mp-sub", n).textContent = `${m.hf_id} · :${m.port}`
+    + (m.fmt === "gguf" ? " · GGUF" : "") + (m.multimodal ? " · vision" : "");
+
+  const pill = q(".mp-status-pill", n);
+  pill.className = "mp-status-pill mp-status-" + m.status;
+  q(".mp-status-text", n).textContent = _MP_STATUS_LABEL[m.status] || m.status;
+
+  const active = m.status !== "stopped" && m.status !== "error";
+  q(".mp-act-run", n).hidden = active;
+  q(".mp-act-run", n).textContent = m.status === "error" ? "Retry" : "Run";
+  q(".mp-act-stop", n).hidden = !active;
+
+  q(".mp-base-url", n).textContent = m.base_url;
+  q(".mp-register-block", n).hidden = !m.ready;
+  const registered = _mpIsRegistered(m);
+  q(".mp-act-register", n).hidden = registered;
+  q(".mp-registered-note", n).hidden = !registered;
+  if (!st.imgShown) q(".mp-act-addimg", n).hidden = !m.multimodal;
+  q(".mp-test-block", n).hidden = !m.ready;
+
+  const errEl = q(".mp-model-error", n);
+  if (m.status === "error" && (m.error || m.detail)) {
+    errEl.hidden = false; errEl.textContent = m.error || m.detail;
+    if (st.lastStatus !== "error") _mpSetExpanded(st, true);
+  } else {
+    errEl.hidden = true;
+  }
+  q(".mp-body", n).hidden = !st.expanded;
+  n.classList.toggle("expanded", !!st.expanded);
+  st.lastStatus = m.status;
+  st.model = m;
+}
+
+function _mpSetExpanded(st, val) {
+  st.expanded = val;
+  st.node.querySelector(".mp-body").hidden = !val;
+  st.node.classList.toggle("expanded", val);
+  if (!val) {
+    st.node.querySelector(".mp-logs-block").hidden = true;
+    _mpCloseLogs(st);
+  }
+}
+
+function _mpWireCard(st, m) {
+  const n = st.node;
+  const id = m.id;
+  const q = (sel) => n.querySelector(sel);
+
+  q(".mp-act-run").addEventListener("click", () => _mpAct(id, "start"));
+  q(".mp-act-stop").addEventListener("click", () => _mpAct(id, "stop"));
+  q(".mp-act-remove").addEventListener("click", async () => {
+    const ok = await uiConfirm({
+      title: `Remove ${id}?`,
+      message: "Stops the model and removes it from the manager. Downloaded weights are kept.",
+      okText: "Remove", danger: true,
+    });
+    if (!ok) return;
+    _mpCloseLogs(st);
+    try { await _mpApi(`models/${encodeURIComponent(id)}`, { method: "DELETE" }); }
+    catch (e) { showToast(e.message, "error"); return; }
+    _mpState.cards.delete(id); n.remove();
+    showToast("Removed " + id, "ok");
+  });
+
+  n.querySelector(".mp-card-top").addEventListener("click", (e) => {
+    if (e.target.closest("button")) return;
+    _mpSetExpanded(st, !st.expanded);
+  });
+
+  q(".mp-act-logs").addEventListener("click", () => {
+    const lb = q(".mp-logs-block");
+    if (lb.hidden) { _mpSetExpanded(st, true); lb.hidden = false; _mpOpenLogs(st, id); }
+    else { lb.hidden = true; _mpCloseLogs(st); }
+  });
+
+  q(".mp-act-copy").addEventListener("click", () => {
+    copyText(q(".mp-base-url").textContent).then(
+      () => showToast("Copied base URL", "ok"),
+      () => showToast("Copy failed — select the URL manually", "error"));
+  });
+
+  // The integration win over the standalone dashboard: one click registers
+  // the ready model as a kind='openai' backend, so it shows up in the model
+  // pickers (topbar + bot cards) immediately.
+  q(".mp-act-register").addEventListener("click", async () => {
+    const btn = q(".mp-act-register");
+    btn.disabled = true;
+    try {
+      const info = _mpState.info || await fetch("/api/llm-info").then(r => r.json());
+      const r = await fetch("/api/backends/auto-register", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ manager_url: info.manager_url, model_id: id }),
+      });
+      if (!r.ok) {
+        let d = `HTTP ${r.status}`;
+        try { const b = await r.json(); d = (b.detail && b.detail.message) || b.detail || d; } catch (e) {}
+        throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+      }
+      const b = await r.json();
+      showToast(`Registered '${b.name}' as a backend — it's in the model pickers now.`, "ok");
+      await loadBackends();
+      await loadModels();     // refresh the topbar/grouped pickers
+      mpLoadModels();         // repaint cards (registered ✓)
+    } catch (e) {
+      showToast("Register failed: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  q(".mp-act-addimg").addEventListener("click", async () => {
+    st.imgShown = true;
+    q(".mp-act-addimg").hidden = true;
+    q(".mp-test-img-wrap").hidden = false;
+    q(".mp-test-img").src = "/api/llm/test-image";
+    try {
+      const blob = await (await fetch("/api/llm/test-image")).blob();
+      st.file = new File([blob], "test.png", { type: "image/png" });
+    } catch (e) {}
+  });
+  q(".mp-act-pick").addEventListener("click", () => q(".mp-test-file").click());
+  q(".mp-test-file").addEventListener("change", (ev) => {
+    const f = ev.target.files[0]; if (!f) return;
+    st.file = f; q(".mp-test-img").src = URL.createObjectURL(f);
+  });
+  q(".mp-act-test").addEventListener("click", () => _mpRunTest(st, id));
+}
+
+async function _mpAct(id, verb) {
+  try {
+    await _mpApi(`models/${encodeURIComponent(id)}/${verb}`, { method: "POST" });
+    await mpLoadModels();
+  } catch (e) { showToast(e.message, "error"); }
+}
+
+async function _mpRunTest(st, id) {
+  const n = st.node;
+  const ansEl = n.querySelector(".mp-test-answer");
+  ansEl.hidden = false; ansEl.textContent = "Running…";
+  try {
+    const fd = new FormData();
+    fd.append("prompt", n.querySelector(".mp-test-prompt").value);
+    if (st.file) fd.append("image", st.file);
+    const r = await _mpApi(`models/${encodeURIComponent(id)}/test`, { method: "POST", body: fd });
+    ansEl.innerHTML = escapeHtml(r.answer || "(empty response)") +
+      `<div class="mp-dim">${r.latency_ms} ms${r.usage ? " · " + (r.usage.total_tokens || "?") + " tokens" : ""}</div>`;
+  } catch (e) {
+    ansEl.textContent = "Test failed: " + e.message;
+  }
+}
+
+function _mpOpenLogs(st, id) {
+  _mpCloseLogs(st);
+  const view = st.node.querySelector(".mp-logs-view");
+  view.textContent = "";
+  // EventSource through the same-origin proxy — the manager's SSE stream.
+  const es = new EventSource(`/api/llm/models/${encodeURIComponent(id)}/logs`);
+  st.es = es;
+  es.onmessage = (ev) => {
+    let d; try { d = JSON.parse(ev.data); } catch (e) { return; }
+    if (d.line !== undefined) {
+      const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 30;
+      view.textContent += d.line + "\n";
+      if (view.textContent.length > 200000) view.textContent = view.textContent.slice(-150000);
+      if (atBottom) view.scrollTop = view.scrollHeight;
+    }
+    if (d.status !== undefined && st.model) {
+      const pill = st.node.querySelector(".mp-status-pill");
+      pill.className = "mp-status-pill mp-status-" + d.status;
+      st.node.querySelector(".mp-status-text").textContent = _MP_STATUS_LABEL[d.status] || d.status;
+      if (d.ready) mpLoadModels();
+    }
+    if (d.eof) _mpCloseLogs(st);
+  };
+  es.onerror = () => { /* browser auto-retries; partial logs stay */ };
+}
+
+function _mpCloseLogs(st) {
+  if (st.es) { st.es.close(); st.es = null; }
+}
+
+async function mpLoadCache() {
+  if (!_mpState.active) return;
+  let data;
+  try { data = await _mpApi("cache"); }
+  catch (e) { return; }
+  const models = data.models || [];
+  const list = document.getElementById("mp-cache-list");
+  list.innerHTML = "";
+  document.getElementById("mp-cache-count").textContent = models.length
+    ? `· ${models.length} on disk (${data.total_gb} GB)` : "";
+  document.getElementById("mp-cache-empty").hidden = models.length > 0;
+  for (const m of models) {
+    const li = document.createElement("li");
+    li.className = "mp-cache-row";
+    li.innerHTML =
+      `<span class="mp-c-id">${escapeHtml(m.hf_id)}` +
+      (m.multimodal ? ` <span class="mp-type-pill">vision</span>` : "") + `</span>` +
+      `<span class="mp-c-size">${m.size_gb} GB</span>` +
+      `<span class="mp-c-actions">` +
+      `<button class="btn btn-small btn-primary mp-c-run" type="button">Run</button>` +
+      `<button class="btn btn-small btn-danger mp-c-free" type="button">Free</button></span>`;
+    li.querySelector(".mp-c-run").addEventListener("click", () => {
+      showToast("Launching " + m.hf_id + " from cache…", "ok");
+      mpAdd(m.hf_id, false);
+    });
+    li.querySelector(".mp-c-free").addEventListener("click", async () => {
+      const ok = await uiConfirm({
+        title: `Free ${m.hf_id}?`,
+        message: `Deletes ${m.size_gb} GB of weights from disk. Re-running later re-downloads.`,
+        okText: "Free", danger: true,
+      });
+      if (!ok) return;
+      try {
+        await _mpApi("cache/delete", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ hf_id: m.hf_id }),
+        });
+        showToast("Freed " + m.hf_id, "ok");
+        mpLoadCache();
+      } catch (e) { showToast(e.message, "error"); }
+    });
+    list.appendChild(li);
+  }
+}
+
+async function mpLoadModels() {
+  if (!_mpState.active) return;
+  let data;
+  try { data = await _mpApi("models"); }
+  catch (e) { _mpSetOffline(true); return; }
+  _mpSetOffline(false);
+  const models = data.models || [];
+  const seen = new Set();
+  for (const m of models) { mpRenderCard(m); seen.add(m.id); }
+  for (const [id, st] of _mpState.cards) {
+    if (!seen.has(id)) { _mpCloseLogs(st); st.node.remove(); _mpState.cards.delete(id); }
+  }
+  document.getElementById("mp-models-empty").hidden = models.length > 0;
+}
+
+function onModelsPageEntered() {
+  if (_mpState.active) return;
+  _mpState.active = true;
+  fetch("/api/llm-info").then(r => r.json()).then(i => { _mpState.info = i; }).catch(() => {});
+  mpLoadBanner(); mpLoadModels(); mpLoadCache();
+  _mpState.pollTimer = setInterval(mpLoadModels, 5000);
+  _mpState.bannerTimer = setInterval(mpLoadBanner, 15000);
+}
+
+function onModelsPageLeft() {
+  if (!_mpState.active) return;
+  _mpState.active = false;
+  clearInterval(_mpState.pollTimer); _mpState.pollTimer = null;
+  clearInterval(_mpState.bannerTimer); _mpState.bannerTimer = null;
+  for (const [, st] of _mpState.cards) _mpCloseLogs(st);
+}
+
+function initModelsPage() {
+  const form = document.getElementById("mp-add-form");
+  if (!form) return;
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const hf = document.getElementById("mp-hf-id").value.trim();
+    if (hf) mpAdd(hf, false);
+  });
+  document.getElementById("mp-analyze-btn").addEventListener("click", mpAnalyze);
+  document.getElementById("mp-refresh-btn").addEventListener("click", () => { mpLoadBanner(); mpLoadModels(); });
+  document.getElementById("mp-cache-refresh").addEventListener("click", mpLoadCache);
+}
+
+// =====================================================================
+// Voice Studio page — native port of miniclosedai-voice's Voice Studio.
+// Targets ANY registered kind='voice' backend (local or remote) through the
+// same-origin /api/voicestudio/{backend_id}/* proxy. Clone flow: record via
+// mic (or upload audio) → mono WAV in the browser → POST /voices.
+// =====================================================================
+const _VS_MAX_RECORD_S = 30;   // recorder auto-stop
+const _VS_MAX_UPLOAD_S = 90;   // matches the server's trim cap
+
+const _vsState = {
+  active: false,
+  backendId: null,
+  blob: null,          // staged WAV for the save form
+  rec: null,           // live recording state
+};
+
+const _VS_SCRIPTS = {
+  en: "The quick brown fox jumps over the lazy dog. I enjoy reading aloud in a calm, natural voice — clear consonants, easy pace, and a friendly tone that sounds like everyday conversation.",
+  es: "El veloz zorro marrón salta sobre el perro perezoso. Me gusta leer en voz alta con calma y naturalidad — consonantes claras, ritmo tranquilo y un tono amable de conversación cotidiana.",
+};
+
+function _vsApi(path, opts = {}) {
+  const bid = _vsState.backendId;
+  return fetch(`/api/voicestudio/${bid}/${path}`, opts).then(async (r) => {
+    if (!r.ok) {
+      let detail = `HTTP ${r.status}`;
+      try { const b = await r.json(); detail = b.detail || detail; } catch (e) {}
+      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+    return r.status === 204 ? null : r.json();
+  });
+}
+
+// WAV encoder — ported verbatim from miniclosedai-voice's Voice Studio so the
+// wire format stays byte-identical (float32 mono chunks → int16 PCM WAV).
+function _vsEncodeWav(chunks, srcRate, dstRate) {
+  let totalLen = 0;
+  for (const c of chunks) totalLen += c.length;
+  const merged = new Float32Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) { merged.set(c, offset); offset += c.length; }
+  let resampled;
+  if (srcRate === dstRate) {
+    resampled = merged;
+  } else {
+    const newLen = Math.round(merged.length * (dstRate / srcRate));
+    resampled = new Float32Array(newLen);
+    const ratio = (merged.length - 1) / (newLen - 1);
+    for (let i = 0; i < newLen; i++) {
+      const idx = i * ratio;
+      const lo = Math.floor(idx);
+      const hi = Math.min(lo + 1, merged.length - 1);
+      const t = idx - lo;
+      resampled[i] = merged[lo] * (1 - t) + merged[hi] * t;
+    }
+  }
+  const i16 = new Int16Array(resampled.length);
+  for (let i = 0; i < resampled.length; i++) {
+    const s = Math.max(-1, Math.min(1, resampled[i]));
+    i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  const blockAlign = 2;
+  const byteRate = dstRate * blockAlign;
+  const dataSize = i16.length * 2;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buf);
+  const writeStr = (off, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i));
+  };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, dstRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, dataSize, true);
+  new Int16Array(buf, 44).set(i16);
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+function _vsBackends() {
+  return (backendCache || []).filter(b => b.kind === "voice" && b.enabled);
+}
+
+function vsRenderBackendSelect() {
+  const sel = document.getElementById("vs-backend-select");
+  if (!sel) return;
+  const backends = _vsBackends();
+  sel.innerHTML = "";
+  if (!backends.length) {
+    sel.innerHTML = '<option value="">No voice services — add one in Settings</option>';
+    _vsState.backendId = null;
+    document.getElementById("vs-health").textContent = "";
+    document.getElementById("vs-voices-list").innerHTML = "";
+    return;
+  }
+  let saved = null;
+  try { saved = parseInt(localStorage.getItem("miniclosedai:vsBackend"), 10); } catch (e) {}
+  for (const b of backends) {
+    const opt = document.createElement("option");
+    opt.value = String(b.id);
+    opt.textContent = `${b.name} — ${b.base_url}`;
+    sel.appendChild(opt);
+  }
+  const pick = backends.some(b => b.id === saved) ? saved : backends[0].id;
+  sel.value = String(pick);
+  _vsState.backendId = pick;
+}
+
+async function vsLoadHealth() {
+  const el = document.getElementById("vs-health");
+  if (!el || _vsState.backendId == null) return;
+  try {
+    const h = await _vsApi("health");
+    el.innerHTML =
+      `ASR <strong>${escapeHtml(h.asr_model || "?")}</strong> · ` +
+      `TTS <strong>${escapeHtml(h.tts_model || "?")}</strong> · ` +
+      `device ${escapeHtml(h.device || "?")} · ` +
+      (h.voices_loaded ? "voices loaded ✓" : "warming up…") +
+      (h.relay_capable ? " · relay-capable ✓" : "");
+  } catch (e) {
+    el.textContent = `Service unreachable: ${e.message}`;
+  }
+}
+
+async function vsLoadVoices() {
+  const list = document.getElementById("vs-voices-list");
+  const empty = document.getElementById("vs-voices-empty");
+  if (!list || _vsState.backendId == null) return;
+  let cat;
+  try { cat = await _vsApi("voices"); }
+  catch (e) { list.innerHTML = ""; empty.hidden = true; return; }
+  list.innerHTML = "";
+  let total = 0;
+  for (const lang of Object.keys(cat).sort()) {
+    const voices = cat[lang] || [];
+    if (!voices.length) continue;
+    const head = document.createElement("div");
+    head.className = "vs-lang-head";
+    head.textContent = lang.toUpperCase();
+    list.appendChild(head);
+    for (const v of voices) {
+      total++;
+      const row = document.createElement("div");
+      row.className = "vs-voice-row";
+      const label = document.createElement("span");
+      label.textContent = v.name || v.id;
+      const idc = document.createElement("code");
+      idc.className = "vs-voice-id";
+      idc.textContent = v.id;
+      row.append(label, idc);
+      if (v.id !== "default") {
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "btn btn-small btn-danger";
+        del.textContent = "Delete";
+        del.addEventListener("click", async () => {
+          const ok = await uiConfirm({
+            title: `Delete voice '${v.name || v.id}'?`,
+            message: "Removes the cloned reference clip from the voice service.",
+            okText: "Delete", danger: true,
+          });
+          if (!ok) return;
+          try {
+            await _vsApi(`voices/${encodeURIComponent(v.id)}`, { method: "DELETE" });
+            showToast(`Deleted voice ${v.id}`, "ok");
+            vsLoadVoices();
+            loadVoices();   // chat topbar voice picker stays in sync
+          } catch (e) { showToast(e.message, "error"); }
+        });
+        row.appendChild(del);
+      }
+      list.appendChild(row);
+    }
+  }
+  empty.hidden = total > 0;
+}
+
+// ---- recorder (ScriptProcessor capture → float32 chunks) ----
+async function vsStartRecording() {
+  const status = document.getElementById("vs-status");
+  status.textContent = "";
+  if (!navigator.mediaDevices?.getUserMedia) {
+    status.textContent = "This browser doesn't support audio recording.";
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+    });
+  } catch (e) {
+    status.textContent = `Microphone access denied: ${e?.message || e}`;
+    return;
+  }
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const source = ctx.createMediaStreamSource(stream);
+  const processor = ctx.createScriptProcessor(4096, 1, 1);
+  source.connect(processor);
+  const silence = ctx.createGain();
+  silence.gain.value = 0;
+  processor.connect(silence);
+  silence.connect(ctx.destination);
+
+  const rec = { ctx, stream, source, processor, chunks: [], sampleRate: ctx.sampleRate,
+                startedAt: performance.now(), timer: null };
+  _vsState.rec = rec;
+  const levelBar = document.getElementById("vs-level-bar");
+  processor.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    rec.chunks.push(new Float32Array(input));
+    let sumSq = 0;
+    for (let i = 0; i < input.length; i++) sumSq += input[i] * input[i];
+    const pct = Math.min(100, Math.round(Math.sqrt(sumSq / input.length) * 250));
+    if (levelBar) levelBar.style.width = pct + "%";
+  };
+
+  const btn = document.getElementById("vs-record-btn");
+  btn.textContent = "■ Stop";
+  btn.classList.add("is-recording");
+  document.getElementById("vs-rec-timer").hidden = false;
+  document.getElementById("vs-level").hidden = false;
+  const script = document.getElementById("vs-script");
+  script.hidden = false;
+  script.textContent = _VS_SCRIPTS[document.getElementById("vs-lang").value] || _VS_SCRIPTS.en;
+
+  rec.timer = setInterval(() => {
+    const s = (performance.now() - rec.startedAt) / 1000;
+    document.getElementById("vs-rec-timer").textContent =
+      `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+    if (s >= _VS_MAX_RECORD_S) vsStopRecording();
+  }, 250);
+}
+
+async function vsStopRecording() {
+  const rec = _vsState.rec;
+  if (!rec) return;
+  _vsState.rec = null;
+  clearInterval(rec.timer);
+  try {
+    rec.processor.disconnect();
+    rec.source.disconnect();
+    rec.processor.onaudioprocess = null;
+    for (const t of rec.stream.getTracks()) t.stop();
+    await rec.ctx.close();
+  } catch (e) {}
+  const btn = document.getElementById("vs-record-btn");
+  btn.textContent = "● Record";
+  btn.classList.remove("is-recording");
+  document.getElementById("vs-rec-timer").hidden = true;
+  document.getElementById("vs-level").hidden = true;
+  document.getElementById("vs-script").hidden = true;
+  if (!rec.chunks.length) {
+    document.getElementById("vs-status").textContent = "Captured zero audio — try again.";
+    return;
+  }
+  _vsStage(_vsEncodeWav(rec.chunks, rec.sampleRate, rec.sampleRate));
+}
+
+// Decode an uploaded audio file (any browser-decodable format), downmix to
+// mono, trim to the server's cap, and re-encode as WAV — same pipeline as
+// the original Voice Studio uploader.
+async function vsLoadAudioFile(file) {
+  const status = document.getElementById("vs-status");
+  status.textContent = "";
+  if (!file) return;
+  if (file.size > 40 * 1024 * 1024) {
+    status.textContent = `File too large (${(file.size / 1024 / 1024).toFixed(1)} MB; max 40 MB).`;
+    return;
+  }
+  let audioBuffer;
+  try {
+    const arrayBuf = await file.arrayBuffer();
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    audioBuffer = await ctx.decodeAudioData(arrayBuf);
+    try { await ctx.close(); } catch (e) {}
+  } catch (e) {
+    status.textContent = `Could not decode this file: ${e?.message || e}. Try WAV / MP3 / M4A / OGG.`;
+    return;
+  }
+  if (audioBuffer.duration < 0.5) {
+    status.textContent = `Audio is only ${audioBuffer.duration.toFixed(2)} s — at least 0.5 s required.`;
+    return;
+  }
+  const maxSamples = Math.floor(_VS_MAX_UPLOAD_S * audioBuffer.sampleRate);
+  const n = Math.min(audioBuffer.length, maxSamples);
+  const channels = audioBuffer.numberOfChannels;
+  const mono = new Float32Array(n);
+  if (channels === 1) {
+    mono.set(audioBuffer.getChannelData(0).subarray(0, n));
+  } else {
+    const cs = [];
+    for (let i = 0; i < channels; i++) cs.push(audioBuffer.getChannelData(i));
+    for (let i = 0; i < n; i++) {
+      let sum = 0;
+      for (let c = 0; c < channels; c++) sum += cs[c][i];
+      mono[i] = sum / channels;
+    }
+  }
+  if (audioBuffer.duration > _VS_MAX_UPLOAD_S) {
+    showToast(`Audio trimmed to the first ${_VS_MAX_UPLOAD_S} s.`, "warn");
+  }
+  _vsStage(_vsEncodeWav([mono], audioBuffer.sampleRate, audioBuffer.sampleRate));
+  const base = (file.name || "").replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim();
+  const nameEl = document.getElementById("vs-name");
+  if (base && !nameEl.value) {
+    nameEl.value = base.charAt(0).toUpperCase() + base.slice(1);
+  }
+}
+
+function _vsStage(blob) {
+  _vsState.blob = blob;
+  const audio = document.getElementById("vs-audio");
+  if (audio.src) URL.revokeObjectURL(audio.src);
+  audio.src = URL.createObjectURL(blob);
+  document.getElementById("vs-review").hidden = false;
+  document.getElementById("vs-name").focus();
+}
+
+function vsDiscard() {
+  const audio = document.getElementById("vs-audio");
+  if (audio.src) URL.revokeObjectURL(audio.src);
+  audio.src = "";
+  _vsState.blob = null;
+  document.getElementById("vs-review").hidden = true;
+  document.getElementById("vs-name").value = "";
+  document.getElementById("vs-file").value = "";
+  document.getElementById("vs-status").textContent = "";
+}
+
+async function vsSaveVoice() {
+  const status = document.getElementById("vs-status");
+  const name = document.getElementById("vs-name").value.trim();
+  if (!_vsState.blob) { status.textContent = "Record or upload a sample first."; return; }
+  if (!name) { status.textContent = "Give the voice a name."; return; }
+  const btn = document.getElementById("vs-save-btn");
+  btn.disabled = true;
+  status.textContent = "Uploading + conditioning…";
+  try {
+    const fd = new FormData();
+    fd.append("audio", _vsState.blob, "sample.wav");
+    fd.append("name", name);
+    fd.append("language", document.getElementById("vs-lang").value);
+    const r = await _vsApi("voices", { method: "POST", body: fd });
+    showToast(`Voice '${r.name}' created (${r.voice_id})`, "ok");
+    status.textContent = "";
+    vsDiscard();
+    vsLoadVoices();
+    loadVoices();   // new clone appears in the chat voice picker immediately
+  } catch (e) {
+    status.textContent = "Save failed: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function onVoiceStudioPageEntered() {
+  if (_vsState.active) return;
+  _vsState.active = true;
+  vsRenderBackendSelect();
+  vsLoadHealth();
+  vsLoadVoices();
+}
+
+function onVoiceStudioPageLeft() {
+  if (!_vsState.active) return;
+  _vsState.active = false;
+  if (_vsState.rec) vsStopRecording();
+}
+
+function initVoiceStudioPage() {
+  const sel = document.getElementById("vs-backend-select");
+  if (!sel) return;
+  sel.addEventListener("change", () => {
+    _vsState.backendId = parseInt(sel.value, 10) || null;
+    try { localStorage.setItem("miniclosedai:vsBackend", String(_vsState.backendId)); } catch (e) {}
+    vsLoadHealth();
+    vsLoadVoices();
+  });
+  document.getElementById("vs-record-btn").addEventListener("click", () => {
+    _vsState.rec ? vsStopRecording() : vsStartRecording();
+  });
+  document.getElementById("vs-file").addEventListener("change", (e) => {
+    const f = e.target.files[0];
+    if (f) vsLoadAudioFile(f);
+  });
+  document.getElementById("vs-save-btn").addEventListener("click", vsSaveVoice);
+  document.getElementById("vs-discard-btn").addEventListener("click", vsDiscard);
+}
+
+// =====================================================================
+// Security (Settings → Security). Opt-in auth: create the account here;
+// afterwards the server serves the landing page to signed-out visitors and
+// expects a bearer token on the API — in GRACE MODE: unauthenticated API
+// requests still work but land in the "connections needing attention" list.
+// =====================================================================
+const _authState = { enabled: false, loggedIn: false, alertCount: 0, pollTimer: null };
+
+function _setText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+function _refreshAuthAlertDot() {
+  const dot = document.getElementById("settings-alert-dot");
+  if (dot) dot.hidden = !(_authState.enabled && _authState.alertCount > 0);
+}
+
+async function loadAuthState() {
+  try {
+    const r = await fetch("/api/auth/state");
+    if (!r.ok) return;
+    const j = await r.json();
+    _authState.enabled = !!j.enabled;
+    _authState.loggedIn = !!j.logged_in;
+    _authState.alertCount = j.alert_count || 0;
+    _authState.username = j.username || "";
+  } catch (e) { return; }
+  _refreshAuthAlertDot();
+  _renderSecuritySection();
+}
+
+function _renderSecuritySection() {
+  const setup = document.getElementById("auth-setup-box");
+  const manage = document.getElementById("auth-manage-box");
+  const signout = document.getElementById("auth-signout-btn");
+  if (!setup || !manage) return;
+  setup.hidden = _authState.enabled;
+  manage.hidden = !(_authState.enabled && _authState.loggedIn);
+  if (signout) signout.hidden = !(_authState.enabled && _authState.loggedIn);
+  if (_authState.loggedIn) {
+    _setText("auth-username", _authState.username || "");
+    _loadAuthAlerts();
+  }
+}
+
+async function _loadAuthAlerts() {
+  const list = document.getElementById("auth-alerts-list");
+  const empty = document.getElementById("auth-alerts-empty");
+  if (!list) return;
+  let alerts = [];
+  try {
+    const r = await fetch("/api/auth/alerts");
+    if (r.ok) alerts = (await r.json()).alerts || [];
+  } catch (e) {}
+  _authState.alertCount = alerts.length;
+  _refreshAuthAlertDot();
+  _setText("auth-alert-count", alerts.length ? `· ${alerts.length}` : "");
+  list.innerHTML = "";
+  if (empty) empty.hidden = alerts.length > 0;
+  for (const a of alerts) {
+    const row = document.createElement("div");
+    row.className = "auth-alert-row";
+    const meta = document.createElement("div");
+    meta.className = "auth-alert-meta";
+    meta.innerHTML =
+      `<code>${escapeHtml(a.method)} ${escapeHtml(a.path)}</code>` +
+      `<span class="mp-dim"> from ${escapeHtml(a.ip)} · ×${a.count} · last ${escapeHtml(a.last_seen)}` +
+      (a.user_agent ? ` · ${escapeHtml(a.user_agent.slice(0, 60))}` : "") + `</span>`;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-small";
+    btn.textContent = "Dismiss";
+    btn.addEventListener("click", async () => {
+      try {
+        await fetch("/api/auth/alerts/dismiss", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fingerprint: a.fingerprint }),
+        });
+      } catch (e) {}
+      _loadAuthAlerts();
+    });
+    row.append(meta, btn);
+    list.appendChild(row);
+  }
+}
+
+async function _authPost(path, body) {
+  const r = await fetch(path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  if (!r.ok) {
+    let d = `HTTP ${r.status}`;
+    try { d = (await r.json()).detail || d; } catch (e) {}
+    throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+  }
+  return r.json();
+}
+
+function initSecurityUI() {
+  const setupBtn = document.getElementById("auth-setup-btn");
+  if (!setupBtn) return;
+
+  setupBtn.addEventListener("click", async () => {
+    const user = document.getElementById("auth-setup-user").value.trim();
+    const p1 = document.getElementById("auth-setup-pass").value;
+    const p2 = document.getElementById("auth-setup-pass2").value;
+    const status = document.getElementById("auth-setup-status");
+    if (!user || !p1) { status.textContent = "Username and password required."; return; }
+    if (p1.length < 6) { status.textContent = "Password must be at least 6 characters."; return; }
+    if (p1 !== p2) { status.textContent = "Passwords don't match."; return; }
+    setupBtn.disabled = true;
+    try {
+      const j = await _authPost("/api/auth/setup", { username: user, password: p1 });
+      await loadAuthState();
+      // Reveal the token immediately — this is the one guaranteed sighting.
+      const tokEl = document.getElementById("auth-token-value");
+      if (tokEl) tokEl.textContent = j.api_token;
+      showToast("Account created — auth is ON. Copy your API token now.", "ok");
+    } catch (e) {
+      status.textContent = e.message;
+    } finally {
+      setupBtn.disabled = false;
+    }
+  });
+
+  document.getElementById("auth-signout-btn")?.addEventListener("click", async () => {
+    try { await _authPost("/api/auth/logout"); } catch (e) {}
+    location.replace("/");   // server now serves the landing page
+  });
+
+  document.getElementById("auth-token-reveal")?.addEventListener("click", async () => {
+    try {
+      const r = await fetch("/api/auth/token");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _setText("auth-token-value", (await r.json()).api_token);
+    } catch (e) { showToast("Could not load token: " + e.message, "error"); }
+  });
+
+  document.getElementById("auth-token-copy")?.addEventListener("click", async () => {
+    try {
+      const r = await fetch("/api/auth/token");
+      const tok = (await r.json()).api_token;
+      await copyText(tok);
+      showToast("API token copied", "ok");
+    } catch (e) { showToast("Copy failed", "error"); }
+  });
+
+  document.getElementById("auth-token-regen")?.addEventListener("click", async () => {
+    const ok = await uiConfirm({
+      title: "Regenerate API token?",
+      message: "Every client using the current token will start showing up in " +
+               "'connections needing attention' until you update it.",
+      okText: "Regenerate", danger: true,
+    });
+    if (!ok) return;
+    try {
+      const j = await _authPost("/api/auth/token/regenerate");
+      _setText("auth-token-value", j.api_token);
+      showToast("New token generated — update your clients.", "ok");
+    } catch (e) { showToast(e.message, "error"); }
+  });
+
+  document.getElementById("auth-change-btn")?.addEventListener("click", async () => {
+    const cur = document.getElementById("auth-cur-pass").value;
+    const nw = document.getElementById("auth-new-pass").value;
+    const status = document.getElementById("auth-manage-status");
+    try {
+      await _authPost("/api/auth/change", { current_password: cur, new_password: nw });
+      status.textContent = "Password changed.";
+      document.getElementById("auth-cur-pass").value = "";
+      document.getElementById("auth-new-pass").value = "";
+    } catch (e) { status.textContent = e.message; }
+  });
+
+  document.getElementById("auth-disable-btn")?.addEventListener("click", async () => {
+    const cur = document.getElementById("auth-cur-pass").value;
+    const status = document.getElementById("auth-manage-status");
+    if (!cur) { status.textContent = "Enter your current password above to disable."; return; }
+    const ok = await uiConfirm({
+      title: "Disable authentication?",
+      message: "The app becomes open again: no sign-in, no API token, alerts cleared.",
+      okText: "Disable", danger: true,
+    });
+    if (!ok) return;
+    try {
+      await _authPost("/api/auth/disable", { password: cur });
+      showToast("Authentication disabled.", "ok");
+      await loadAuthState();
+    } catch (e) { status.textContent = e.message; }
+  });
+
+  document.getElementById("auth-alerts-clear")?.addEventListener("click", async () => {
+    try { await _authPost("/api/auth/alerts/clear"); } catch (e) {}
+    _loadAuthAlerts();
+  });
+
+  // Light poll: keep the gear's amber dot honest while auth is on.
+  _authState.pollTimer = setInterval(() => {
+    if (_authState.enabled) loadAuthState();
+  }, 60000);
+}
+
+// =====================================================================
 // Instance identity (Settings → Instance identity). Server-side per-install
 // name + description: the name becomes the browser-tab title, and because a
 // tab's hover card shows the full document.title, appending the description
@@ -7150,6 +8301,10 @@ async function init() {
   startPullPoller();
   initUpgradeUI();
   initImportBotUI();
+  initModelsPage();
+  initVoiceStudioPage();
+  initSecurityUI();
+  loadAuthState().catch(() => {});
   els.input.addEventListener("input", autoGrowInput);
   // Warm the backend cache FIRST so the dashboard's push-to-talk affordance
   // (which checks for a kind='voice' row) shows up without first opening

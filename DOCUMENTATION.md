@@ -281,7 +281,7 @@ python3 cli.py <command> [args]  # directly — works under any python3, no venv
 | `MINICLOSEDAI_URL` | `https://localhost:8095` | Full base URL of the target server (overrides PORT). |
 | `MINICLOSEDAI_PORT` | `8095` | Port, when `MINICLOSEDAI_URL` is unset (scheme is `https`). |
 | `MINICLOSEDAI_VERIFY` | unset | `1`/`true` enforces TLS cert verification. Off by default because the dev server's cert is self-signed. |
-| `MINICLOSEDAI_API_KEY` | unset | Sent as `Authorization: Bearer …` on every request. The app does not require it; set it when you front the server with an auth proxy that does. |
+| `MINICLOSEDAI_API_KEY` | unset | Sent as `Authorization: Bearer …` on every request. Set it to the API token from Settings → Security once authentication is enabled (grace mode: requests without it still work but are flagged to the instance owner). |
 
 Exit codes: `0` ok · `1` API/usage error · `2` server unreachable / unauthorized.
 
@@ -303,6 +303,8 @@ substring of the title/name.
 | **eval** | `ls`, `add`, `rm`, `clear`, `seed`, `run --mode exact\|contains\|judge` | `…/api/conversations/{id}/eval/*` |
 | **apps** | `ls`, `show`, `create`, `edit`, `rm`, `add-bot`, `rm-bot`, `sdk --lang ts\|js\|py [--out] [--zip]` | `…/api/apps*`, `…/apps/{id}/sdk[.zip]` |
 | **logs** | `logs [--limit N] [--json]`, `logs clear`, `logs export [--out f]` | `…/api/logs*` |
+| **llm** (Models tab) | `info`, `gpu`, `ls`, `analyze`, `run`, `start`, `stop`, `rm`, `status`, `logs -f`, `test`, `url`, `register`, `cache`, `free` | `…/api/llm/*` (same-origin proxy to the miniclosedai-llm manager) |
+| **voice** (Voice Studio tab) | `status`, `url`, `ls`, `clone`, `rm`, `speak`, `transcribe` — all take `[--backend <id-or-name>]` | `…/api/voicestudio/{backend_id}/*` (same-origin proxy to a registered `kind='voice'` backend) |
 
 ### Examples
 
@@ -324,6 +326,53 @@ substring of the title/name.
 `send` persists the turn and includes prior history by default (it behaves like the GUI
 chat); pass `--ephemeral` for a stateless one-shot call (the microservice pattern — no
 history, nothing saved).
+
+### `llm` and `voice` — terminal side of the Models / Voice Studio tabs
+
+These two groups are ports of the sibling repos' own CLIs (`mc` from miniclosedai-llm,
+`vc` from miniclosedai-voice), retargeted at the same-origin proxies the Models and Voice
+Studio tabs use (`/api/llm/*`, `/api/voicestudio/{backend_id}/*`) instead of dialing the
+sibling services' ports directly — so they work identically whether `mcai` runs on this
+box or against a remote MiniClosedAI, with no separate network path to the sibling
+required. The sibling CLIs (`mc`, `vc`) remain fully functional standalone; these are an
+additional, unified path through the merged app, not a replacement.
+
+```bash
+./mcai llm ls                                            # models on the manager
+./mcai llm run meta-llama/Llama-3.1-8B-Instruct --wait    # download + run, block till ready
+./mcai llm test llama-3-1-8b-instruct "say hi"            # quick-test, text or --image
+./mcai llm register llama-3-1-8b-instruct                 # POST /api/backends/auto-register —
+                                                          #   the CLI equivalent of the GUI's
+                                                          #   one-click "Register as backend"
+./mcai llm logs llama-3-1-8b-instruct -f                  # SSE log stream, through the proxy
+
+./mcai voice ls                                # catalog (grouped by language)
+./mcai voice clone sample.wav --name "Edgar"   # POST multipart /voices
+./mcai voice speak "hi" --voice edgar --out hi.wav --play
+./mcai voice transcribe hi.wav
+./mcai voice --backend "runpod" ls             # a second registered voice backend
+```
+
+`mcai voice` takes an optional `--backend <id-or-name>` on every subcommand — unlike `vc`
+(always exactly one target service), MiniClosedAI can have several `kind='voice'`
+backends registered (local + remote); omitted defaults to the first enabled one, printed
+to stderr so the choice is never silently ambiguous.
+
+`llm register` and the "one command mismatch" a keen reader may notice: `mcai models`
+(top-level) is the aggregated model list across ALL registered backends — unrelated to
+`mcai llm`, which is specifically the miniclosedai-llm manager's own model set (running,
+stopped, downloadable). The group is named `llm`, not `models`, to avoid that collision.
+
+**`speak`/`transcribe` are proxied, unlike the GUI's Voice Studio tab (catalog + health
+only)** — `_VOICESTUDIO_ALLOWED` in app.py was extended to include them specifically so
+these two CLI commands work through MiniClosedAI's one port even when the CLI operator
+has no direct network path to a remote/firewalled voice backend (the same remote-access
+principle as the rest of this API — see [remote / agent access](#remote--agent-access)).
+
+**Deliberately not ported:** `mc chat` (dials the raw vLLM port directly, bypassing the
+manager — register the model with `mcai llm register` then use `mcai chat <bot>`
+instead) and `mc serve`/`vc serve` (exec the *sibling* repo's own `dev.sh` — meaningless
+from inside this repo; `./dev.sh up` already starts every service together).
 
 ### Remote / agent access
 
@@ -374,9 +423,9 @@ MINICLOSEDAI_URL=https://<host>:8095 python3 cli.py send 75 "Summarize: ..."
 
 ### Not covered (GUI-only)
 
-Voice push-to-talk / TTS playback and the WebRTC duplex call path need a browser
-mic/speaker and are intentionally not in `mcai`. Everything else the GUI does is a CLI
-command.
+Push-to-talk and the WebRTC duplex call mode need an actual browser mic/speaker and are
+intentionally not in `mcai` — everything else the GUI does, including one-off TTS
+synthesis and catalog management (`mcai voice speak`/`clone`/etc.), is a CLI command.
 
 ---
 
@@ -1099,6 +1148,46 @@ Lists Ollama models available locally.
   ]
 }
 ```
+
+### Authentication (opt-in, grace mode)
+
+Off until an account exists (Settings → Security). Once enabled: `/` serves
+`static/landing.html` to visitors without a session cookie (`mca_session`, HttpOnly,
+browser-session lifetime, Secure on https); `/api/*` + `/v1/*` accept the session OR
+`Authorization: Bearer <api_token>`; requests with neither are **allowed** and recorded
+in `auth_alerts` (surfaced in Settings + amber dot on the gear). Tables: `users`
+(single row, scrypt password hash, api_token), `sessions`, `auth_alerts` (deduped by
+ip+method+path, hit counts).
+
+```
+GET  /api/auth/state              → {enabled, logged_in, username?, alert_count?}
+POST /api/auth/setup              → create THE account (409 if exists); returns api_token once
+POST /api/auth/login | logout     → session cookie in/out (login sleeps 0.5s on failure)
+GET  /api/auth/token              → session-only; POST /api/auth/token/regenerate
+POST /api/auth/change             → {current_password, new_password}
+POST /api/auth/disable            → {password} — full reset back to the open app
+GET  /api/auth/alerts             → session-only; POST .../dismiss {fingerprint}, .../clear
+```
+
+### Sibling-service proxies (Models tab + Voice Studio tab)
+
+The Models and Voice Studio pages are native UIs for the sibling services; the browser
+only ever talks to this origin. Both proxies stream (JSON, SSE, multipart) and inject
+auth server-side.
+
+```
+GET/POST/DELETE /api/llm/{path}                → miniclosedai-llm manager /api/{path}
+                                                 (allowlist: health, gpu, models, analyze,
+                                                  cache, test-image; SSE logs pass through)
+GET             /api/llm-info                  → {manager_url, reachable}
+GET/POST/DELETE /api/voicestudio/{bid}/{path}  → registered kind='voice' backend {bid}
+                                                 (allowlist: health, voices, api/connect-info;
+                                                  row's api_key injected as Bearer)
+```
+
+Manager location: `MINICLOSEDAI_LLM_MANAGER_URL` (default `http://localhost:8099`),
+optional `MINICLOSEDAI_LLM_MANAGER_KEY` bearer. Unreachable manager → 502 with a
+`./dev.sh up` hint (`dev.sh up` starts voice + LLM manager + app together on a CUDA box).
 
 ### Instance identity
 
