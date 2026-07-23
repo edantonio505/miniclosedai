@@ -5458,6 +5458,23 @@ class FakeManager(_FakeServer):
                             "base_url": "http://localhost:8002/v1",
                             "alt_base_url": "http://host.docker.internal:8002/v1",
                         },
+                        {
+                            # Has a local_url (unlike the two entries above) —
+                            # used to test the loopback-manager_url → local_url
+                            # preference without changing what the existing
+                            # tests above assert against qwen3-vl-8b.
+                            "id": "co-located-model",
+                            "served_name": "co-located-model",
+                            "hf_id": "Meta/Llama-Fake",
+                            "status": "running",
+                            "ready": True,
+                            "multimodal": False,
+                            "port": 8003,
+                            "source": "custom",
+                            "base_url": "https://fake-pod-8003.proxy.runpod.net/v1",
+                            "alt_base_url": "http://host.docker.internal:8003/v1",
+                            "local_url": "http://127.0.0.1:8003/v1",
+                        },
                     ]},
                     "/api/health": {"engine": "docker", "gpu_ok": True,
                                     "dashboard_url": outer.base_url},
@@ -5549,6 +5566,81 @@ def _():
         "model_id": "anything",
     })
     assert r.status_code == 502, r.text
+
+
+# ----- _pick_backend_url: pure unit tests (no network round trip) -----
+
+_PICK_URL_MODEL = {
+    "base_url": "https://fake-pod-8003.proxy.runpod.net/v1",
+    "alt_base_url": "http://host.docker.internal:8003/v1",
+    "local_url": "http://127.0.0.1:8003/v1",
+}
+
+@test("_pick_backend_url: loopback manager_url + local_url present → local_url")
+def _():
+    for loopback in ("http://localhost:8099", "http://127.0.0.1:8099", "http://[::1]:8099"):
+        got = app_mod._pick_backend_url(_PICK_URL_MODEL, loopback, False)
+        assert got == _PICK_URL_MODEL["local_url"], (loopback, got)
+
+
+@test("_pick_backend_url: non-loopback manager_url → base_url unchanged")
+def _():
+    got = app_mod._pick_backend_url(_PICK_URL_MODEL, "http://example-remote-host:8099", False)
+    assert got == _PICK_URL_MODEL["base_url"], got
+
+
+@test("_pick_backend_url: no local_url on the model → base_url even if loopback")
+def _():
+    model = {"base_url": _PICK_URL_MODEL["base_url"]}
+    got = app_mod._pick_backend_url(model, "http://localhost:8099", False)
+    assert got == model["base_url"], got
+
+
+@test("_pick_backend_url: prefer_docker_host wins regardless of loopback-ness")
+def _():
+    for manager_url in ("http://localhost:8099", "http://example-remote-host:8099"):
+        got = app_mod._pick_backend_url(_PICK_URL_MODEL, manager_url, True)
+        assert got == _PICK_URL_MODEL["alt_base_url"], (manager_url, got)
+
+
+# ----- auto-register: full flow picks local_url when co-located -----
+
+@test("auto-register: loopback manager_url → registers local_url, not base_url")
+def _():
+    r = client.post("/api/backends/auto-register", json={
+        "manager_url": fake_manager.base_url,   # _FakeServer binds 127.0.0.1
+        "model_id": "co-located-model",
+    })
+    assert r.status_code == 201, r.text
+    bid = r.json()["id"]
+    try:
+        assert r.json()["base_url"] == "http://127.0.0.1:8003/v1", r.json()
+    finally:
+        client.delete(f"/api/backends/{bid}")
+
+
+@test("auto-register: registering the same model twice upserts, no duplicate row")
+def _():
+    r1 = client.post("/api/backends/auto-register", json={
+        "manager_url": fake_manager.base_url,
+        "model_id": "co-located-model",
+    })
+    assert r1.status_code == 201, r1.text
+    bid1 = r1.json()["id"]
+    try:
+        r2 = client.post("/api/backends/auto-register", json={
+            "manager_url": fake_manager.base_url,
+            "model_id": "co-located-model",
+        })
+        assert r2.status_code == 201, r2.text
+        bid2 = r2.json()["id"]
+        assert bid1 == bid2, "re-registering created a new row instead of updating in place"
+
+        all_backends = client.get("/api/backends").json()
+        matches = [b for b in all_backends if b["name"] == "co-located-model"]
+        assert len(matches) == 1, f"expected exactly one backend, got {len(matches)}"
+    finally:
+        client.delete(f"/api/backends/{bid1}")
 
 
 # ----- In-flight 409 guard -----

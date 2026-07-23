@@ -7435,7 +7435,9 @@ const _MP_STATUS_LABEL = {
 
 function _mpIsRegistered(m) {
   return (backendCache || []).some(b =>
-    b.base_url === m.base_url || (m.alt_base_url && b.base_url === m.alt_base_url));
+    b.base_url === m.base_url
+    || (m.alt_base_url && b.base_url === m.alt_base_url)
+    || (m.local_url && b.base_url === m.local_url));
 }
 
 function mpRenderCard(m) {

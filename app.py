@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -836,6 +837,31 @@ def _normalize_base_url(url: str) -> str:
     return (url or "").rstrip("/")
 
 
+# Same loopback set used at the upgrade endpoint's client-IP check (~api_request_upgrade).
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+def _pick_backend_url(match: dict, manager_url: str, prefer_docker_host: bool) -> str | None:
+    """Which of a model's URL forms (base_url / alt_base_url / local_url) to
+    register as the backend's base_url.
+
+    prefer_docker_host wins outright (miniclosedai running as a Docker
+    container reaches the manager via host.docker.internal). Otherwise, if
+    `manager_url` — the address miniclosedai itself used to reach the manager
+    — is loopback, miniclosedai and the manager are provably on the same
+    host, so the model's own local_url (127.0.0.1:<port>) is preferred over a
+    public/RunPod-proxy base_url: no extra hop through a remote edge for
+    traffic that never leaves the machine. A genuinely remote manager_url
+    falls through to base_url unchanged.
+    """
+    if prefer_docker_host:
+        return match.get("alt_base_url") or match.get("base_url")
+    host = urlparse(_normalize_base_url(manager_url)).hostname
+    if host in _LOOPBACK_HOSTS and match.get("local_url"):
+        return match["local_url"]
+    return match.get("base_url")
+
+
 def _backend_err(backend: dict) -> str:
     return f"Cannot reach '{backend.get('name','backend')}' at {backend.get('base_url','?')}"
 
@@ -1030,10 +1056,16 @@ async def api_auto_register_backend(data: BackendAutoRegister):
     Flow:
       1. GET <manager_url>/api/models     — list everything the manager runs.
       2. Find an entry where served_name == model_id (or hf_id matches).
-      3. Pick base_url (or alt_base_url if prefer_docker_host=true).
+      3. Pick a URL: alt_base_url if prefer_docker_host=true; else local_url
+         (127.0.0.1:<port>) if manager_url itself is loopback — i.e.
+         miniclosedai and the manager are on the same host, so there's no
+         reason to route through a public/RunPod-proxy base_url; else
+         base_url.
       4. Refuse to register a model whose status != 'running'  — points the
          user at `mc start <id>`.
-      5. INSERT a kind='openai' backend with that URL.
+      5. Upsert a kind='openai' backend with that URL — updates the existing
+         row by (name, kind) if this model was already registered, instead of
+         creating a duplicate.
 
     Errors:
       404 — model_id not found on the manager; response lists known names.
@@ -1094,8 +1126,7 @@ async def api_auto_register_backend(data: BackendAutoRegister):
                         "(and `--wait` if you want to block until ready).",
             },
         )
-    url_key = "alt_base_url" if data.prefer_docker_host else "base_url"
-    base_url = match.get(url_key) or match.get("base_url")
+    base_url = _pick_backend_url(match, data.manager_url, data.prefer_docker_host)
     if not base_url:
         raise HTTPException(
             502,
@@ -1103,15 +1134,28 @@ async def api_auto_register_backend(data: BackendAutoRegister):
         )
     name = data.name or match.get("served_name") or data.model_id
 
-    # Now the same INSERT path the regular /api/backends route uses.
+    # Upsert by (name, kind) — re-registering the same model (e.g. after it
+    # picks up a new URL preference, or just restarted on a new port) updates
+    # the existing row instead of piling up duplicate backends.
     with db.get_conn() as conn:
-        cur = conn.execute(
-            """INSERT INTO backends (name, kind, base_url, api_key, headers, enabled, is_builtin)
-               VALUES (?, 'openai', ?, ?, '{}', 1, 0)""",
-            (name, _normalize_base_url(base_url), data.api_key),
-        )
+        existing = conn.execute(
+            "SELECT id FROM backends WHERE name = ? AND kind = 'openai'", (name,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE backends SET base_url = ?, api_key = COALESCE(?, api_key) WHERE id = ?",
+                (_normalize_base_url(base_url), data.api_key, existing["id"]),
+            )
+            row_id = existing["id"]
+        else:
+            cur = conn.execute(
+                """INSERT INTO backends (name, kind, base_url, api_key, headers, enabled, is_builtin)
+                   VALUES (?, 'openai', ?, ?, '{}', 1, 0)""",
+                (name, _normalize_base_url(base_url), data.api_key),
+            )
+            row_id = cur.lastrowid
         conn.commit()
-        row = conn.execute("SELECT * FROM backends WHERE id = ?", (cur.lastrowid,)).fetchone()
+        row = conn.execute("SELECT * FROM backends WHERE id = ?", (row_id,)).fetchone()
     out = _scrub_backend(db.row_to_dict(row))
     # Echo the served-model name so the caller can use it as the bot's `model`.
     out["served_model"] = match.get("served_name") or data.model_id
