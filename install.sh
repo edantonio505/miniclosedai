@@ -18,6 +18,12 @@
 #   MINICLOSEDAI_VOICE_REPO=...           override miniclosedai-voice repo URL
 #   MINICLOSEDAI_VOICE_SETUP=1            0 = clone voice but skip its setup.sh
 #                                         (the multi-GB torch install)
+#   MINICLOSEDAI_LLM_SHIM_SETUP=1         0 = clone miniclosedai-llm but skip
+#                                         its setup_shim.sh (see point 4 below)
+#   LAUNCH_ENGINE=auto                    docker|native|shim — forwarded as-is
+#                                         to miniclosedai-llm; auto lets it
+#                                         pick. Set docker/native to skip the
+#                                         shim auto-install below.
 #   MINICLOSEDAI_JETSON_TORCH=2.8.0      torch/torchaudio version to pull from
 #                                         jetson-ai-lab on a Jetson (auto-picks
 #                                         the newest cp310 wheel if unavailable)
@@ -33,12 +39,21 @@
 #   3. Creates a venv, installs requirements.txt
 #   4. On a CUDA machine (nvidia-smi answers), ALSO clones the two sibling
 #      repos next to it — miniclosedai-llm (model server) and
-#      miniclosedai-voice (ASR + TTS) — and runs the voice one-time setup.
+#      miniclosedai-voice (ASR + TTS) — and runs each one's one-time setup.
 #      NVIDIA Jetson (Tegra/Orin) is auto-detected: the voice env is built with
 #      NVIDIA's jetson-ai-lab torch (sm_87) instead of pytorch.org's generic
 #      aarch64 wheels (which load but crash on the Orin GPU), and the Tegra NVML
 #      allocator workaround is baked into the voice venv. So a fresh Jetson
 #      install gets working GPU voice out of the box.
+#      For miniclosedai-llm: when Docker isn't usable (most RunPod pods can't
+#      run Docker-in-Docker), its bare-metal transformers-shim engine is set up
+#      HERE, synchronously, before the stack starts — not deferred to a
+#      background job after the server is already up. That background-install
+#      path still exists in miniclosedai-llm's own dev.sh as a safety net (e.g.
+#      re-running dev.sh directly, without going through this installer), but
+#      doing it here means there's no window where "Download & Run" is clicked
+#      before the engine is ready: by the time this script prints "installed",
+#      Download & Run already works.
 #      The full stack then starts via ./dev.sh up (voice + models + app) and
 #      the Models / Voice Studio tabs are live. CPU-only boxes skip this and
 #      run the app alone — same UI, register remote endpoints in Settings.
@@ -58,6 +73,7 @@ FULL_MODE="${MINICLOSEDAI_FULL:-auto}"
 LLM_REPO_URL="${MINICLOSEDAI_LLM_REPO:-https://github.com/edantonio505/miniclosedai-llm.git}"
 VOICE_REPO_URL="${MINICLOSEDAI_VOICE_REPO:-https://github.com/edantonio505/miniclosedai-voice.git}"
 VOICE_SETUP="${MINICLOSEDAI_VOICE_SETUP:-1}"
+LLM_SHIM_SETUP="${MINICLOSEDAI_LLM_SHIM_SETUP:-1}"
 # Local voice service URL to auto-register in the app (gap-3 fix). Preset it in
 # ~/.bash_aliases to point elsewhere; the installer reads it from the env.
 VOICE_URL="${MINICLOSEDAI_VOICE_URL:-http://localhost:8090}"
@@ -214,6 +230,12 @@ cuda_works() {
     command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
 }
 
+# Is Docker actually usable for launching models (not just installed)? Mirrors
+# miniclosedai-llm/dev.sh's own DOCKER_OK check exactly.
+docker_works() {
+    command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
 clone_or_update() {
     # $1 = repo url, $2 = target dir, $3 = label
     if [ -d "$2/.git" ]; then
@@ -314,9 +336,29 @@ if [ "$INSTALL_FULL" = "1" ]; then
     printf '%sFull stack (CUDA detected): installing the model server + voice service%s\n' "$BOLD" "$RST"
 
     if clone_or_update "$LLM_REPO_URL" "$LLM_DIR" "miniclosedai-llm"; then
-        # No pre-setup needed: its dev.sh creates a venv + installs
-        # manager-requirements.txt on first start.
-        ok "miniclosedai-llm ready (bootstraps itself on first start)"
+        # dev.sh creates its own venv + installs manager-requirements.txt on
+        # first start — no pre-setup needed for that. But launching an actual
+        # model needs a working engine: Docker, native vLLM, or the bare-metal
+        # transformers shim. Most RunPod pods can't run Docker-in-Docker, so
+        # without this, the manager comes up with "no launch engine" and stays
+        # that way until someone notices and runs setup_shim.sh by hand.
+        if docker_works; then
+            ok "miniclosedai-llm ready (Docker available — models launch via Docker)"
+        elif [ "${LAUNCH_ENGINE:-auto}" = "docker" ] || [ "${LAUNCH_ENGINE:-auto}" = "native" ]; then
+            ok "miniclosedai-llm ready (LAUNCH_ENGINE=${LAUNCH_ENGINE} set — bare-metal shim setup skipped)"
+        elif [ "$LLM_SHIM_SETUP" = "1" ] && [ -x "$LLM_DIR/setup_shim.sh" ]; then
+            say "No Docker on this host — installing the bare-metal transformers shim now"
+            say "(torch — several GB, can take minutes) so model launches work immediately…"
+            if ( cd "$LLM_DIR" && ./setup_shim.sh ); then
+                ok "miniclosedai-llm ready (bare-metal shim set up — models launch without Docker)"
+            else
+                warn "shim setup failed — fix and re-run: cd $LLM_DIR && ./setup_shim.sh"
+            fi
+        elif [ "$LLM_SHIM_SETUP" != "1" ]; then
+            say "Skipping shim setup (MINICLOSEDAI_LLM_SHIM_SETUP=0) — run $LLM_DIR/setup_shim.sh later"
+        else
+            warn "miniclosedai-llm has no setup_shim.sh (old checkout?) — models may fail to launch without Docker"
+        fi
     fi
 
     if clone_or_update "$VOICE_REPO_URL" "$VOICE_DIR" "miniclosedai-voice"; then
