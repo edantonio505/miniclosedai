@@ -725,6 +725,20 @@
       </section>
 
       <section class="settings-section">
+        <div class="settings-section-header"><h2>Connect</h2></div>
+        <div class="tabs" id="vs-share-tabs" data-group="vs-share">
+          <button type="button" class="tab active" data-share="local">Local</button>
+          <button type="button" class="tab" data-share="public">Public</button>
+        </div>
+        <div class="mp-copy-box">
+          <code id="vs-share-url" class="mp-base-url"></code>
+          <button id="vs-share-copy" type="button" class="btn btn-small">Copy</button>
+        </div>
+        <p id="vs-share-alt-hint" class="settings-hint" hidden></p>
+        <p id="vs-share-auth-hint" class="settings-hint" hidden></p>
+      </section>
+
+      <section class="settings-section">
         <div class="settings-section-header">
           <h2>Voices</h2>
           <button id="vs-refresh" type="button" class="btn btn-small">Refresh</button>
@@ -736,6 +750,14 @@
       <section class="settings-section">
         <div class="settings-section-header"><h2>Clone a voice</h2></div>
         <p class="settings-hint">Record 10–30&nbsp;s of clear speech (or upload a WAV) — the service conditions its TTS on this single reference clip. Read naturally; avoid background noise.</p>
+        <p id="vs-script" class="vs-script"></p>
+        <div class="vs-clone-row">
+          <div class="tabs" id="vs-script-lang-tabs" data-group="vs-script-lang">
+            <button type="button" class="tab active" data-lang="en">EN</button>
+            <button type="button" class="tab" data-lang="es">ES</button>
+          </div>
+          <button id="vs-script-shuffle" type="button" class="btn btn-small">↻ New script</button>
+        </div>
         <div class="vs-clone-row">
           <button id="vs-record-btn" type="button" class="btn btn-small">● Record</button>
           <span id="vs-rec-timer" class="vs-rec-timer" hidden>0:00</span>
@@ -743,7 +765,6 @@
           <span class="settings-hint-inline">or</span>
           <input id="vs-file" type="file" accept="audio/wav,audio/x-wav,.wav" />
         </div>
-        <p id="vs-script" class="vs-script" hidden></p>
         <div id="vs-review" class="vs-review" hidden>
           <audio id="vs-audio" controls></audio>
           <div class="settings-row">

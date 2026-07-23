@@ -3613,11 +3613,12 @@ body[data-page="voice-studio"] .page-voice-studio {
 }
 .vs-voice-row {
   display: flex; align-items: center; gap: 10px; padding: 7px 4px;
-  border-bottom: 1px solid var(--divider);
+  border-bottom: 1px solid var(--divider); flex-wrap: wrap;
 }
 .vs-voice-row:last-child { border-bottom: 0; }
 .vs-voice-row > span:first-child { flex: 1 1 auto; }
 .vs-voice-id { color: var(--text-muted); font-size: 11px; font-family: var(--font-mono); }
+.vs-voice-test { flex-basis: 100%; margin-top: 8px; }
 .vs-clone-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 #vs-record-btn.is-recording { color: var(--danger); border-color: var(--danger); }
 .vs-rec-timer { font-family: var(--font-mono); font-size: 13px; color: var(--danger); }

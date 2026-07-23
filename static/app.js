@@ -7771,12 +7771,33 @@ const _vsState = {
   backendId: null,
   blob: null,          // staged WAV for the save form
   rec: null,           // live recording state
+  scriptLang: "en",    // read-prompt language (independent of the save form's vs-lang)
+  scriptIdx: -1,        // index into _VS_SCRIPTS[scriptLang]
+  connectInfo: null,    // last GET api/connect-info response
+  shareMode: "local",   // "local" | "public" — which URL the Connect card shows
 };
 
+// Read-aloud scripts shown while cloning a voice — ~8-12s each at conversational
+// pace, phonetically diverse so the reference clip captures a wide range of sounds.
+// Ported verbatim from miniclosedai-voice's own Voice Studio (READ_PROMPTS).
 const _VS_SCRIPTS = {
-  en: "The quick brown fox jumps over the lazy dog. I enjoy reading aloud in a calm, natural voice — clear consonants, easy pace, and a friendly tone that sounds like everyday conversation.",
-  es: "El veloz zorro marrón salta sobre el perro perezoso. Me gusta leer en voz alta con calma y naturalidad — consonantes claras, ritmo tranquilo y un tono amable de conversación cotidiana.",
+  en: [
+    "The quick brown fox jumps over the lazy dog. Bright stars shine above the silent meadow, while gentle music drifts through the evening air.",
+    "Please call Stella. Ask her to bring these things with her from the store: six spoons of fresh snow peas, five thick slabs of blue cheese, and maybe a snack for her brother Bob.",
+    "On a cold morning, the train arrived quietly at the station. Travelers stepped onto the platform with warm coats, eager to begin their journeys through the countryside.",
+    "Hello, today I am recording a short voice sample. The weather is calm, the room is quiet, and I hope this clip captures my natural speaking voice clearly.",
+    "A thousand tiny lights twinkled across the bay as the ferry pulled into the harbor, and the salty breeze carried the sound of distant laughter and music.",
+  ],
+  es: [
+    "El veloz murciélago hindú comía feliz cardillo y kiwi. La cigüeña tocaba el saxofón detrás del palenque de paja, mientras la luna brillaba sobre el río tranquilo.",
+    "Hola, hoy estoy grabando una muestra corta de mi voz. El clima está calmado, la habitación está silenciosa, y espero que este audio capture mi forma natural de hablar.",
+    "El sol se asomaba entre las nubes mientras los pájaros cantaban en los árboles del parque. Una brisa suave traía el aroma del café recién hecho desde la cocina.",
+    "Camino por la playa al atardecer, escuchando el sonido de las olas y sintiendo la arena tibia bajo los pies. Las gaviotas vuelan bajo, casi rozando el agua salada.",
+    "En la ciudad nunca duerme la música. Por las calles se mezclan acordes de guitarra, voces alegres, risas en cafés y el ritmo constante de pasos sobre el adoquín.",
+  ],
 };
+
+const _VS_SAMPLE_GREETING = "Hello! This is a quick sample of your cloned voice.";
 
 function _vsApi(path, opts = {}) {
   const bid = _vsState.backendId;
@@ -7788,6 +7809,42 @@ function _vsApi(path, opts = {}) {
     }
     return r.status === 204 ? null : r.json();
   });
+}
+
+// Like _vsApi, but for endpoints that return a binary body (e.g. /speak's
+// audio/wav) instead of JSON — _vsApi always calls .json() on success, which
+// would throw on a binary response.
+function _vsApiBlob(path, opts = {}) {
+  const bid = _vsState.backendId;
+  return fetch(`/api/voicestudio/${bid}/${path}`, opts).then(async (r) => {
+    if (!r.ok) {
+      let detail = `HTTP ${r.status}`;
+      try { const b = await r.json(); detail = b.detail || detail; } catch (e) {}
+      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+    return r.blob();
+  });
+}
+
+// POST text to /speak for the given voice and play the result. Used by both
+// the per-voice "Sample" button (fixed greeting) and "Test…" panel (typed text).
+async function _vsSynthAndPlay(text, voiceId, lang, btn) {
+  if (btn) { btn.disabled = true; btn.dataset.origText = btn.textContent; btn.textContent = "…"; }
+  try {
+    const blob = await _vsApiBlob("speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, voice: voiceId, language: lang }),
+    });
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.addEventListener("ended", () => URL.revokeObjectURL(url));
+    await audio.play();
+  } catch (e) {
+    showToast(`Playback failed: ${e.message}`, "error");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = btn.dataset.origText; }
+  }
 }
 
 // WAV encoder — ported verbatim from miniclosedai-voice's Voice Studio so the
@@ -7888,6 +7945,66 @@ async function vsLoadHealth() {
   }
 }
 
+// Derive a same-host form from the service's public base_url — only meaningful
+// when base_url carries an explicit port (a plain host:port URL). A RunPod-proxy
+// URL embeds the port in the hostname itself (no URL port), which means there's
+// no local machine to reach via 127.0.0.1 from the browser's perspective — in
+// that case there is no local form to derive.
+function _vsDeriveLocalUrl(baseUrl) {
+  try {
+    const u = new URL(baseUrl);
+    if (!u.port) return null;
+    return `http://127.0.0.1:${u.port}`;
+  } catch (e) {
+    return null;
+  }
+}
+
+function _vsRenderShareUrl() {
+  const info = _vsState.connectInfo;
+  const urlEl = document.getElementById("vs-share-url");
+  if (!info || !urlEl) return;
+  const localUrl = _vsDeriveLocalUrl(info.base_url);
+  const tabs = document.getElementById("vs-share-tabs");
+  if (!localUrl) {
+    tabs.hidden = true;
+    urlEl.textContent = info.base_url;
+  } else {
+    tabs.hidden = false;
+    urlEl.textContent = _vsState.shareMode === "public" ? info.base_url : localUrl;
+  }
+  const altHint = document.getElementById("vs-share-alt-hint");
+  if (info.alt_base_url) {
+    altHint.hidden = false;
+    altHint.innerHTML = `Same-host Docker MiniClosedAI? Use <code>${escapeHtml(info.alt_base_url)}</code> instead.`;
+  } else {
+    altHint.hidden = true;
+  }
+  const authHint = document.getElementById("vs-share-auth-hint");
+  if (info.auth_required) {
+    authHint.hidden = false;
+    authHint.textContent = "This service requires an API key — if Voices below is empty, check the key saved on this backend in Settings.";
+  } else {
+    authHint.hidden = true;
+  }
+}
+
+async function vsLoadConnectInfo() {
+  const urlEl = document.getElementById("vs-share-url");
+  if (!urlEl || _vsState.backendId == null) return;
+  try {
+    _vsState.connectInfo = await _vsApi("api/connect-info");
+    _vsRenderShareUrl();
+  } catch (e) {
+    // Don't fall back to location.origin here — that's miniclosedai's own
+    // address, not the voice service's, so it would silently show the wrong URL.
+    document.getElementById("vs-share-tabs").hidden = true;
+    document.getElementById("vs-share-alt-hint").hidden = true;
+    document.getElementById("vs-share-auth-hint").hidden = true;
+    urlEl.textContent = `unavailable: ${e.message}`;
+  }
+}
+
 async function vsLoadVoices() {
   const list = document.getElementById("vs-voices-list");
   const empty = document.getElementById("vs-voices-empty");
@@ -7914,6 +8031,20 @@ async function vsLoadVoices() {
       idc.className = "vs-voice-id";
       idc.textContent = v.id;
       row.append(label, idc);
+
+      const sampleBtn = document.createElement("button");
+      sampleBtn.type = "button";
+      sampleBtn.className = "btn btn-small";
+      sampleBtn.textContent = "▶ Sample";
+      sampleBtn.addEventListener("click", () => _vsSynthAndPlay(_VS_SAMPLE_GREETING, v.id, lang, sampleBtn));
+      row.appendChild(sampleBtn);
+
+      const testBtn = document.createElement("button");
+      testBtn.type = "button";
+      testBtn.className = "btn btn-small";
+      testBtn.textContent = "Test…";
+      row.appendChild(testBtn);
+
       if (v.id !== "default") {
         const del = document.createElement("button");
         del.type = "button";
@@ -7935,10 +8066,80 @@ async function vsLoadVoices() {
         });
         row.appendChild(del);
       }
+
+      // Nested INSIDE the row (not a sibling) so it doesn't disturb
+      // .vs-voice-row:last-child's border rule; flex-basis:100% drops it to
+      // its own line only once unhidden.
+      const testPanel = document.createElement("div");
+      testPanel.className = "vs-voice-test";
+      testPanel.hidden = true;
+      const testRow = document.createElement("div");
+      testRow.className = "mp-test-row";
+      const testControls = document.createElement("div");
+      testControls.className = "mp-test-controls";
+      const testPrompt = document.createElement("textarea");
+      testPrompt.className = "mp-test-prompt";
+      testPrompt.value = "This is a test of the cloned voice.";
+      const testActions = document.createElement("div");
+      testActions.className = "mp-test-actions";
+      const playBtn = document.createElement("button");
+      playBtn.type = "button";
+      playBtn.className = "btn btn-small btn-primary";
+      playBtn.textContent = "▶ Play";
+      playBtn.addEventListener("click", () => {
+        const text = testPrompt.value.trim();
+        if (!text) return;
+        _vsSynthAndPlay(text, v.id, lang, playBtn);
+      });
+      testActions.appendChild(playBtn);
+      testControls.append(testPrompt, testActions);
+      testRow.appendChild(testControls);
+      testPanel.appendChild(testRow);
+      row.appendChild(testPanel);
+
+      testBtn.addEventListener("click", () => { testPanel.hidden = !testPanel.hidden; });
+
       list.appendChild(row);
     }
   }
   empty.hidden = total > 0;
+}
+
+// ---- read-aloud script (independent of recording state) ----
+const _VS_SCRIPT_LANG_KEY = "miniclosedai:vsScriptLang";
+
+function _vsSetScript(idx) {
+  const scripts = _VS_SCRIPTS[_vsState.scriptLang] || _VS_SCRIPTS.en;
+  if (idx == null) {
+    // pick a new random index, avoiding an immediate repeat when possible
+    do { idx = Math.floor(Math.random() * scripts.length); }
+    while (scripts.length > 1 && idx === _vsState.scriptIdx);
+  }
+  _vsState.scriptIdx = idx;
+  const el = document.getElementById("vs-script");
+  if (el) el.textContent = scripts[idx];
+}
+
+function _vsSetScriptLang(lang) {
+  if (!_VS_SCRIPTS[lang]) lang = "en";
+  _vsState.scriptLang = lang;
+  try { localStorage.setItem(_VS_SCRIPT_LANG_KEY, lang); } catch (e) {}
+  const tabs = document.getElementById("vs-script-lang-tabs");
+  if (tabs) {
+    tabs.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.lang === lang));
+  }
+  // Pre-select the save form's language to match — but only when nothing is
+  // currently staged for review, so idly previewing a script in the other
+  // language doesn't silently flip the Language field on an already-recorded clip.
+  if (!_vsState.blob) {
+    const langSelect = document.getElementById("vs-lang");
+    if (langSelect) langSelect.value = lang;
+  }
+  _vsSetScript(0);
+}
+
+function vsShuffleScript() {
+  _vsSetScript(null);
 }
 
 // ---- recorder (ScriptProcessor capture → float32 chunks) ----
@@ -7985,9 +8186,6 @@ async function vsStartRecording() {
   btn.classList.add("is-recording");
   document.getElementById("vs-rec-timer").hidden = false;
   document.getElementById("vs-level").hidden = false;
-  const script = document.getElementById("vs-script");
-  script.hidden = false;
-  script.textContent = _VS_SCRIPTS[document.getElementById("vs-lang").value] || _VS_SCRIPTS.en;
 
   rec.timer = setInterval(() => {
     const s = (performance.now() - rec.startedAt) / 1000;
@@ -8014,7 +8212,6 @@ async function vsStopRecording() {
   btn.classList.remove("is-recording");
   document.getElementById("vs-rec-timer").hidden = true;
   document.getElementById("vs-level").hidden = true;
-  document.getElementById("vs-script").hidden = true;
   if (!rec.chunks.length) {
     document.getElementById("vs-status").textContent = "Captured zero audio — try again.";
     return;
@@ -8125,6 +8322,10 @@ function onVoiceStudioPageEntered() {
   vsRenderBackendSelect();
   vsLoadHealth();
   vsLoadVoices();
+  vsLoadConnectInfo();
+  let savedLang = "en";
+  try { savedLang = localStorage.getItem(_VS_SCRIPT_LANG_KEY) || "en"; } catch (e) {}
+  _vsSetScriptLang(savedLang);
 }
 
 function onVoiceStudioPageLeft() {
@@ -8139,8 +8340,10 @@ function initVoiceStudioPage() {
   sel.addEventListener("change", () => {
     _vsState.backendId = parseInt(sel.value, 10) || null;
     try { localStorage.setItem("miniclosedai:vsBackend", String(_vsState.backendId)); } catch (e) {}
+    if (_vsState.rec) vsStopRecording();
     vsLoadHealth();
     vsLoadVoices();
+    vsLoadConnectInfo();
   });
   document.getElementById("vs-record-btn").addEventListener("click", () => {
     _vsState.rec ? vsStopRecording() : vsStartRecording();
@@ -8151,6 +8354,27 @@ function initVoiceStudioPage() {
   });
   document.getElementById("vs-save-btn").addEventListener("click", vsSaveVoice);
   document.getElementById("vs-discard-btn").addEventListener("click", vsDiscard);
+
+  document.getElementById("vs-share-tabs").addEventListener("click", (e) => {
+    const btn = e.target.closest(".tab");
+    if (!btn) return;
+    document.querySelectorAll("#vs-share-tabs .tab").forEach(t => t.classList.remove("active"));
+    btn.classList.add("active");
+    _vsState.shareMode = btn.dataset.share;
+    _vsRenderShareUrl();
+  });
+  document.getElementById("vs-share-copy").addEventListener("click", () => {
+    copyText(document.getElementById("vs-share-url").textContent).then(
+      () => showToast("Copied", "ok"),
+      () => showToast("Copy failed — select the URL manually", "error"));
+  });
+
+  document.getElementById("vs-script-lang-tabs").addEventListener("click", (e) => {
+    const btn = e.target.closest(".tab");
+    if (!btn) return;
+    _vsSetScriptLang(btn.dataset.lang);
+  });
+  document.getElementById("vs-script-shuffle").addEventListener("click", vsShuffleScript);
 }
 
 // =====================================================================
